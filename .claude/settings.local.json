@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go mod tidy:*)",
+      "Bash(go mod download:*)",
+      "Bash(go build:*)",
+      "Bash(timeout 5 go run:*)",
+      "Bash(HTTP_LISTEN_ADDR=:8089 timeout 5 go run:*)",
+      "Bash(curl:*)",
+      "Bash(go get:*)",
+      "Bash(go test:*)",
+      "Bash(make:*)",
+      "Bash(go run:*)",
+      "Bash(LOG_LEVEL=debug timeout 75 go run:*)",
+      "Bash(timeout 75 docker run:*)",
+      "Bash(for i in 1 2 3)",
+      "Bash(do echo \"=== Test $i ===\")",
+      "Bash(done)",
+      "Bash(LOG_LEVEL=debug timeout 120 go run:*)",
+      "Bash(xargs:*)"
+    ]
+  }
+}

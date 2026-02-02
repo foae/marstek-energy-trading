@@ -27,6 +27,12 @@ go.work.sum
 # env file
 .env
 
+# Runtime data
+data/
+
+# Binary
+energy-trader
+
 # Editor/IDE
 # .idea/
 # .vscode/

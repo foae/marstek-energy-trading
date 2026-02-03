@@ -43,6 +43,7 @@ type Service struct {
 	currentTradeSOC    int
 	lastChargePrice    decimal.Decimal // track last charge price for profitability check
 	lastErrorNotify    time.Time       // rate limit error notifications
+	lastMidnightSwap   time.Time       // track last midnight price swap to avoid repeated fetches
 }
 
 // New creates a new trading service.
@@ -96,31 +97,43 @@ func (s *Service) analyzerConfig() AnalyzerConfig {
 	}
 }
 
-// calculateAveragePrice calculates the average price over a time range from todayPrices.
-// Each 15-minute slot is weighted equally.
+// calculateAveragePrice calculates the time-weighted average price over a time range.
+// Prices are weighted by the actual overlap duration with each 15-minute slot.
 func (s *Service) calculateAveragePrice(start, end time.Time) decimal.Decimal {
 	if len(s.todayPrices) == 0 {
 		return decimal.Zero
 	}
 
-	var sum float64
-	var count int
+	var weightedSum float64
+	var totalDuration time.Duration
 
 	for _, p := range s.todayPrices {
 		slotEnd := p.Time.Add(15 * time.Minute)
 		// Check if this slot overlaps with our time range
 		// Slot overlaps if: slot starts before our end AND slot ends after our start
 		if p.Time.Before(end) && slotEnd.After(start) {
-			sum += p.Value
-			count++
+			// Calculate actual overlap duration
+			overlapStart := p.Time
+			if start.After(p.Time) {
+				overlapStart = start
+			}
+			overlapEnd := slotEnd
+			if end.Before(slotEnd) {
+				overlapEnd = end
+			}
+			overlap := overlapEnd.Sub(overlapStart)
+			if overlap > 0 {
+				weightedSum += p.Value * overlap.Seconds()
+				totalDuration += overlap
+			}
 		}
 	}
 
-	if count == 0 {
+	if totalDuration == 0 {
 		return decimal.Zero
 	}
 
-	return decimal.NewFromFloat(sum / float64(count))
+	return decimal.NewFromFloat(weightedSum / totalDuration.Seconds())
 }
 
 // Start begins the trading loop.
@@ -272,8 +285,9 @@ func (s *Service) tick(ctx context.Context) {
 				s.startChargingLocked(ctx, currentPrice, batStatus.SOC)
 			}
 		} else if inDischargeWindow {
-			if batStatus.SOC <= 11 {
-				l.Debug("in discharge window but battery at min SOC")
+			minSOC := int(s.cfg.BatteryMinSOC * 100)
+			if batStatus.SOC <= minSOC {
+				l.Debug("in discharge window but battery at min SOC", "min_soc", minSOC)
 			} else if !batStatus.DischargFlag {
 				l.Warn("in discharge window but battery discharging disabled")
 			} else if !s.isDischargeProfitiable(currentPrice) {
@@ -306,11 +320,12 @@ func (s *Service) tick(ctx context.Context) {
 		}
 
 	case StateDischarging:
+		minSOC := int(s.cfg.BatteryMinSOC * 100)
 		if !inDischargeWindow {
 			l.Info("decision: stop discharging - left discharge window")
 			s.stopDischargingLocked(ctx, batStatus.SOC)
-		} else if batStatus.SOC <= 11 {
-			l.Info("decision: stop discharging - battery at min SOC")
+		} else if batStatus.SOC <= minSOC {
+			l.Info("decision: stop discharging - battery at min SOC", "min_soc", minSOC)
 			s.stopDischargingLocked(ctx, batStatus.SOC)
 		} else {
 			s.refreshPassiveModeLocked(ctx, s.cfg.DischargePowerW)
@@ -321,9 +336,9 @@ func (s *Service) tick(ctx context.Context) {
 // isDischargeProfitiable checks if discharging at the given price is profitable
 // compared to the last charge price, accounting for battery efficiency.
 func (s *Service) isDischargeProfitiable(dischargePrice decimal.Decimal) bool {
-	// If we don't have a last charge price, fall back to plan-level check
+	// If we don't have a last charge price, block discharge - we need a known cost basis
 	if s.lastChargePrice.IsZero() {
-		return true
+		return false
 	}
 	// Profitable if: discharge_price > charge_price / efficiency
 	efficiency := decimal.NewFromFloat(s.cfg.BatteryEfficiency)
@@ -553,13 +568,17 @@ func (s *Service) checkPriceFetch(ctx context.Context) {
 		}
 	}
 
-	// At midnight, move tomorrow's prices to today
-	if now.Hour() == 0 && now.Minute() < 15 {
+	// At midnight, move tomorrow's prices to today (only once per day)
+	today := now.Truncate(24 * time.Hour)
+	alreadySwappedToday := s.lastMidnightSwap.Truncate(24 * time.Hour).Equal(today)
+
+	if now.Hour() == 0 && now.Minute() < 15 && !alreadySwappedToday {
 		s.mu.Lock()
 		if len(s.tomorrowPrices) > 0 {
 			s.todayPrices = s.tomorrowPrices
 			s.tomorrowPrices = nil
 			s.currentPlan = AnalyzePrices(s.todayPrices, s.analyzerConfig())
+			s.lastMidnightSwap = now
 
 			l := slog.With(
 				"day", "today",
@@ -574,6 +593,7 @@ func (s *Service) checkPriceFetch(ctx context.Context) {
 		} else {
 			// Fallback: tomorrow's prices weren't fetched, fetch today's prices now
 			slog.Warn("tomorrow's prices not available at midnight, fetching today's prices")
+			s.lastMidnightSwap = now // Mark as handled to avoid repeated fetches
 			s.mu.Unlock()
 			if err := s.fetchTodayPrices(ctx); err != nil {
 				slog.Error("failed to fetch today's prices at midnight", "error", err)

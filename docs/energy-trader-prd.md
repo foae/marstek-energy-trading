@@ -4,7 +4,7 @@ Product Requirements Document for the Marstek Energy Trading Bot.
 
 ## Overview
 
-A Go service that performs energy price arbitrage using a Marstek Venus E battery. The service fetches NordPool day-ahead prices, identifies optimal charge/discharge windows, and controls the battery via its local UDP API.
+A Go service that performs energy price arbitrage using a Marstek Venus E battery. The service fetches NordPool day-ahead prices, identifies optimal charge/discharge windows, and controls the battery via an ESPHome HTTP REST API.
 
 ## Hardware
 
@@ -14,8 +14,24 @@ A Go service that performs energy price arbitrage using a Marstek Venus E batter
 - **Charge rate**: max 2500W
 - **Discharge rate**: 800-2500W
 - **Min SOC protection**: 11% (built-in)
+
+### ESPHome Bridge (Default)
+- **Protocol**: HTTP REST API
+- **Default URL**: `http://192.168.1.50`
+- **Endpoints**:
+  - `GET /sensor/{name}` - Read sensor values (SOC, temperature, power)
+  - `POST /number/{name}/set?value=X` - Set charge/discharge power
+  - `POST /select/{name}/set?option=Y` - Set mode (charge/discharge/stop)
+- **Entity names** (URL-encoded):
+  - `Battery%20State%20Of%20Charge` - SOC percentage
+  - `Forcible%20Charge%20Power` - Charge power setting
+  - `Forcible%20Discharge%20Power` - Discharge power setting
+  - `Forcible%20Charge%E2%81%84Discharge` - Mode select (charge/discharge/stop)
+
+### Legacy UDP API (Preserved)
 - **Protocol**: UDP JSON-RPC to `192.168.1.255:30000`
 - **Documentation**: [docs/marstek-api.md](marstek-api.md)
+- **Status**: Code preserved in `clients/marstek/` but not used by default
 
 ### NordPool API
 - **Endpoint**: `https://dataportal-api.nordpoolgroup.com/api/DayAheadPriceIndices`
@@ -197,7 +213,8 @@ Load from `.env` file with fallback to environment variables.
 | `BATTERY_CAPACITY_KWH` | `5.12` | Battery capacity (kWh) |
 | `BATTERY_MIN_SOC` | `0.11` | Minimum SOC (0.0-1.0) |
 | `MAX_CYCLES_PER_DAY` | `2` | Max charge/discharge cycles per day |
-| `BATTERY_UDP_ADDR` | `192.168.1.255:30000` | Battery address |
+| `ESPHOME_URL` | `http://192.168.1.50` | ESPHome device URL |
+| `BATTERY_UDP_ADDR` | - | Legacy UDP address (optional) |
 | `CHARGE_POWER_W` | `2500` | Charge power (watts) |
 | `DISCHARGE_POWER_W` | `2500` | Discharge power (watts) |
 | `PASSIVE_MODE_TIMEOUT_S` | `300` | Passive mode timeout |
@@ -223,14 +240,16 @@ marstek-energy-trading/
 ├── service/
 │   ├── service.go               # Trading engine
 │   ├── analyzer.go              # Price analysis
-│   └── recorder.go              # Trade recording (decimal)
+│   ├── recorder.go              # Trade recording (decimal)
+│   └── interfaces.go            # BatteryController interface
 ├── clients/
+│   ├── esphome/client.go        # ESPHome HTTP client (default)
+│   ├── marstek/client.go        # Battery UDP (legacy, preserved)
 │   ├── nordpool/client.go       # NordPool API
-│   ├── marstek/client.go        # Battery UDP
 │   └── telegram/client.go       # Telegram bot
 ├── internal/config/config.go    # Configuration
 ├── docs/
-│   ├── marstek-api.md           # Battery API docs
+│   ├── marstek-api.md           # Legacy UDP API docs
 │   └── energy-trader-prd.md     # This file
 ├── Dockerfile
 ├── Makefile

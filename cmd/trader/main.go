@@ -12,7 +12,7 @@ import (
 
 	"github.com/joho/godotenv"
 
-	"github.com/foae/marstek-energy-trading/clients/marstek"
+	"github.com/foae/marstek-energy-trading/clients/esphome"
 	"github.com/foae/marstek-energy-trading/clients/nordpool"
 	"github.com/foae/marstek-energy-trading/clients/telegram"
 	"github.com/foae/marstek-energy-trading/handler"
@@ -54,8 +54,10 @@ func main() {
 
 	// Initialize clients with configured timezone
 	nordpoolClient := nordpool.NewWithLocation(cfg.NordPoolArea, cfg.NordPoolCurrency, cfg.Location())
-	marstekClient := marstek.New(cfg.BatteryUDPAddr)
-	defer marstekClient.Close() // Ensure UDP connection is closed on shutdown
+	minSOC := int(cfg.BatteryMinSOC * 100)
+	esphomeClient := esphome.New(cfg.ESPHomeURL, minSOC)
+	defer esphomeClient.Close()
+	slog.Info("using ESPHome battery backend", "url", cfg.ESPHomeURL, "min_soc", minSOC)
 	telegramClient := telegram.New(cfg.TelegramBotToken, cfg.TelegramChatID)
 
 	if telegramClient.Enabled() {
@@ -66,7 +68,7 @@ func main() {
 	recorder := service.NewRecorder(cfg.DataDir, cfg.BatteryEfficiency, cfg.Location())
 
 	// Initialize trading service
-	tradingSvc := service.New(cfg, nordpoolClient, marstekClient, telegramClient, recorder)
+	tradingSvc := service.New(cfg, nordpoolClient, esphomeClient, telegramClient, recorder)
 
 	// Setup HTTP handler
 	h := handler.New(tradingSvc)

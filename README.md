@@ -1,6 +1,6 @@
 # Energy Market Minitrader
 
-A Go service that performs energy price arbitrage using a Marstek Venus E battery. The service fetches NordPool day-ahead prices, identifies optimal charge/discharge windows, and controls the battery via its local UDP API.
+A Go service that performs energy price arbitrage using a Marstek Venus E battery. The service fetches NordPool day-ahead prices, identifies optimal charge/discharge windows, and controls the battery via an ESPHome REST API (with legacy UDP support available).
 
 ## Trading Strategy
 
@@ -26,9 +26,16 @@ Product website: https://www.marstek.nl/product/plug-and-charge-thuisbatterij-5-
 | Round-trip efficiency | 90% |
 | Max charge | 2500 W |
 | Discharge range | 800-2500 W |
-| Local API | UDP to `192.168.1.255:30000` |
+| Control API | ESPHome REST (default) or UDP |
 
-API documentation: [docs/marstek-api.md](docs/marstek-api.md) | [Original PDF](https://static-eu.marstekenergy.com/ems/resource/agreement/MarstekDeviceOpenApi.pdf)
+### ESPHome Integration (Default)
+The service uses an ESPHome device as a bridge to control the battery via HTTP REST API. This provides more reliable communication than the native UDP protocol.
+
+- **Default endpoint**: `http://192.168.1.50`
+- **Protocol**: HTTP REST with JSON responses
+
+### Legacy UDP API (Optional)
+Direct UDP control is available but not enabled by default. See [docs/marstek-api.md](docs/marstek-api.md) for protocol details.
 
 ### NordPool API
 - **Endpoint**: `https://dataportal-api.nordpoolgroup.com/api/DayAheadPriceIndices`
@@ -62,7 +69,7 @@ Copy `.env.example` to `.env`. Key settings:
 |----------|---------|-------------|
 | `MIN_PRICE_SPREAD` | `0.05` | Minimum EUR/kWh spread to trigger trading |
 | `BATTERY_EFFICIENCY` | `0.90` | Round-trip efficiency (0.0-1.0) |
-| `BATTERY_UDP_ADDR` | `192.168.1.255:30000` | Battery UDP address |
+| `ESPHOME_URL` | `http://192.168.1.50` | ESPHome device URL |
 | `CHARGE_POWER_W` | `2500` | Charge power in watts |
 | `DISCHARGE_POWER_W` | `2500` | Discharge power in watts |
 | `TELEGRAM_BOT_TOKEN` | - | Optional: Telegram notifications |
@@ -90,8 +97,7 @@ To follow trading decisions: `docker logs -f <container> | jq 'select(.msg | sta
 
 ## Limitations
 
-- **Single instance per host**: The battery client binds to UDP port 30000 (required by Marstek protocol). Only one instance can run per host.
-- **Network requirements**: The service must be on the same network as the battery for UDP broadcast.
+- **Network requirements**: The service must be able to reach the ESPHome device over HTTP.
 
 ## Project Structure
 
@@ -99,8 +105,9 @@ To follow trading decisions: `docker logs -f <container> | jq 'select(.msg | sta
 cmd/trader/main.go       # Entry point
 internal/config/         # Configuration (env parsing via caarlos0/env)
 clients/
+  esphome/               # ESPHome HTTP client (default)
+  marstek/               # Battery UDP client (legacy, preserved)
   nordpool/              # NordPool API client
-  marstek/               # Battery UDP client
   telegram/              # Telegram bot notifications
 service/
   service.go             # Trading engine + main loop

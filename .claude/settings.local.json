@@ -17,7 +17,10 @@
       "Bash(do echo \"=== Test $i ===\")",
       "Bash(done)",
       "Bash(LOG_LEVEL=debug timeout 120 go run:*)",
-      "Bash(xargs:*)"
+      "Bash(xargs:*)",
+      "Bash(docker logs:*)",
+      "Bash(docker ps:*)",
+      "Bash(python3:*)"
     ]
   }
 }

@@ -36,4 +36,4 @@ docker-build:
 # Run Docker container (mounts ./data for state, uses host network for UDP)
 docker-run:
 	@mkdir -p data
-	docker run --rm --network=host --env-file .env -v $(PWD)/data:/app/data energy-trader:latest
+	docker run -d --name energy-trader --network=host --env-file .env -v $(PWD)/data:/app/data energy-trader:latest

@@ -27,7 +27,8 @@ type Config struct {
 	MaxCyclesPerDay    int     `env:"MAX_CYCLES_PER_DAY" envDefault:"2"`
 
 	// Battery
-	BatteryUDPAddr      string `env:"BATTERY_UDP_ADDR" envDefault:"192.168.1.255:30000"`
+	BatteryUDPAddr      string `env:"BATTERY_UDP_ADDR"`                             // No default (optional, for UDP client)
+	ESPHomeURL          string `env:"ESPHOME_URL" envDefault:"http://192.168.1.50"` // ESPHome REST API
 	ChargePowerW        int    `env:"CHARGE_POWER_W" envDefault:"2500"`
 	DischargePowerW     int    `env:"DISCHARGE_POWER_W" envDefault:"2500"`
 	PassiveModeTimeoutS int    `env:"PASSIVE_MODE_TIMEOUT_S" envDefault:"300"`

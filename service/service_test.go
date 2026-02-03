@@ -657,7 +657,7 @@ func (e *mockError) Error() string { return e.msg }
 
 func TestIsDischargeProfitiable_ZeroLastChargePrice(t *testing.T) {
 	// Scenario: No previous charge recorded (lastChargePrice = 0)
-	// Expected: Should allow discharge
+	// Expected: Should block discharge (need known cost basis for profitability check)
 
 	cfg := testConfig()
 	svc := &Service{
@@ -665,8 +665,8 @@ func TestIsDischargeProfitiable_ZeroLastChargePrice(t *testing.T) {
 		lastChargePrice: decimal.Zero,
 	}
 
-	if !svc.isDischargeProfitiable(decimal.NewFromFloat(0.10)) {
-		t.Error("discharge should be allowed when no previous charge recorded")
+	if svc.isDischargeProfitiable(decimal.NewFromFloat(0.10)) {
+		t.Error("discharge should be blocked when no previous charge recorded")
 	}
 }
 

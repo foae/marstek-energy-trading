@@ -122,24 +122,26 @@ func (r *Recorder) GetHistory() History {
 		dischargeRevenue := decimal.Zero
 		var chargeCycles, dischargeCycles int
 
-		// Track min/max prices
-		minChargePrice := decimal.Zero
-		maxDischargePrice := decimal.Zero
+		// Track min/max prices with seen flags to handle negative prices correctly
+		var minChargePrice, maxDischargePrice decimal.Decimal
+		var seenCharge, seenDischarge bool
 
 		for _, t := range trades {
 			switch t.Action {
 			case ActionCharge:
 				chargedKWh = chargedKWh.Add(t.EnergyKWh)
 				chargeCost = chargeCost.Add(t.PriceEUR.Mul(t.EnergyKWh))
-				if minChargePrice.IsZero() || t.PriceEUR.LessThan(minChargePrice) {
+				if !seenCharge || t.PriceEUR.LessThan(minChargePrice) {
 					minChargePrice = t.PriceEUR
+					seenCharge = true
 				}
 				chargeCycles++
 			case ActionDischarge:
 				dischargedKWh = dischargedKWh.Add(t.EnergyKWh)
 				dischargeRevenue = dischargeRevenue.Add(t.PriceEUR.Mul(t.EnergyKWh))
-				if t.PriceEUR.GreaterThan(maxDischargePrice) {
+				if !seenDischarge || t.PriceEUR.GreaterThan(maxDischargePrice) {
 					maxDischargePrice = t.PriceEUR
+					seenDischarge = true
 				}
 				dischargeCycles++
 			}

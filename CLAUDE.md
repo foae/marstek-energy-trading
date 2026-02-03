@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Energy market minitrader - a Go service that performs energy price arbitrage using a Marstek Venus E battery (5.12 kWh). It fetches NordPool day-ahead prices, identifies optimal charge/discharge windows, and controls the battery via UDP.
+Energy market minitrader - a Go service that performs energy price arbitrage using a Marstek Venus E battery (5.12 kWh). It fetches NordPool day-ahead prices, identifies optimal charge/discharge windows, and controls the battery via ESPHome HTTP REST API.
 
 ## Hardware Constraints
 
@@ -15,7 +15,8 @@ Energy market minitrader - a Go service that performs energy price arbitrage usi
 
 ## API Documentation
 
-- **Marstek local API**: UDP to `192.168.1.255:30000` - JSON-RPC protocol. See [docs/marstek-api.md](docs/marstek-api.md)
+- **ESPHome REST API**: `http://192.168.1.50` (default) - HTTP REST with JSON responses. Used for battery control.
+- **Marstek UDP API**: `192.168.1.255:30000` - JSON-RPC protocol. Legacy, see [docs/marstek-api.md](docs/marstek-api.md)
 - **NordPool API**: `https://dataportal-api.nordpoolgroup.com/api/DayAheadPriceIndices` - 15-min resolution
 
 ## Build Commands
@@ -34,8 +35,9 @@ make docker-build       # build Docker image
 cmd/trader/main.go       # Entry point
 internal/config/         # Configuration (env parsing via caarlos0/env)
 clients/
+  esphome/               # ESPHome HTTP client (default battery backend)
+  marstek/               # Battery UDP client (legacy, preserved but unwired)
   nordpool/              # NordPool API client (timezone-aware)
-  marstek/               # Battery UDP client (port 30000)
   telegram/              # Telegram notifications
 service/
   service.go             # Trading engine + main loop
@@ -54,6 +56,7 @@ handler/                 # HTTP health/metrics/status
 ## Configuration
 
 Copy `.env.example` to `.env`. Key settings:
+- `ESPHOME_URL`: ESPHome device URL (default `http://192.168.1.50`)
 - `MIN_PRICE_SPREAD`: Minimum EUR/kWh spread to trigger trading
 - `BATTERY_EFFICIENCY`: Round-trip efficiency (default 0.90)
 - `CHARGE_POWER_W` / `DISCHARGE_POWER_W`: Power rates in watts
@@ -102,10 +105,18 @@ Copy `.env.example` to `.env`. Key settings:
 - Use atomic writes for data files: write to temp file, then `os.Rename()`
 - Prevents corruption if process crashes during write
 
-### UDP Protocol (Marstek)
+### ESPHome HTTP Protocol
+- Stateless HTTP REST - each request is independent
+- Sensor values: GET `/sensor/{name}` returns JSON with `state` field
+- Commands: POST `/number/{name}/set?value=X` or `/select/{name}/set?option=Y`
+- No auto-timeout on charge/discharge - service's refresh loop re-sends commands
+- Entity names use URL encoding (spaces as `%20`, Unicode division slash as `%E2%81%84`)
+
+### Legacy UDP Protocol (Marstek)
 - Validate response ID matches request ID (loop until match or timeout)
 - Client binds to port 30000 (protocol requirement) - only one instance per host
 - Close connection on shutdown
+- Code preserved in `clients/marstek/` but not wired into main.go
 
 ## Trading Algorithm
 

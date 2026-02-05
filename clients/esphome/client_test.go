@@ -67,13 +67,13 @@ func TestGetBatteryStatus(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case strings.Contains(r.URL.Path, "State%20Of%20Charge") || strings.Contains(r.URL.Path, "State Of Charge"):
-			w.Write([]byte(`{"id":"sensor-soc","state":75}`))
+			w.Write([]byte(`{"id":"sensor-soc","value":75,"state":"75 %"}`))
 		case strings.Contains(r.URL.Path, "Temperature"):
-			w.Write([]byte(`{"id":"sensor-temp","state":25.5}`))
+			w.Write([]byte(`{"id":"sensor-temp","value":25.5,"state":"25.5 °C"}`))
 		case strings.Contains(r.URL.Path, "Remaining%20Capacity") || strings.Contains(r.URL.Path, "Remaining Capacity"):
-			w.Write([]byte(`{"id":"sensor-cap","state":3.84}`)) // kWh
+			w.Write([]byte(`{"id":"sensor-cap","value":3.84,"state":"3.84 kWh"}`))
 		case strings.Contains(r.URL.Path, "Total%20Energy") || strings.Contains(r.URL.Path, "Total Energy"):
-			w.Write([]byte(`{"id":"sensor-total","state":5.12}`)) // kWh
+			w.Write([]byte(`{"id":"sensor-total","value":5.12,"state":"5.12 kWh"}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -107,7 +107,7 @@ func TestGetBatteryStatus_PartialFailure(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.Contains(r.URL.Path, "State%20Of%20Charge") || strings.Contains(r.URL.Path, "State Of Charge") {
-			w.Write([]byte(`{"id":"sensor-soc","state":50}`))
+			w.Write([]byte(`{"id":"sensor-soc","value":50,"state":"50 %"}`))
 			return
 		}
 		http.NotFound(w, r)
@@ -147,7 +147,7 @@ func TestGetBatteryStatus_ChargingFlags(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				if strings.Contains(r.URL.Path, "State%20Of%20Charge") || strings.Contains(r.URL.Path, "State Of Charge") {
-					fmt.Fprintf(w, `{"id":"sensor-soc","state":%d}`, soc)
+					fmt.Fprintf(w, `{"id":"sensor-soc","value":%d,"state":"%d %%"}`, soc, soc)
 					return
 				}
 				http.NotFound(w, r)
@@ -317,11 +317,11 @@ func TestGetESStatus(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case strings.Contains(r.URL.Path, "State%20Of%20Charge") || strings.Contains(r.URL.Path, "State Of Charge"):
-			w.Write([]byte(`{"id":"sensor-soc","state":80}`))
+			w.Write([]byte(`{"id":"sensor-soc","value":80,"state":"80 %"}`))
 		case strings.Contains(r.URL.Path, "Battery%20Power") || strings.Contains(r.URL.Path, "Battery Power"):
-			w.Write([]byte(`{"id":"sensor-power","state":-1500}`)) // negative = charging
+			w.Write([]byte(`{"id":"sensor-power","value":-1500,"state":"-1500 W"}`)) // negative = charging
 		case strings.Contains(r.URL.Path, "Remaining%20Capacity") || strings.Contains(r.URL.Path, "Remaining Capacity"):
-			w.Write([]byte(`{"id":"sensor-cap","state":4.1}`))
+			w.Write([]byte(`{"id":"sensor-cap","value":4.1,"state":"4.1 kWh"}`))
 		default:
 			http.NotFound(w, r)
 		}

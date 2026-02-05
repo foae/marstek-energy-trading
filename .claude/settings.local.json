@@ -20,7 +20,8 @@
       "Bash(xargs:*)",
       "Bash(docker logs:*)",
       "Bash(docker ps:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(ssh:*)"
     ]
   }
 }

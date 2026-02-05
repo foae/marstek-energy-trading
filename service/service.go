@@ -579,13 +579,17 @@ func (s *Service) checkPriceFetch(ctx context.Context) {
 			s.tomorrowPrices = nil
 			s.currentPlan = AnalyzePrices(s.todayPrices, s.analyzerConfig())
 			s.lastMidnightSwap = now
+			plan := s.currentPlan
+			slotsTotal := len(s.todayPrices)
+			s.mu.Unlock()
 
-			l := slog.With("day", "today", "slots_total", len(s.todayPrices))
+			l := slog.With("day", "today", "slots_total", slotsTotal)
 			l.Info("switched to new day's prices",
-				"price_min_eur_kwh", s.currentPlan.MinPrice,
-				"price_max_eur_kwh", s.currentPlan.MaxPrice,
+				"price_min_eur_kwh", plan.MinPrice,
+				"price_max_eur_kwh", plan.MaxPrice,
 			)
-			s.logTradingPlan(l, s.currentPlan)
+			// Log and notify (outside lock for network I/O)
+			s.logAndNotifyTradingPlan(ctx, l, plan, "today", slotsTotal, slotsTotal)
 		} else {
 			// Fallback: tomorrow's prices weren't fetched, fetch today's prices now
 			slog.Warn("tomorrow's prices not available at midnight, fetching today's prices")
@@ -595,9 +599,7 @@ func (s *Service) checkPriceFetch(ctx context.Context) {
 				slog.Error("failed to fetch today's prices at midnight", "error", err)
 				s.notifyError(ctx, "Failed to fetch today's prices at midnight: "+err.Error())
 			}
-			return
 		}
-		s.mu.Unlock()
 	}
 }
 
@@ -633,8 +635,8 @@ func (s *Service) fetchTodayPrices(ctx context.Context) error {
 		"price_max_eur_kwh", s.currentPlan.MaxPrice,
 	)
 
-	// Log trading plan details
-	s.logTradingPlan(l, s.currentPlan)
+	// Log and notify trading plan
+	s.logAndNotifyTradingPlan(ctx, l, s.currentPlan, "today", len(prices), len(futurePrices))
 
 	return nil
 }
@@ -660,41 +662,76 @@ func (s *Service) fetchTomorrowPrices(ctx context.Context) error {
 		"price_max_eur_kwh", plan.MaxPrice,
 	)
 
-	// Log trading plan details
-	s.logTradingPlan(l, plan)
+	// Log and notify trading plan
+	s.logAndNotifyTradingPlan(ctx, l, plan, "tomorrow", len(prices), len(prices))
 
 	return nil
 }
 
-// logTradingPlan logs the trading windows for a given plan using the provided logger.
-func (s *Service) logTradingPlan(l *slog.Logger, plan *TradingPlan) {
-	if !plan.IsProfitable {
-		// Calculate break-even spread needed to overcome efficiency loss
-		// For a charge at min price, discharge must be > minPrice/efficiency
-		breakEvenDischarge := plan.MinPrice / s.cfg.BatteryEfficiency
-		minProfitableSpread := breakEvenDischarge - plan.MinPrice
+// logAndNotifyTradingPlan logs the trading plan and sends a Telegram notification.
+func (s *Service) logAndNotifyTradingPlan(ctx context.Context, l *slog.Logger, plan *TradingPlan, day string, slotsTotal, slotsAnalyzed int) {
+	// Calculate break-even spread needed to overcome efficiency loss
+	breakEvenDischarge := plan.MinPrice / s.cfg.BatteryEfficiency
+	minProfitableSpread := breakEvenDischarge - plan.MinPrice
 
+	if !plan.IsProfitable {
 		l.Info("no profitable charge→discharge sequence found",
 			"reason", "window-averaged prices don't meet spread/efficiency requirements",
 			"min_spread_for_efficiency", minProfitableSpread,
 			"min_spread_configured", s.cfg.MinPriceSpread,
 			"battery_efficiency", s.cfg.BatteryEfficiency,
 		)
+	} else {
+		// Log each profitable cycle
+		for i, c := range plan.Cycles {
+			l.Info("profitable cycle found",
+				"cycle", i+1,
+				"charge_start", c.ChargeWindow.Start.Format("15:04"),
+				"charge_end", c.ChargeWindow.End.Format("15:04"),
+				"charge_avg_eur_kwh", c.ChargeWindow.Price,
+				"discharge_start", c.DischargeWindow.Start.Format("15:04"),
+				"discharge_end", c.DischargeWindow.End.Format("15:04"),
+				"discharge_avg_eur_kwh", c.DischargeWindow.Price,
+				"expected_profit_eur_kwh", c.Profit,
+			)
+		}
+	}
+
+	// Send Telegram notification
+	if !s.telegramEnabled() {
 		return
 	}
 
-	// Log each profitable cycle
-	for i, c := range plan.Cycles {
-		l.Info("profitable cycle found",
-			"cycle", i+1,
-			"charge_start", c.ChargeWindow.Start.Format("15:04"),
-			"charge_end", c.ChargeWindow.End.Format("15:04"),
-			"charge_avg_eur_kwh", c.ChargeWindow.Price,
-			"discharge_start", c.DischargeWindow.Start.Format("15:04"),
-			"discharge_end", c.DischargeWindow.End.Format("15:04"),
-			"discharge_avg_eur_kwh", c.DischargeWindow.Price,
-			"expected_profit_eur_kwh", c.Profit,
-		)
+	// Build notification data
+	data := telegram.TradingPlanData{
+		Day:                    day,
+		Date:                   plan.Date,
+		SlotsTotal:             slotsTotal,
+		SlotsAnalyzed:          slotsAnalyzed,
+		PriceMin:               plan.MinPrice,
+		PriceMax:               plan.MaxPrice,
+		IsProfitable:           plan.IsProfitable,
+		Reason:                 "Window-averaged prices don't meet spread/efficiency requirements",
+		MinSpreadForEfficiency: minProfitableSpread,
+		MinSpreadConfigured:    s.cfg.MinPriceSpread,
+		BatteryEfficiency:      s.cfg.BatteryEfficiency,
+	}
+
+	// Add cycles if profitable
+	for _, c := range plan.Cycles {
+		data.Cycles = append(data.Cycles, telegram.TradingPlanCycle{
+			ChargeStart:    c.ChargeWindow.Start.Format("15:04"),
+			ChargeEnd:      c.ChargeWindow.End.Format("15:04"),
+			ChargePrice:    c.ChargeWindow.Price,
+			DischargeStart: c.DischargeWindow.Start.Format("15:04"),
+			DischargeEnd:   c.DischargeWindow.End.Format("15:04"),
+			DischargePrice: c.DischargeWindow.Price,
+			ProfitPerKWh:   c.Profit,
+		})
+	}
+
+	if err := s.telegram.SendTradingPlan(ctx, data); err != nil {
+		slog.Warn("failed to send trading plan notification", "error", err)
 	}
 }
 

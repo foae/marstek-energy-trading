@@ -257,6 +257,89 @@ type getUpdatesResponse struct {
 	Result []Update `json:"result"`
 }
 
+// TradingPlanCycle represents a single charge/discharge cycle.
+type TradingPlanCycle struct {
+	ChargeStart    string
+	ChargeEnd      string
+	ChargePrice    float64
+	DischargeStart string
+	DischargeEnd   string
+	DischargePrice float64
+	ProfitPerKWh   float64
+}
+
+// TradingPlanData contains data for trading plan notifications.
+type TradingPlanData struct {
+	Day           string // "today" or "tomorrow"
+	Date          time.Time
+	SlotsTotal    int
+	SlotsAnalyzed int
+	PriceMin      float64
+	PriceMax      float64
+	IsProfitable  bool
+	Cycles        []TradingPlanCycle
+	// For non-profitable plans
+	Reason                 string
+	MinSpreadForEfficiency float64
+	MinSpreadConfigured    float64
+	BatteryEfficiency      float64
+}
+
+// SendTradingPlan sends a trading plan notification.
+func (c *Client) SendTradingPlan(ctx context.Context, data TradingPlanData) error {
+	var text string
+
+	dateStr := data.Date.Format("02 Jan 2006")
+	dayLabel := "📅"
+	if data.Day == "tomorrow" {
+		dayLabel = "🔮"
+	}
+
+	if !data.IsProfitable {
+		text = fmt.Sprintf(
+			"%s <b>Trading Plan - %s</b>\n"+
+				"<i>%s</i>\n\n"+
+				"❌ <b>No profitable opportunities</b>\n\n"+
+				"Price range: %.4f - %.4f EUR/kWh\n"+
+				"Slots analyzed: %d of %d\n\n"+
+				"<i>%s</i>\n"+
+				"Min spread needed: %.4f EUR/kWh\n"+
+				"Configured min spread: %.4f EUR/kWh",
+			dayLabel, data.Day, dateStr,
+			data.PriceMin, data.PriceMax,
+			data.SlotsAnalyzed, data.SlotsTotal,
+			data.Reason,
+			data.MinSpreadForEfficiency,
+			data.MinSpreadConfigured,
+		)
+	} else {
+		text = fmt.Sprintf(
+			"%s <b>Trading Plan - %s</b>\n"+
+				"<i>%s</i>\n\n"+
+				"✅ <b>%d profitable cycle(s) found</b>\n\n"+
+				"Price range: %.4f - %.4f EUR/kWh\n",
+			dayLabel, data.Day, dateStr,
+			len(data.Cycles),
+			data.PriceMin, data.PriceMax,
+		)
+
+		for i, cycle := range data.Cycles {
+			text += fmt.Sprintf(
+				"\n<b>Cycle %d:</b>\n"+
+					"🔋 Charge: %s - %s @ %.4f EUR/kWh\n"+
+					"⚡ Discharge: %s - %s @ %.4f EUR/kWh\n"+
+					"💰 Expected profit: %.4f EUR/kWh\n",
+				i+1,
+				cycle.ChargeStart, cycle.ChargeEnd, cycle.ChargePrice,
+				cycle.DischargeStart, cycle.DischargeEnd, cycle.DischargePrice,
+				cycle.ProfitPerKWh,
+			)
+		}
+	}
+
+	return c.SendMessage(ctx, text)
+}
+
 // PollCommands checks for new commands and returns them.
 // Returns command strings (e.g., "/status") from the configured chat.
 func (c *Client) PollCommands(ctx context.Context) ([]string, error) {

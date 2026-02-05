@@ -612,9 +612,19 @@ func (s *Service) fetchTodayPrices(ctx context.Context) error {
 		return err
 	}
 
+	// Filter to only future prices for analysis (handles late-start scenarios)
+	now := s.now()
+	futurePrices := make([]nordpool.Price, 0, len(prices))
+	for _, p := range prices {
+		slotEnd := p.Time.Add(15 * time.Minute)
+		if !slotEnd.Before(now) { // include slots not yet ended
+			futurePrices = append(futurePrices, p)
+		}
+	}
+
 	s.mu.Lock()
-	s.todayPrices = prices
-	s.currentPlan = AnalyzePrices(prices, s.analyzerConfig())
+	s.todayPrices = prices                                            // full day for price lookups
+	s.currentPlan = AnalyzePrices(futurePrices, s.analyzerConfig()) // analyze only future
 	s.mu.Unlock()
 
 	l := slog.With(

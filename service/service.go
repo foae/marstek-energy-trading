@@ -580,15 +580,11 @@ func (s *Service) checkPriceFetch(ctx context.Context) {
 			s.currentPlan = AnalyzePrices(s.todayPrices, s.analyzerConfig())
 			s.lastMidnightSwap = now
 
-			l := slog.With(
-				"day", "today",
-				"count", len(s.todayPrices),
-				"min_price_eur_kwh", s.currentPlan.MinPrice,
-				"max_price_eur_kwh", s.currentPlan.MaxPrice,
-				"spread_eur_kwh", s.currentPlan.Spread,
-				"profitable", s.currentPlan.IsProfitable,
+			l := slog.With("day", "today", "slots_total", len(s.todayPrices))
+			l.Info("switched to new day's prices",
+				"price_min_eur_kwh", s.currentPlan.MinPrice,
+				"price_max_eur_kwh", s.currentPlan.MaxPrice,
 			)
-			l.Info("switched to new day's prices")
 			s.logTradingPlan(l, s.currentPlan)
 		} else {
 			// Fallback: tomorrow's prices weren't fetched, fetch today's prices now
@@ -623,21 +619,21 @@ func (s *Service) fetchTodayPrices(ctx context.Context) error {
 	}
 
 	s.mu.Lock()
-	s.todayPrices = prices                                            // full day for price lookups
+	s.todayPrices = prices                                          // full day for price lookups
 	s.currentPlan = AnalyzePrices(futurePrices, s.analyzerConfig()) // analyze only future
 	s.mu.Unlock()
 
 	l := slog.With(
 		"day", "today",
-		"count", len(prices),
-		"min_price_eur_kwh", s.currentPlan.MinPrice,
-		"max_price_eur_kwh", s.currentPlan.MaxPrice,
-		"spread_eur_kwh", s.currentPlan.Spread,
-		"profitable", s.currentPlan.IsProfitable,
+		"slots_total", len(prices),
+		"slots_analyzed", len(futurePrices),
 	)
-	l.Info("fetched prices")
+	l.Info("fetched prices",
+		"price_min_eur_kwh", s.currentPlan.MinPrice,
+		"price_max_eur_kwh", s.currentPlan.MaxPrice,
+	)
 
-	// Log trading windows at Info level for visibility
+	// Log trading plan details
 	s.logTradingPlan(l, s.currentPlan)
 
 	return nil
@@ -657,15 +653,14 @@ func (s *Service) fetchTomorrowPrices(ctx context.Context) error {
 	plan := AnalyzePrices(prices, s.analyzerConfig())
 	l := slog.With(
 		"day", "tomorrow",
-		"count", len(prices),
-		"min_price_eur_kwh", plan.MinPrice,
-		"max_price_eur_kwh", plan.MaxPrice,
-		"spread_eur_kwh", plan.Spread,
-		"profitable", plan.IsProfitable,
+		"slots_total", len(prices),
 	)
-	l.Info("fetched prices")
+	l.Info("fetched prices",
+		"price_min_eur_kwh", plan.MinPrice,
+		"price_max_eur_kwh", plan.MaxPrice,
+	)
 
-	// Log trading windows at Info level for visibility
+	// Log trading plan details
 	s.logTradingPlan(l, plan)
 
 	return nil
@@ -674,26 +669,32 @@ func (s *Service) fetchTomorrowPrices(ctx context.Context) error {
 // logTradingPlan logs the trading windows for a given plan using the provided logger.
 func (s *Service) logTradingPlan(l *slog.Logger, plan *TradingPlan) {
 	if !plan.IsProfitable {
-		l.Info("trading plan: no profitable windows", "min_required_spread", s.cfg.MinPriceSpread)
+		// Calculate break-even spread needed to overcome efficiency loss
+		// For a charge at min price, discharge must be > minPrice/efficiency
+		breakEvenDischarge := plan.MinPrice / s.cfg.BatteryEfficiency
+		minProfitableSpread := breakEvenDischarge - plan.MinPrice
+
+		l.Info("no profitable charge→discharge sequence found",
+			"reason", "window-averaged prices don't meet spread/efficiency requirements",
+			"min_spread_for_efficiency", minProfitableSpread,
+			"min_spread_configured", s.cfg.MinPriceSpread,
+			"battery_efficiency", s.cfg.BatteryEfficiency,
+		)
 		return
 	}
 
-	// Log charge windows
-	for i, w := range plan.ChargeWindows {
-		l.Info("trading plan: charge window",
-			"window", i+1,
-			"start", w.Start.Format("15:04"),
-			"end", w.End.Format("15:04"),
-			"avg_price_eur_kwh", w.Price)
-	}
-
-	// Log discharge windows
-	for i, w := range plan.DischargeWindows {
-		l.Info("trading plan: discharge window",
-			"window", i+1,
-			"start", w.Start.Format("15:04"),
-			"end", w.End.Format("15:04"),
-			"avg_price_eur_kwh", w.Price)
+	// Log each profitable cycle
+	for i, c := range plan.Cycles {
+		l.Info("profitable cycle found",
+			"cycle", i+1,
+			"charge_start", c.ChargeWindow.Start.Format("15:04"),
+			"charge_end", c.ChargeWindow.End.Format("15:04"),
+			"charge_avg_eur_kwh", c.ChargeWindow.Price,
+			"discharge_start", c.DischargeWindow.Start.Format("15:04"),
+			"discharge_end", c.DischargeWindow.End.Format("15:04"),
+			"discharge_avg_eur_kwh", c.DischargeWindow.Price,
+			"expected_profit_eur_kwh", c.Profit,
+		)
 	}
 }
 

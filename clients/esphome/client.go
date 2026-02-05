@@ -196,10 +196,12 @@ func (c *Client) Idle() error {
 }
 
 // sensorResponse represents ESPHome sensor JSON response.
+// Note: ESPHome returns "state" as a formatted string with unit (e.g., "11.0 %"),
+// while "value" is the raw numeric value. We only use "value".
 type sensorResponse struct {
 	ID    string  `json:"id"`
-	State float64 `json:"state"`
-	Value float64 `json:"value"`
+	State string  `json:"state"` // Formatted string with unit, not used
+	Value float64 `json:"value"` // Raw numeric value
 }
 
 // textSensorResponse represents ESPHome text sensor JSON response.
@@ -227,11 +229,7 @@ func (c *Client) getSensorFloat(path string) (float64, error) {
 		return 0, fmt.Errorf("decode sensor response: %w", err)
 	}
 
-	// ESPHome may return value in either "state" or "value" field
-	if sensor.Value != 0 {
-		return sensor.Value, nil
-	}
-	return sensor.State, nil
+	return sensor.Value, nil
 }
 
 // getTextSensor retrieves a text sensor value.

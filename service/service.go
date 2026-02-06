@@ -432,7 +432,7 @@ func (s *Service) stopChargingLocked(ctx context.Context, endSOC int) {
 
 	s.mu.Unlock()
 	if s.telegramEnabled() {
-		if err := s.telegram.SendTradeEnd(ctx, "Charging", energyF, avgPriceF); err != nil {
+		if err := s.telegram.SendTradeEnd(ctx, "Charging", energyF, avgPriceF, endSOC); err != nil {
 			l.Warn("failed to send trade notification", "error", err)
 		}
 	}
@@ -514,7 +514,7 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 
 	s.mu.Unlock()
 	if s.telegramEnabled() {
-		if err := s.telegram.SendTradeEnd(ctx, "Discharging", energyF, priceF); err != nil {
+		if err := s.telegram.SendTradeEnd(ctx, "Discharging", energyF, priceF, endSOC); err != nil {
 			l.Warn("failed to send trade notification", "error", err)
 		}
 	}

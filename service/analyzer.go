@@ -8,6 +8,13 @@ import (
 	"github.com/foae/marstek-energy-trading/clients/nordpool"
 )
 
+// localMidnight returns midnight in the time's local timezone.
+// Unlike Truncate(24h) which truncates to UTC midnight, this preserves the local date.
+func localMidnight(t time.Time) time.Time {
+	y, m, d := t.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, t.Location())
+}
+
 // TimeWindow represents a time window for charging or discharging.
 type TimeWindow struct {
 	Start time.Time
@@ -84,7 +91,7 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 	// Handle case where we don't have enough data points
 	if len(sortedByTime) < chargeWindowSize || len(sortedByTime) < dischargeWindowSize {
 		return &TradingPlan{
-			Date:     sortedByTime[0].Time.Truncate(24 * time.Hour),
+			Date:     localMidnight(sortedByTime[0].Time),
 			MinPrice: minPrice,
 			MaxPrice: maxPrice,
 			Spread:   spread,
@@ -123,7 +130,7 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 	}
 
 	return &TradingPlan{
-		Date:             sortedByTime[0].Time.Truncate(24 * time.Hour),
+		Date:             localMidnight(sortedByTime[0].Time),
 		ChargeWindows:    chargeWindows,
 		DischargeWindows: dischargeWindows,
 		Cycles:           cycles,

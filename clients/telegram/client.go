@@ -96,10 +96,11 @@ func (c *Client) SendTradeStart(ctx context.Context, action string, priceEUR flo
 }
 
 // SendTradeEnd sends a notification when a trade ends.
-func (c *Client) SendTradeEnd(ctx context.Context, action string, energyKWh float64, avgPriceEUR float64) error {
+func (c *Client) SendTradeEnd(ctx context.Context, action string, energyKWh float64, avgPriceEUR float64, endSOC int) error {
+	totalCost := energyKWh * avgPriceEUR
 	text := fmt.Sprintf(
-		"<b>%s completed</b>\nEnergy: %.2f kWh\nAvg price: %.4f EUR/kWh",
-		action, energyKWh, avgPriceEUR,
+		"<b>%s completed</b>\nEnergy: %.2f kWh\nAvg price: %.4f EUR/kWh\nTotal cost: %.4f EUR\nSOC: %d%%",
+		action, energyKWh, avgPriceEUR, totalCost, endSOC,
 	)
 	return c.SendMessage(ctx, text)
 }

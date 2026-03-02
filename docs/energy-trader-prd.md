@@ -4,7 +4,7 @@ Product Requirements Document for the Marstek Energy Trading Bot.
 
 ## Overview
 
-A Go service that performs energy price arbitrage using a Marstek Venus E battery. The service fetches NordPool day-ahead prices, identifies optimal charge/discharge windows, and controls the battery via an ESPHome HTTP REST API.
+A Go service that performs energy price arbitrage using a Marstek Venus E battery. The service fetches NordPool day-ahead prices, identifies optimal charge/discharge windows, and controls the battery via an ESPHome HTTP REST API. It also supports solar self-consumption: when a HomeWizard P1 meter detects grid export (solar surplus), the battery charges with free energy and discharges it during high-price windows for pure profit.
 
 ## Hardware
 
@@ -27,6 +27,13 @@ A Go service that performs energy price arbitrage using a Marstek Venus E batter
   - `Forcible%20Charge%20Power` - Charge power setting
   - `Forcible%20Discharge%20Power` - Discharge power setting
   - `Forcible%20Charge%E2%81%84Discharge` - Mode select (charge/discharge/stop)
+
+### HomeWizard P1 Meter (Optional)
+- **Protocol**: HTTP REST API
+- **Endpoint**: `GET /api/v1/data` - returns `active_power_w` (positive = import, negative = export)
+- **Connectivity check**: `GET /api` - returns device info
+- **Timeout**: 5 seconds
+- **Purpose**: Detects solar surplus (grid export) to trigger battery charging with free energy
 
 ### Legacy UDP API (Preserved)
 - **Protocol**: UDP JSON-RPC to `192.168.1.255:30000`
@@ -82,6 +89,24 @@ discharge_price > charge_price / 0.90
 
 Example: Charging at 0.10 EUR/kWh requires discharging at > 0.111 EUR/kWh to break even.
 
+### Simplified Discharge
+
+The service always discharges during high-price windows when SOC > min SOC, regardless of the last charge price. This is because:
+- Solar-charged energy is free, so any discharge revenue is pure profit
+- Even grid-charged energy is better discharged than left idle (the energy is already in the battery)
+
+The `lastChargePrice` is still tracked for observability logging but no longer gates discharge decisions.
+
+### Solar Self-Consumption
+
+When a HomeWizard P1 meter is configured, the service detects grid export (solar surplus) and charges the battery with free energy:
+
+1. **Detection**: P1 meter is polled every 1 second. Negative `active_power_w` = exporting to grid = solar surplus.
+2. **Confirmation**: Requires 3 consecutive readings above `SOLAR_MIN_SURPLUS_W` (default: 100W) to avoid false starts.
+3. **Charging**: Battery charges at the detected surplus power (clamped to `CHARGE_POWER_W`). Power is dynamically adjusted with a 50W deadband to avoid flapping.
+4. **Yielding**: Solar charging stops immediately when a scheduled charge or discharge window starts.
+5. **Recording**: Solar charges are recorded as `solar_charge` trades with price = 0 EUR/kWh. They contribute to `chargedKWh` but not to `chargeCost` in P&L.
+
 ### Configurable Spread Threshold
 
 Trades only execute when price spread exceeds `MIN_PRICE_SPREAD` (default: 0.05 EUR/kWh).
@@ -111,7 +136,8 @@ Time    Price   Action
 
 ### Execution Model
 - Continuous daemon process
-- Main loop runs every minute
+- Main trading loop runs every minute
+- Solar tick loop runs every 1 second (when P1 meter configured, nil channel when disabled)
 - Graceful shutdown on SIGINT/SIGTERM
 
 ### Data Persistence
@@ -218,6 +244,8 @@ Load from `.env` file with fallback to environment variables.
 | `CHARGE_POWER_W` | `2500` | Charge power (watts) |
 | `DISCHARGE_POWER_W` | `2500` | Discharge power (watts) |
 | `PASSIVE_MODE_TIMEOUT_S` | `300` | Passive mode timeout |
+| `HOMEWIZARD_P1_URL` | - | HomeWizard P1 meter URL (optional, empty = disabled) |
+| `SOLAR_MIN_SURPLUS_W` | `100` | Min surplus watts to start solar charging |
 | `TELEGRAM_BOT_TOKEN` | - | Telegram bot token |
 | `TELEGRAM_CHAT_ID` | - | Telegram chat ID |
 
@@ -225,6 +253,7 @@ Load from `.env` file with fallback to environment variables.
 
 | Time | Action |
 |------|--------|
+| Every 1 sec | Solar tick: read P1 meter, manage solar charging (when enabled) |
 | Every 1 min | Check battery, execute trades |
 | Every 5 sec | Poll Telegram commands |
 | Every 15 min | Check if prices need fetching |
@@ -244,6 +273,7 @@ marstek-energy-trading/
 │   └── interfaces.go            # BatteryController interface
 ├── clients/
 │   ├── esphome/client.go        # ESPHome HTTP client (default)
+│   ├── homewizard/client.go     # HomeWizard P1 meter (solar surplus detection)
 │   ├── marstek/client.go        # Battery UDP (legacy, preserved)
 │   ├── nordpool/client.go       # NordPool API
 │   └── telegram/client.go       # Telegram bot
@@ -267,7 +297,6 @@ make docker-build   # Build Docker image
 
 ## Out of Scope (v1)
 
-- HomeWizard P1 meter integration
 - Web UI dashboard
 - Multiple battery support
 - Dynamic rate adjustment

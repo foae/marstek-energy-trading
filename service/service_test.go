@@ -212,6 +212,40 @@ func (m *MockNotifier) PollCommands(ctx context.Context) ([]string, error) {
 	return cmds, nil
 }
 
+// MockMeterReader implements MeterReader for testing.
+type MockMeterReader struct {
+	mu            sync.Mutex
+	enabled       bool
+	ActivePowerW  float64
+	ActivePowerErr error
+}
+
+func NewMockMeter(enabled bool, activePowerW float64) *MockMeterReader {
+	return &MockMeterReader{
+		enabled:      enabled,
+		ActivePowerW: activePowerW,
+	}
+}
+
+func (m *MockMeterReader) Enabled() bool {
+	return m.enabled
+}
+
+func (m *MockMeterReader) GetActivePowerW() (float64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ActivePowerErr != nil {
+		return 0, m.ActivePowerErr
+	}
+	return m.ActivePowerW, nil
+}
+
+func (m *MockMeterReader) SetActivePowerW(w float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ActivePowerW = w
+}
+
 // --- Test helpers ---
 
 func testConfig() *config.Config {
@@ -226,6 +260,7 @@ func testConfig() *config.Config {
 		ChargePowerW:        2500,
 		DischargePowerW:     2500,
 		PassiveModeTimeoutS: 300,
+		SolarMinSurplusW:    100,
 		TZ:                  "UTC",
 	}
 }
@@ -243,6 +278,7 @@ func testConfigSmallBattery() *config.Config {
 		ChargePowerW:        2000,
 		DischargePowerW:     2000,
 		PassiveModeTimeoutS: 300,
+		SolarMinSurplusW:    100,
 		TZ:                  "UTC",
 	}
 }
@@ -440,29 +476,37 @@ func TestTick_NoDischargeWhenBatteryLow(t *testing.T) {
 	}
 }
 
-func TestTick_NoDischargeWhenNotProfitable(t *testing.T) {
-	// Scenario: Last charge was at high price, current discharge price is not profitable
-	// Expected: tick() should not discharge
+func TestTick_DischargeRegardlessOfProfitability(t *testing.T) {
+	// Scenario: Last charge was at high price, current discharge price is below breakeven
+	// Expected: tick() should still discharge (profitability gate removed — any revenue is better than none)
+	// Using small battery so windows fit in 4 slots
 
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime, 0.05, 0.06, 0.15, 0.16)
+	prices := makePrices(baseTime,
+		0.05, // slot 0 - charge window
+		0.15, // slot 1 - middle
+		0.25, // slot 2 - discharge window
+		0.10, // slot 3 - middle
+	)
 
-	cfg := testConfig()
+	cfg := testConfigSmallBattery()
 	mockBattery := NewMockBattery(80)
-	clockTime := baseTime.Add(2 * 15 * time.Minute) // In discharge window (price=0.15)
+	clockTime := baseTime.Add(2 * 15 * time.Minute) // In discharge window (price=0.25)
 
 	svc := newTestService(cfg, mockBattery, prices, clockTime)
-	svc.lastChargePrice = decimal.NewFromFloat(0.15) // Breakeven = 0.15/0.90 = 0.167
+	// Set last charge price high so breakeven (0.25/0.90 = 0.278) exceeds discharge price (0.25)
+	// Previously this would block discharge; now it should still discharge
+	svc.lastChargePrice = decimal.NewFromFloat(0.25)
 
 	ctx := context.Background()
 	svc.tick(ctx)
 
-	// Should stay idle because discharge at 0.15 < breakeven 0.167
-	if svc.state != StateIdle {
-		t.Errorf("expected state=idle (not profitable), got %s", svc.state)
+	// Should discharge even though price is at breakeven
+	if svc.state != StateDischarging {
+		t.Errorf("expected state=discharging (always discharge in window), got %s", svc.state)
 	}
-	if len(mockBattery.DischargeCalls) != 0 {
-		t.Errorf("expected no discharge calls when not profitable, got %d", len(mockBattery.DischargeCalls))
+	if len(mockBattery.DischargeCalls) != 1 {
+		t.Errorf("expected 1 discharge call, got %d", len(mockBattery.DischargeCalls))
 	}
 }
 
@@ -655,42 +699,6 @@ func (e *mockError) Error() string { return e.msg }
 
 // --- Edge cases for profitability check ---
 
-func TestIsDischargeProfitiable_ZeroLastChargePrice(t *testing.T) {
-	// Scenario: No previous charge recorded (lastChargePrice = 0)
-	// Expected: Should block discharge (need known cost basis for profitability check)
-
-	cfg := testConfig()
-	svc := &Service{
-		cfg:             cfg,
-		lastChargePrice: decimal.Zero,
-	}
-
-	if svc.isDischargeProfitiable(decimal.NewFromFloat(0.10)) {
-		t.Error("discharge should be blocked when no previous charge recorded")
-	}
-}
-
-func TestIsDischargeProfitiable_ExactBreakevenPrice(t *testing.T) {
-	// Scenario: Discharge price at/below breakeven
-	// Expected: Should NOT be profitable
-
-	cfg := testConfig()
-	svc := &Service{
-		cfg:             cfg,
-		lastChargePrice: decimal.NewFromFloat(0.10), // Breakeven = 0.10 / 0.90 = 0.1111
-	}
-
-	// Below breakeven - should NOT be profitable
-	if svc.isDischargeProfitiable(decimal.NewFromFloat(0.11)) {
-		t.Error("discharge at 0.11 should not be profitable (breakeven=0.1111)")
-	}
-
-	// Above breakeven - should be profitable
-	if !svc.isDischargeProfitiable(decimal.NewFromFloat(0.12)) {
-		t.Error("discharge at 0.12 should be profitable (breakeven=0.1111)")
-	}
-}
-
 // --- Trade recording tests ---
 
 func TestTick_RecordsTrade(t *testing.T) {
@@ -790,5 +798,572 @@ func TestTick_FullChargeDischargeSequence(t *testing.T) {
 	}
 	if len(mockBattery.DischargeCalls) != 1 {
 		t.Errorf("expected 1 discharge call, got %d", len(mockBattery.DischargeCalls))
+	}
+}
+
+// --- Solar charging tests ---
+
+// newTestServiceWithMeter creates a Service with a meter for solar testing.
+func newTestServiceWithMeter(cfg *config.Config, battery *MockBattery, meter *MockMeterReader, prices []nordpool.Price, clockTime time.Time) *Service {
+	recorder := NewRecorder("", cfg.BatteryEfficiency, time.UTC)
+	svc := &Service{
+		cfg:         cfg,
+		battery:     battery,
+		meter:       meter,
+		recorder:    recorder,
+		state:       StateIdle,
+		loc:         time.UTC,
+		todayPrices: prices,
+		nowFunc:     func() time.Time { return clockTime },
+	}
+	svc.currentPlan = AnalyzePrices(prices, svc.analyzerConfig())
+	return svc
+}
+
+func TestSolarTick_StartAfter3Confirmations(t *testing.T) {
+	// Scenario: P1 meter shows -500W (exporting 500W surplus) consistently
+	// Expected: After 3 consecutive readings, solar charging should start
+
+	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	// Flat prices = no profitable windows, so no scheduled trading
+	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
+
+	cfg := testConfigSmallBattery()
+	mockBattery := NewMockBattery(50)
+	meter := NewMockMeter(true, -500) // exporting 500W
+
+	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
+
+	ctx := context.Background()
+
+	// Tick 1-2: accumulate confirmations, no charging yet
+	svc.solarTick(ctx)
+	if svc.state != StateIdle {
+		t.Errorf("tick 1: expected idle, got %s", svc.state)
+	}
+	svc.solarTick(ctx)
+	if svc.state != StateIdle {
+		t.Errorf("tick 2: expected idle, got %s", svc.state)
+	}
+
+	// Tick 3: should start solar charging
+	svc.solarTick(ctx)
+	if svc.state != StateSolarCharging {
+		t.Errorf("tick 3: expected solar_charging, got %s", svc.state)
+	}
+	if len(mockBattery.ChargeCalls) != 1 {
+		t.Fatalf("expected 1 charge call, got %d", len(mockBattery.ChargeCalls))
+	}
+	if mockBattery.ChargeCalls[0].PowerW != 500 {
+		t.Errorf("expected charge power=500, got %d", mockBattery.ChargeCalls[0].PowerW)
+	}
+}
+
+func TestSolarTick_StopOnSurplusDrop(t *testing.T) {
+	// Scenario: Solar charging active, then surplus drops below threshold
+	// Expected: Should stop solar charging
+
+	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
+
+	cfg := testConfigSmallBattery()
+	mockBattery := NewMockBattery(50)
+	meter := NewMockMeter(true, -500)
+
+	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
+	// Pre-set solar charging state
+	svc.state = StateSolarCharging
+	svc.currentTradeStart = baseTime.Add(-5 * time.Minute)
+	svc.currentTradeSOC = 45
+	svc.solarChargePower = 500
+
+	ctx := context.Background()
+
+	// Surplus drops to 50W (below 100W threshold)
+	meter.SetActivePowerW(-50)
+	svc.solarTick(ctx)
+
+	if svc.state != StateIdle {
+		t.Errorf("expected idle after surplus drop, got %s", svc.state)
+	}
+}
+
+func TestSolarTick_YieldToDischargeWindow(t *testing.T) {
+	// Scenario: Solar charging active, then a discharge window starts
+	// Expected: tick() should stop solar charging and start discharging
+
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime,
+		0.05, // slot 0 - charge window
+		0.15, // slot 1 - middle
+		0.25, // slot 2 - discharge window
+		0.10, // slot 3 - middle
+	)
+
+	cfg := testConfigSmallBattery()
+	mockBattery := NewMockBattery(80)
+	meter := NewMockMeter(true, -500)
+
+	// Time is in discharge window (slot 2)
+	clockTime := baseTime.Add(2 * 15 * time.Minute)
+	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, clockTime)
+
+	// Pre-set solar charging state
+	svc.state = StateSolarCharging
+	svc.currentTradeStart = clockTime.Add(-5 * time.Minute)
+	svc.currentTradeSOC = 75
+	svc.solarChargePower = 500
+
+	ctx := context.Background()
+	svc.tick(ctx) // Regular tick should handle the transition
+
+	if svc.state != StateDischarging {
+		t.Errorf("expected discharging after yield, got %s", svc.state)
+	}
+}
+
+func TestSolarTick_YieldToChargeWindow(t *testing.T) {
+	// Scenario: Solar charging active, then a scheduled charge window starts
+	// Expected: tick() should stop solar charging and start scheduled charging
+
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime,
+		0.05, // slot 0 - charge window
+		0.15, // slot 1 - middle
+		0.25, // slot 2 - discharge window
+		0.10, // slot 3 - middle
+	)
+
+	cfg := testConfigSmallBattery()
+	mockBattery := NewMockBattery(50)
+	meter := NewMockMeter(true, -500)
+
+	// Time is in charge window (slot 0)
+	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
+
+	// Pre-set solar charging state
+	svc.state = StateSolarCharging
+	svc.currentTradeStart = baseTime.Add(-5 * time.Minute)
+	svc.currentTradeSOC = 45
+	svc.solarChargePower = 500
+
+	ctx := context.Background()
+	svc.tick(ctx) // Regular tick should handle the transition
+
+	if svc.state != StateCharging {
+		t.Errorf("expected charging after yield to charge window, got %s", svc.state)
+	}
+}
+
+func TestSolarTick_ClampToMaxPower(t *testing.T) {
+	// Scenario: Surplus is 5000W but max charge power is 2000W
+	// Expected: Should clamp to max charge power
+
+	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
+
+	cfg := testConfigSmallBattery() // ChargePowerW = 2000
+	mockBattery := NewMockBattery(50)
+	meter := NewMockMeter(true, -5000) // 5000W surplus
+
+	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
+
+	ctx := context.Background()
+	// 3 ticks to start
+	svc.solarTick(ctx)
+	svc.solarTick(ctx)
+	svc.solarTick(ctx)
+
+	if svc.state != StateSolarCharging {
+		t.Fatalf("expected solar_charging, got %s", svc.state)
+	}
+	if len(mockBattery.ChargeCalls) != 1 {
+		t.Fatalf("expected 1 charge call, got %d", len(mockBattery.ChargeCalls))
+	}
+	if mockBattery.ChargeCalls[0].PowerW != cfg.ChargePowerW {
+		t.Errorf("expected charge power clamped to %d, got %d", cfg.ChargePowerW, mockBattery.ChargeCalls[0].PowerW)
+	}
+}
+
+func TestSolarTick_NoStartDuringDischargeWindow(t *testing.T) {
+	// Scenario: Surplus available but we're in a discharge window
+	// Expected: Should not start solar charging
+
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime,
+		0.05, // slot 0 - charge window
+		0.15, // slot 1 - middle
+		0.25, // slot 2 - discharge window
+		0.10, // slot 3 - middle
+	)
+
+	cfg := testConfigSmallBattery()
+	mockBattery := NewMockBattery(80)
+	meter := NewMockMeter(true, -500) // exporting
+
+	// Time is in discharge window (slot 2)
+	clockTime := baseTime.Add(2 * 15 * time.Minute)
+	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, clockTime)
+
+	ctx := context.Background()
+	svc.solarTick(ctx)
+	svc.solarTick(ctx)
+	svc.solarTick(ctx)
+
+	if svc.state != StateIdle {
+		t.Errorf("expected idle during discharge window, got %s", svc.state)
+	}
+}
+
+func TestSolarTick_NoStartDuringChargeWindow(t *testing.T) {
+	// Scenario: Surplus available but we're in a scheduled charge window
+	// Expected: Should not start solar charging (let tick() handle scheduled charging)
+
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime,
+		0.05, // slot 0 - charge window
+		0.15, // slot 1 - middle
+		0.25, // slot 2 - discharge window
+		0.10, // slot 3 - middle
+	)
+
+	cfg := testConfigSmallBattery()
+	mockBattery := NewMockBattery(50)
+	meter := NewMockMeter(true, -500) // exporting
+
+	// Time is in charge window (slot 0)
+	clockTime := baseTime
+	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, clockTime)
+
+	ctx := context.Background()
+	svc.solarTick(ctx)
+	svc.solarTick(ctx)
+	svc.solarTick(ctx)
+
+	if svc.state != StateIdle {
+		t.Errorf("expected idle during charge window, got %s", svc.state)
+	}
+}
+
+func TestSolarTick_IgnoresStateCharging(t *testing.T) {
+	// Scenario: Battery is in scheduled charging state
+	// Expected: solarTick should be a no-op
+
+	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
+
+	cfg := testConfigSmallBattery()
+	mockBattery := NewMockBattery(50)
+	meter := NewMockMeter(true, -500)
+
+	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
+	svc.state = StateCharging
+
+	ctx := context.Background()
+	svc.solarTick(ctx)
+	svc.solarTick(ctx)
+	svc.solarTick(ctx)
+
+	if svc.state != StateCharging {
+		t.Errorf("expected state unchanged at charging, got %s", svc.state)
+	}
+	// No charge calls should be made by solarTick
+	if len(mockBattery.ChargeCalls) != 0 {
+		t.Errorf("expected no charge calls from solarTick, got %d", len(mockBattery.ChargeCalls))
+	}
+}
+
+func TestSolarTick_IgnoresStateDischarging(t *testing.T) {
+	// Scenario: Battery is in scheduled discharging state
+	// Expected: solarTick should be a no-op
+
+	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
+
+	cfg := testConfigSmallBattery()
+	mockBattery := NewMockBattery(80)
+	meter := NewMockMeter(true, -500)
+
+	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
+	svc.state = StateDischarging
+
+	ctx := context.Background()
+	svc.solarTick(ctx)
+	svc.solarTick(ctx)
+	svc.solarTick(ctx)
+
+	if svc.state != StateDischarging {
+		t.Errorf("expected state unchanged at discharging, got %s", svc.state)
+	}
+}
+
+func TestSolarTick_NoStartWhenBatteryFull(t *testing.T) {
+	// Scenario: Surplus available but battery at 100%
+	// Expected: Should not start solar charging
+
+	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
+
+	cfg := testConfigSmallBattery()
+	mockBattery := NewMockBattery(100) // Full
+	meter := NewMockMeter(true, -500)
+
+	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
+
+	ctx := context.Background()
+	svc.solarTick(ctx)
+	svc.solarTick(ctx)
+	svc.solarTick(ctx)
+
+	if svc.state != StateIdle {
+		t.Errorf("expected idle when battery full, got %s", svc.state)
+	}
+}
+
+func TestSolarTick_StopWhenBatteryFull(t *testing.T) {
+	// Scenario: Solar charging active, battery reaches 100%
+	// Expected: Should stop solar charging
+
+	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
+
+	cfg := testConfigSmallBattery()
+	mockBattery := NewMockBattery(100) // Just became full
+	meter := NewMockMeter(true, -500)
+
+	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
+	svc.state = StateSolarCharging
+	svc.currentTradeStart = baseTime.Add(-10 * time.Minute)
+	svc.currentTradeSOC = 95
+	svc.solarChargePower = 500
+
+	ctx := context.Background()
+	svc.solarTick(ctx)
+
+	if svc.state != StateIdle {
+		t.Errorf("expected idle when battery full during solar, got %s", svc.state)
+	}
+}
+
+func TestSolarTick_SurplusCountResets(t *testing.T) {
+	// Scenario: Surplus readings interrupted by a below-threshold reading
+	// Expected: Counter resets and needs 3 new readings to start
+
+	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
+
+	cfg := testConfigSmallBattery()
+	mockBattery := NewMockBattery(50)
+	meter := NewMockMeter(true, -500)
+
+	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
+
+	ctx := context.Background()
+
+	// 2 surplus readings
+	svc.solarTick(ctx)
+	svc.solarTick(ctx)
+	if svc.solarSurplusCount != 2 {
+		t.Fatalf("expected count=2, got %d", svc.solarSurplusCount)
+	}
+
+	// Surplus drops below threshold
+	meter.SetActivePowerW(-50) // 50W surplus < 100W threshold
+	svc.solarTick(ctx)
+	if svc.solarSurplusCount != 0 {
+		t.Errorf("expected count reset to 0, got %d", svc.solarSurplusCount)
+	}
+
+	// Need 3 more readings to start
+	meter.SetActivePowerW(-500)
+	svc.solarTick(ctx)
+	svc.solarTick(ctx)
+	if svc.state != StateIdle {
+		t.Error("should still be idle after only 2 new readings")
+	}
+	svc.solarTick(ctx)
+	if svc.state != StateSolarCharging {
+		t.Errorf("expected solar_charging after 3 new readings, got %s", svc.state)
+	}
+}
+
+func TestSolarTick_PowerAdjustmentDeadband(t *testing.T) {
+	// Scenario: Solar charging at 500W, surplus changes to 530W (within 50W deadband)
+	// Expected: Should NOT send a new charge command
+
+	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
+
+	cfg := testConfigSmallBattery()
+	mockBattery := NewMockBattery(50)
+	meter := NewMockMeter(true, -530)
+
+	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
+	svc.state = StateSolarCharging
+	svc.currentTradeStart = baseTime.Add(-5 * time.Minute)
+	svc.currentTradeSOC = 45
+	svc.solarChargePower = 500
+	svc.lastPassiveRefresh = baseTime // Recent refresh
+
+	ctx := context.Background()
+	svc.solarTick(ctx)
+
+	// Power should stay at 500 (30W diff < 50W deadband)
+	if svc.solarChargePower != 500 {
+		t.Errorf("expected power unchanged at 500, got %d", svc.solarChargePower)
+	}
+}
+
+func TestMeterEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		meter    MeterReader
+		expected bool
+	}{
+		{"nil meter", nil, false},
+		{"disabled meter", NewMockMeter(false, 0), false},
+		{"enabled meter", NewMockMeter(true, 0), true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := &Service{meter: tt.meter}
+			if got := svc.meterEnabled(); got != tt.expected {
+				t.Errorf("meterEnabled() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestSolarTick_RecordsTrade(t *testing.T) {
+	// Scenario: Solar charge starts and stops, trade should be recorded with ActionSolarCharge and zero price
+
+	now := time.Now().UTC()
+	baseTime := time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
+
+	cfg := testConfigSmallBattery()
+	mockBattery := NewMockBattery(50)
+	meter := NewMockMeter(true, -50) // low surplus to stop
+
+	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
+	svc.state = StateSolarCharging
+	svc.currentTradeStart = baseTime.Add(-10 * time.Minute)
+	svc.currentTradeSOC = 45
+	svc.solarChargePower = 500
+	svc.solarLastUpdate = baseTime.Add(-10 * time.Minute)
+
+	ctx := context.Background()
+	svc.solarTick(ctx) // Should stop due to low surplus
+
+	// Check trade was recorded
+	history := svc.recorder.GetHistory()
+	if len(history.Days) == 0 {
+		t.Fatal("expected trade to be recorded")
+	}
+
+	trade := history.Days[0].Trades[0]
+	if trade.Action != ActionSolarCharge {
+		t.Errorf("expected ActionSolarCharge, got %s", trade.Action)
+	}
+	if !trade.PriceEUR.IsZero() {
+		t.Errorf("expected zero price, got %s", trade.PriceEUR)
+	}
+}
+
+func TestSolarTick_EnergyAccumulatesWithVaryingPower(t *testing.T) {
+	// Scenario: Solar charging at 500W for 5 min, then 1500W for 5 min
+	// Expected energy: (500*300 + 1500*300) / 3_600_000 = 0.1667 kWh
+	// Old bug would have calculated: 1500*600 / 3_600_000 = 0.25 kWh
+
+	now := time.Now().UTC()
+	baseTime := time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
+
+	cfg := testConfigSmallBattery()
+	mockBattery := NewMockBattery(50)
+	meter := NewMockMeter(true, -50)
+
+	clockTime := baseTime
+	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, clockTime)
+
+	// Simulate: started at 500W at baseTime
+	svc.state = StateSolarCharging
+	svc.currentTradeStart = baseTime
+	svc.currentTradeSOC = 40
+	svc.solarChargePower = 500
+	svc.solarEnergyWs = 0
+	svc.solarLastUpdate = baseTime
+
+	// Advance 5 minutes and accumulate at 500W
+	clockTime = baseTime.Add(5 * time.Minute)
+	svc.SetClock(func() time.Time { return clockTime })
+	svc.accumulateSolarEnergyLocked()
+	// Should have 500 * 300 = 150000 Ws
+	if svc.solarEnergyWs != 150000 {
+		t.Errorf("expected 150000 Ws after 5min at 500W, got %f", svc.solarEnergyWs)
+	}
+
+	// Change power to 1500W
+	svc.solarChargePower = 1500
+
+	// Advance another 5 minutes and stop
+	clockTime = baseTime.Add(10 * time.Minute)
+	svc.SetClock(func() time.Time { return clockTime })
+
+	ctx := context.Background()
+	svc.solarTick(ctx) // will stop due to low surplus
+
+	history := svc.recorder.GetHistory()
+	if len(history.Days) == 0 {
+		t.Fatal("expected trade to be recorded")
+	}
+
+	trade := history.Days[0].Trades[0]
+	energyF, _ := trade.EnergyKWh.Float64()
+	// 500W*300s + 1500W*300s = 600000 Ws = 0.1667 kWh
+	expectedKWh := 600000.0 / 3_600_000.0
+	tolerance := 0.001
+	diff := energyF - expectedKWh
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > tolerance {
+		t.Errorf("energy = %.4f kWh, want ~%.4f kWh (varying power accumulation)", energyF, expectedKWh)
+	}
+}
+
+func TestSolarTick_YieldsDirectlyToDischargeWindow(t *testing.T) {
+	// Verify solarTick() itself stops solar charging when a discharge window starts
+	// (not relying on tick() which runs every 60s)
+
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime,
+		0.05, // slot 0 - charge window
+		0.15, // slot 1 - middle
+		0.25, // slot 2 - discharge window
+		0.10, // slot 3 - middle
+	)
+
+	cfg := testConfigSmallBattery()
+	mockBattery := NewMockBattery(80)
+	meter := NewMockMeter(true, -500) // still has surplus
+
+	// Time is in discharge window (slot 2)
+	clockTime := baseTime.Add(2 * 15 * time.Minute)
+	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, clockTime)
+
+	svc.state = StateSolarCharging
+	svc.currentTradeStart = clockTime.Add(-5 * time.Minute)
+	svc.currentTradeSOC = 75
+	svc.solarChargePower = 500
+	svc.solarLastUpdate = clockTime.Add(-5 * time.Minute)
+
+	ctx := context.Background()
+	svc.solarTick(ctx) // solarTick should yield directly
+
+	// Should be idle (solarTick stops solar, tick() needed to start discharge)
+	if svc.state != StateIdle {
+		t.Errorf("expected idle after solarTick yield, got %s", svc.state)
 	}
 }

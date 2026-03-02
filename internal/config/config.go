@@ -33,6 +33,10 @@ type Config struct {
 	DischargePowerW     int    `env:"DISCHARGE_POWER_W" envDefault:"2500"`
 	PassiveModeTimeoutS int    `env:"PASSIVE_MODE_TIMEOUT_S" envDefault:"300"`
 
+	// HomeWizard P1 meter (optional)
+	HomeWizardP1URL string `env:"HOMEWIZARD_P1_URL"`              // Empty = disabled
+	SolarMinSurplusW int   `env:"SOLAR_MIN_SURPLUS_W" envDefault:"100"` // Min surplus watts to start solar charging
+
 	// Telegram (optional)
 	TelegramBotToken string `env:"TELEGRAM_BOT_TOKEN"`
 	TelegramChatID   string `env:"TELEGRAM_CHAT_ID"`

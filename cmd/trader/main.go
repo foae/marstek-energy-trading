@@ -13,6 +13,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/foae/marstek-energy-trading/clients/esphome"
+	"github.com/foae/marstek-energy-trading/clients/homewizard"
 	"github.com/foae/marstek-energy-trading/clients/nordpool"
 	"github.com/foae/marstek-energy-trading/clients/telegram"
 	"github.com/foae/marstek-energy-trading/handler"
@@ -58,6 +59,13 @@ func main() {
 	esphomeClient := esphome.New(cfg.ESPHomeURL, minSOC)
 	defer esphomeClient.Close()
 	slog.Info("using ESPHome battery backend", "url", cfg.ESPHomeURL, "min_soc", minSOC)
+	p1Client := homewizard.New(cfg.HomeWizardP1URL)
+	if p1Client.Enabled() {
+		slog.Info("HomeWizard P1 meter enabled", "url", cfg.HomeWizardP1URL)
+	} else {
+		slog.Info("HomeWizard P1 meter disabled (no URL configured)")
+	}
+
 	telegramClient := telegram.New(cfg.TelegramBotToken, cfg.TelegramChatID)
 
 	if telegramClient.Enabled() {
@@ -68,7 +76,7 @@ func main() {
 	recorder := service.NewRecorder(cfg.DataDir, cfg.BatteryEfficiency, cfg.Location())
 
 	// Initialize trading service
-	tradingSvc := service.New(cfg, nordpoolClient, esphomeClient, telegramClient, recorder)
+	tradingSvc := service.New(cfg, nordpoolClient, esphomeClient, p1Client, telegramClient, recorder)
 
 	// Setup HTTP handler
 	h := handler.New(tradingSvc)

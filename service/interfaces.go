@@ -26,6 +26,12 @@ type BatteryController interface {
 	Idle() error
 }
 
+// MeterReader reads power data from a smart meter.
+type MeterReader interface {
+	Enabled() bool
+	GetActivePowerW() (float64, error)
+}
+
 // Notifier sends notifications.
 type Notifier interface {
 	Enabled() bool

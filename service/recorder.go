@@ -15,8 +15,9 @@ import (
 type TradeAction string
 
 const (
-	ActionCharge    TradeAction = "charge"
-	ActionDischarge TradeAction = "discharge"
+	ActionCharge      TradeAction = "charge"
+	ActionDischarge   TradeAction = "discharge"
+	ActionSolarCharge TradeAction = "solar_charge"
 )
 
 // Trade represents a single trade record.
@@ -135,6 +136,10 @@ func (r *Recorder) GetHistory() History {
 					minChargePrice = t.PriceEUR
 					seenCharge = true
 				}
+				chargeCycles++
+			case ActionSolarCharge:
+				// Solar energy is free: add to charged kWh but not to charge cost
+				chargedKWh = chargedKWh.Add(t.EnergyKWh)
 				chargeCycles++
 			case ActionDischarge:
 				dischargedKWh = dischargedKWh.Add(t.EnergyKWh)

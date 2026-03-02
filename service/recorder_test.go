@@ -140,9 +140,20 @@ func TestGetHistory_MixedChargeAndSolarCharge(t *testing.T) {
 		t.Errorf("PnLEUR = %s, want %s", day.PnLEUR, expectedPnL)
 	}
 
-	// Charge cycles = 2 (grid + solar)
-	if day.ChargeCycles != 2 {
-		t.Errorf("ChargeCycles = %d, want 2", day.ChargeCycles)
+	// Grid charge cycles = 1
+	if day.ChargeCycles != 1 {
+		t.Errorf("ChargeCycles = %d, want 1", day.ChargeCycles)
+	}
+
+	// Solar charge cycles = 1
+	if day.SolarChargeCycles != 1 {
+		t.Errorf("SolarChargeCycles = %d, want 1", day.SolarChargeCycles)
+	}
+
+	// Solar charged kWh = 0.8
+	expectedSolar := decimal.NewFromFloat(0.8)
+	if !day.SolarChargedKWh.Equal(expectedSolar) {
+		t.Errorf("SolarChargedKWh = %s, want %s", day.SolarChargedKWh, expectedSolar)
 	}
 
 	// Min charge price should be from grid charge only (solar has no price entry)

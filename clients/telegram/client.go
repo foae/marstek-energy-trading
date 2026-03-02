@@ -119,6 +119,8 @@ type DailySummaryData struct {
 	DischargedKWh     float64
 	ChargeCycles      int
 	DischargeCycles   int
+	SolarChargedKWh   float64
+	SolarChargeCycles int
 	AvgChargePrice    float64
 	AvgDischargePrice float64
 	MinChargePrice    float64
@@ -169,17 +171,27 @@ func (c *Client) SendDailySummaryFull(ctx context.Context, data DailySummaryData
 				"💰 <b>Today's P&L:</b> %s%.4f EUR\n\n"+
 				"🔋 <b>Charged:</b> %.2f kWh (%d cycles)\n"+
 				"   Avg price: %.4f EUR/kWh\n"+
-				"   Best price: %.4f EUR/kWh\n\n"+
-				"⚡ <b>Discharged:</b> %.2f kWh (%d cycles)\n"+
-				"   Avg price: %.4f EUR/kWh\n"+
-				"   Best price: %.4f EUR/kWh\n\n"+
-				"📊 <b>Cumulative P&L:</b> %s%.4f EUR",
+				"   Best price: %.4f EUR/kWh\n",
 			pnlEmoji,
 			data.Date.Format("02 Jan 2006"),
 			pnlSign, data.PnLEUR,
 			data.ChargedKWh, data.ChargeCycles,
 			data.AvgChargePrice,
 			data.MinChargePrice,
+		)
+
+		if data.SolarChargeCycles > 0 {
+			text += fmt.Sprintf(
+				"\n☀️ <b>Solar charged:</b> %.2f kWh (%d sessions)\n",
+				data.SolarChargedKWh, data.SolarChargeCycles,
+			)
+		}
+
+		text += fmt.Sprintf(
+			"\n⚡ <b>Discharged:</b> %.2f kWh (%d cycles)\n"+
+				"   Avg price: %.4f EUR/kWh\n"+
+				"   Best price: %.4f EUR/kWh\n\n"+
+				"📊 <b>Cumulative P&L:</b> %s%.4f EUR",
 			data.DischargedKWh, data.DischargeCycles,
 			data.AvgDischargePrice,
 			data.MaxDischargePrice,
@@ -212,6 +224,8 @@ func (c *Client) SendStatus(ctx context.Context, data StatusData) error {
 	switch data.State {
 	case "charging":
 		stateEmoji = "🔋"
+	case "solar_charging":
+		stateEmoji = "☀️"
 	case "discharging":
 		stateEmoji = "⚡"
 	}

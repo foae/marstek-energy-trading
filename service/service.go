@@ -520,6 +520,15 @@ func (s *Service) startSolarChargingLocked(ctx context.Context, powerW int, soc 
 	s.solarLastUpdate = s.now()
 
 	l.Info("solar charge session started", "state", s.state)
+
+	// Release lock for notification
+	s.mu.Unlock()
+	if s.telegramEnabled() {
+		if err := s.telegram.SendTradeStart(ctx, "Solar charging", 0, soc); err != nil {
+			l.Warn("failed to send trade notification", "error", err)
+		}
+	}
+	s.mu.Lock()
 }
 
 // stopSolarChargingLocked ends a solar charge session and records the trade. Caller must hold s.mu.
@@ -561,6 +570,14 @@ func (s *Service) stopSolarChargingLocked(ctx context.Context, endSOC int) {
 	s.solarChargePower = 0
 	s.solarEnergyWs = 0
 	s.transitionToIdleLocked(ctx, endSOC)
+
+	s.mu.Unlock()
+	if s.telegramEnabled() {
+		if err := s.telegram.SendTradeEnd(ctx, "Solar charging", energyF, 0, endSOC); err != nil {
+			l.Warn("failed to send trade notification", "error", err)
+		}
+	}
+	s.mu.Lock()
 }
 
 // startChargingLocked begins a charge session. Caller must hold s.mu.
@@ -968,6 +985,8 @@ func (s *Service) checkDailySummary(ctx context.Context) {
 		avgDischargeF, _ := summary.AvgDischargePrice.Float64()
 		maxDischargeF, _ := summary.MaxDischargePrice.Float64()
 
+		solarChargedF, _ := summary.SolarChargedKWh.Float64()
+
 		summaryData := telegram.DailySummaryData{
 			Date:              now,
 			PnLEUR:            pnlF,
@@ -975,6 +994,8 @@ func (s *Service) checkDailySummary(ctx context.Context) {
 			DischargedKWh:     dischargedF,
 			ChargeCycles:      summary.ChargeCycles,
 			DischargeCycles:   summary.DischargeCycles,
+			SolarChargedKWh:   solarChargedF,
+			SolarChargeCycles: summary.SolarChargeCycles,
 			AvgChargePrice:    avgChargeF,
 			MinChargePrice:    minChargeF,
 			AvgDischargePrice: avgDischargeF,

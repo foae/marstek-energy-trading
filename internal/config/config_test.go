@@ -94,6 +94,69 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 }
 
+func TestValidate_BatteryEfficiency(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   float64
+		wantErr bool
+	}{
+		{"valid 0.90", 0.90, false},
+		{"valid 1.0", 1.0, false},
+		{"valid 0.5", 0.5, false},
+		{"invalid 0", 0, true},
+		{"invalid negative", -0.5, true},
+		{"invalid >1", 1.1, true},
+		{"invalid integer-like 90", 90, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{BatteryEfficiency: tt.value, BatteryMinSOC: 0.11}
+			err := cfg.validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidate_BatteryMinSOC(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   float64
+		wantErr bool
+	}{
+		{"valid 0.11", 0.11, false},
+		{"valid 0", 0, false},
+		{"valid 0.99", 0.99, false},
+		{"invalid 1.0", 1.0, true},
+		{"invalid negative", -0.1, true},
+		{"invalid integer-like 11", 11, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{BatteryEfficiency: 0.90, BatteryMinSOC: tt.value}
+			err := cfg.validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidate_MinPriceSpread(t *testing.T) {
+	cfg := &Config{BatteryEfficiency: 0.90, BatteryMinSOC: 0.11, MinPriceSpread: -0.01}
+	if err := cfg.validate(); err == nil {
+		t.Error("expected error for negative MinPriceSpread")
+	}
+
+	cfg.MinPriceSpread = 0
+	if err := cfg.validate(); err != nil {
+		t.Errorf("unexpected error for zero MinPriceSpread: %v", err)
+	}
+}
+
 func TestLoad_CustomValues(t *testing.T) {
 	t.Setenv("HOMEWIZARD_P1_URL", "http://192.168.1.100")
 	t.Setenv("SOLAR_MIN_SURPLUS_W", "200")

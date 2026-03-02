@@ -5,6 +5,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/shopspring/decimal"
+
 	"github.com/foae/marstek-energy-trading/clients/nordpool"
 )
 
@@ -15,18 +17,25 @@ func localMidnight(t time.Time) time.Time {
 	return time.Date(y, m, d, 0, 0, 0, 0, t.Location())
 }
 
+// priceSlot is an internal type used by the analyzer. Prices are converted from
+// nordpool.Price (float64 API boundary) to decimal.Decimal for precise arithmetic.
+type priceSlot struct {
+	Time  time.Time
+	Value decimal.Decimal
+}
+
 // TimeWindow represents a time window for charging or discharging.
 type TimeWindow struct {
 	Start time.Time
 	End   time.Time
-	Price float64 // Average price in this window
+	Price decimal.Decimal // Average price in this window
 }
 
 // TradeCycle represents a paired charge and discharge window.
 type TradeCycle struct {
 	ChargeWindow    TimeWindow
 	DischargeWindow TimeWindow
-	Profit          float64 // Expected profit per kWh (accounting for efficiency)
+	Profit          decimal.Decimal // Expected profit per kWh (accounting for efficiency)
 }
 
 // TradingPlan contains the charge and discharge windows for a day.
@@ -35,10 +44,10 @@ type TradingPlan struct {
 	ChargeWindows    []TimeWindow
 	DischargeWindows []TimeWindow
 	Cycles           []TradeCycle // Paired charge/discharge windows
-	MinPrice         float64
-	MaxPrice         float64
-	Spread           float64 // MaxPrice - MinPrice
-	IsProfitable     bool    // At least one profitable cycle exists
+	MinPrice         decimal.Decimal
+	MaxPrice         decimal.Decimal
+	Spread           decimal.Decimal // MaxPrice - MinPrice
+	IsProfitable     bool            // At least one profitable cycle exists
 }
 
 // AnalyzerConfig contains parameters for price analysis.
@@ -61,25 +70,31 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 	}
 
 	// Sort prices by time
-	sortedByTime := make([]nordpool.Price, len(prices))
-	copy(sortedByTime, prices)
-	sort.Slice(sortedByTime, func(i, j int) bool {
-		return sortedByTime[i].Time.Before(sortedByTime[j].Time)
+	sorted := make([]nordpool.Price, len(prices))
+	copy(sorted, prices)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Time.Before(sorted[j].Time)
 	})
 
+	// Convert API float64 prices to decimal for precise monetary arithmetic
+	slots := make([]priceSlot, len(sorted))
+	for i, p := range sorted {
+		slots[i] = priceSlot{Time: p.Time, Value: decimal.NewFromFloat(p.Value)}
+	}
+
 	// Find min and max prices
-	minPrice := sortedByTime[0].Value
-	maxPrice := sortedByTime[0].Value
-	for _, p := range sortedByTime {
-		if p.Value < minPrice {
-			minPrice = p.Value
+	minPrice := slots[0].Value
+	maxPrice := slots[0].Value
+	for _, s := range slots {
+		if s.Value.LessThan(minPrice) {
+			minPrice = s.Value
 		}
-		if p.Value > maxPrice {
-			maxPrice = p.Value
+		if s.Value.GreaterThan(maxPrice) {
+			maxPrice = s.Value
 		}
 	}
 
-	spread := maxPrice - minPrice
+	spread := maxPrice.Sub(minPrice)
 
 	// Calculate usable capacity accounting for min SOC protection
 	usableCapacity := cfg.BatteryCapacityKWh * (1.0 - cfg.BatteryMinSOC)
@@ -89,14 +104,17 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 	dischargeWindowSize := calculateWindowSize(usableCapacity, cfg.DischargePowerW)
 
 	// Handle case where we don't have enough data points
-	if len(sortedByTime) < chargeWindowSize || len(sortedByTime) < dischargeWindowSize {
+	if len(slots) < chargeWindowSize || len(slots) < dischargeWindowSize {
 		return &TradingPlan{
-			Date:     localMidnight(sortedByTime[0].Time),
+			Date:     localMidnight(slots[0].Time),
 			MinPrice: minPrice,
 			MaxPrice: maxPrice,
 			Spread:   spread,
 		}
 	}
+
+	efficiency := decimal.NewFromFloat(cfg.Efficiency)
+	minSpread := decimal.NewFromFloat(cfg.MinPriceSpread)
 
 	// Find trade cycles using sliding window algorithm
 	var cycles []TradeCycle
@@ -110,14 +128,14 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 
 	// Try to find profitable cycles
 	for i := 0; i < maxCycles; i++ {
-		cycle, found := findBestCycle(sortedByTime, searchStartIdx, chargeWindowSize, dischargeWindowSize, cfg.Efficiency, cfg.MinPriceSpread)
+		cycle, found := findBestCycle(slots, searchStartIdx, chargeWindowSize, dischargeWindowSize, efficiency, minSpread)
 		if !found {
 			break
 		}
 		cycles = append(cycles, cycle)
 		// Next search starts after the discharge window ends
-		searchStartIdx = findSlotIndex(sortedByTime, cycle.DischargeWindow.End)
-		if searchStartIdx < 0 || searchStartIdx >= len(sortedByTime) {
+		searchStartIdx = findSlotIndex(slots, cycle.DischargeWindow.End)
+		if searchStartIdx < 0 || searchStartIdx >= len(slots) {
 			break
 		}
 	}
@@ -130,7 +148,7 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 	}
 
 	return &TradingPlan{
-		Date:             localMidnight(sortedByTime[0].Time),
+		Date:             localMidnight(slots[0].Time),
 		ChargeWindows:    chargeWindows,
 		DischargeWindows: dischargeWindows,
 		Cycles:           cycles,
@@ -144,9 +162,9 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 // findBestCycle finds the most profitable charge/discharge pair starting from the given index.
 // It evaluates ALL possible charge windows and picks the pair with maximum profit.
 // Returns the cycle and true if a profitable pair was found.
-func findBestCycle(prices []nordpool.Price, startIdx, chargeWindowSize, dischargeWindowSize int, efficiency, minSpread float64) (TradeCycle, bool) {
+func findBestCycle(prices []priceSlot, startIdx, chargeWindowSize, dischargeWindowSize int, efficiency, minSpread decimal.Decimal) (TradeCycle, bool) {
 	var bestCycle TradeCycle
-	bestProfit := -math.MaxFloat64
+	var bestProfit decimal.Decimal
 	found := false
 
 	// Evaluate every possible charge window position
@@ -170,17 +188,17 @@ func findBestCycle(prices []nordpool.Price, startIdx, chargeWindowSize, discharg
 
 		// Check if the trade is profitable
 		// Profitable if: discharge_price > charge_price / efficiency AND spread >= minSpread
-		breakEvenPrice := chargeAvg / efficiency
-		if dischargeAvg <= breakEvenPrice || (dischargeAvg-chargeAvg) < minSpread {
+		breakEvenPrice := chargeAvg.Div(efficiency)
+		if dischargeAvg.LessThanOrEqual(breakEvenPrice) || dischargeAvg.Sub(chargeAvg).LessThan(minSpread) {
 			continue
 		}
 
 		// Calculate expected profit per kWh
 		// profit = discharge_price * efficiency - charge_price
-		profit := dischargeAvg*efficiency - chargeAvg
+		profit := dischargeAvg.Mul(efficiency).Sub(chargeAvg)
 
 		// Keep the most profitable pair
-		if profit > bestProfit {
+		if !found || profit.GreaterThan(bestProfit) {
 			bestProfit = profit
 			found = true
 
@@ -204,73 +222,52 @@ func findBestCycle(prices []nordpool.Price, startIdx, chargeWindowSize, discharg
 }
 
 // windowAverage calculates the average price for a window starting at startIdx.
-func windowAverage(prices []nordpool.Price, startIdx, windowSize int) float64 {
-	var sum float64
+func windowAverage(prices []priceSlot, startIdx, windowSize int) decimal.Decimal {
+	sum := decimal.Zero
 	for i := startIdx; i < startIdx+windowSize; i++ {
-		sum += prices[i].Value
+		sum = sum.Add(prices[i].Value)
 	}
-	return sum / float64(windowSize)
+	return sum.Div(decimal.NewFromInt(int64(windowSize)))
 }
 
 // findBestWindow finds the best contiguous window of the given size starting from startIdx.
 // If findLowest is true, finds the window with the lowest average price.
 // If findLowest is false, finds the window with the highest average price.
 // Returns the start index, average price, and whether a valid window was found.
-func findBestWindow(prices []nordpool.Price, startIdx, windowSize int, findLowest bool) (int, float64, bool) {
+func findBestWindow(prices []priceSlot, startIdx, windowSize int, findLowest bool) (int, decimal.Decimal, bool) {
 	if startIdx+windowSize > len(prices) {
-		return 0, 0, false
+		return 0, decimal.Zero, false
 	}
 
 	bestStart := -1
-	var bestAvg float64
-	if findLowest {
-		bestAvg = math.MaxFloat64
-	} else {
-		bestAvg = -math.MaxFloat64
-	}
+	var bestAvg decimal.Decimal
 
 	// Sliding window: compute initial sum
-	var windowSum float64
+	windowSum := decimal.Zero
 	for i := startIdx; i < startIdx+windowSize; i++ {
-		windowSum += prices[i].Value
+		windowSum = windowSum.Add(prices[i].Value)
 	}
+	size := decimal.NewFromInt(int64(windowSize))
 
 	// Check first window
-	avg := windowSum / float64(windowSize)
-	if findLowest {
-		if avg < bestAvg {
-			bestAvg = avg
-			bestStart = startIdx
-		}
-	} else {
-		if avg > bestAvg {
-			bestAvg = avg
-			bestStart = startIdx
-		}
-	}
+	avg := windowSum.Div(size)
+	bestAvg = avg
+	bestStart = startIdx
 
 	// Slide the window
 	for i := startIdx + 1; i+windowSize <= len(prices); i++ {
 		// Remove element leaving window, add element entering window
-		windowSum -= prices[i-1].Value
-		windowSum += prices[i+windowSize-1].Value
-		avg = windowSum / float64(windowSize)
+		windowSum = windowSum.Sub(prices[i-1].Value).Add(prices[i+windowSize-1].Value)
+		avg = windowSum.Div(size)
 
-		if findLowest {
-			if avg < bestAvg {
-				bestAvg = avg
-				bestStart = i
-			}
-		} else {
-			if avg > bestAvg {
-				bestAvg = avg
-				bestStart = i
-			}
+		if (findLowest && avg.LessThan(bestAvg)) || (!findLowest && avg.GreaterThan(bestAvg)) {
+			bestAvg = avg
+			bestStart = i
 		}
 	}
 
 	if bestStart < 0 {
-		return 0, 0, false
+		return 0, decimal.Zero, false
 	}
 
 	return bestStart, bestAvg, true
@@ -293,7 +290,7 @@ func calculateWindowSize(capacityKWh float64, powerW int) int {
 
 // findSlotIndex finds the index of the slot that starts at or after the given time.
 // Returns -1 if not found.
-func findSlotIndex(prices []nordpool.Price, t time.Time) int {
+func findSlotIndex(prices []priceSlot, t time.Time) int {
 	for i, p := range prices {
 		if !p.Time.Before(t) {
 			return i
@@ -303,14 +300,14 @@ func findSlotIndex(prices []nordpool.Price, t time.Time) int {
 }
 
 // GetCurrentPrice returns the price for the current time slot.
-func GetCurrentPrice(prices []nordpool.Price, t time.Time) (float64, bool) {
+func GetCurrentPrice(prices []nordpool.Price, t time.Time) (decimal.Decimal, bool) {
 	for _, p := range prices {
 		slotEnd := p.Time.Add(15 * time.Minute)
 		if !t.Before(p.Time) && t.Before(slotEnd) {
-			return p.Value, true
+			return decimal.NewFromFloat(p.Value), true
 		}
 	}
-	return 0, false
+	return decimal.Zero, false
 }
 
 // IsInChargeWindow checks if the given time is within a charge window.

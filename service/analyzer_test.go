@@ -1,17 +1,16 @@
 package service
 
 import (
-	"math"
 	"testing"
 	"time"
+
+	"github.com/shopspring/decimal"
 
 	"github.com/foae/marstek-energy-trading/clients/nordpool"
 )
 
-const floatTolerance = 0.0001
-
-func floatEqual(a, b float64) bool {
-	return math.Abs(a-b) < floatTolerance
+func decimalEqual(a decimal.Decimal, b float64) bool {
+	return a.Equal(decimal.NewFromFloat(b))
 }
 
 // Helper to create prices for testing.
@@ -24,6 +23,18 @@ func makePrices(baseTime time.Time, values ...float64) []nordpool.Price {
 		}
 	}
 	return prices
+}
+
+// Helper to create priceSlots for internal function tests.
+func makePriceSlots(baseTime time.Time, values ...float64) []priceSlot {
+	slots := make([]priceSlot, len(values))
+	for i, v := range values {
+		slots[i] = priceSlot{
+			Time:  baseTime.Add(time.Duration(i) * 15 * time.Minute),
+			Value: decimal.NewFromFloat(v),
+		}
+	}
+	return slots
 }
 
 // Default test config: 5.12 kWh battery, 2500W charge/discharge, 90% efficiency, 11% min SOC
@@ -88,14 +99,14 @@ func TestAnalyzePrices_MinMaxSpread(t *testing.T) {
 	prices := makePrices(baseTime, values...)
 	plan := AnalyzePrices(prices, defaultTestConfig())
 
-	if !floatEqual(plan.MinPrice, 0.05) {
-		t.Errorf("expected min price 0.05, got %f", plan.MinPrice)
+	if !decimalEqual(plan.MinPrice, 0.05) {
+		t.Errorf("expected min price 0.05, got %s", plan.MinPrice)
 	}
-	if !floatEqual(plan.MaxPrice, 0.20) {
-		t.Errorf("expected max price 0.20, got %f", plan.MaxPrice)
+	if !decimalEqual(plan.MaxPrice, 0.20) {
+		t.Errorf("expected max price 0.20, got %s", plan.MaxPrice)
 	}
-	if !floatEqual(plan.Spread, 0.15) {
-		t.Errorf("expected spread 0.15, got %f", plan.Spread)
+	if !decimalEqual(plan.Spread, 0.15) {
+		t.Errorf("expected spread 0.15, got %s", plan.Spread)
 	}
 }
 
@@ -408,45 +419,45 @@ func TestFindBestWindow(t *testing.T) {
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
 	// Prices: 0.10, 0.08, 0.05, 0.06, 0.15, 0.20, 0.18, 0.12
 	// Indices:  0     1     2     3     4     5     6     7
-	prices := makePrices(baseTime, 0.10, 0.08, 0.05, 0.06, 0.15, 0.20, 0.18, 0.12)
+	slots := makePriceSlots(baseTime, 0.10, 0.08, 0.05, 0.06, 0.15, 0.20, 0.18, 0.12)
 
 	// Find lowest 2-slot window
-	startIdx, avg, found := findBestWindow(prices, 0, 2, true)
+	startIdx, avg, found := findBestWindow(slots, 0, 2, true)
 	if !found {
 		t.Fatal("expected to find a window")
 	}
 	if startIdx != 2 { // slots 2-3 have 0.05 and 0.06, avg = 0.055
 		t.Errorf("expected startIdx=2, got %d", startIdx)
 	}
-	if !floatEqual(avg, 0.055) {
-		t.Errorf("expected avg=0.055, got %f", avg)
+	if !decimalEqual(avg, 0.055) {
+		t.Errorf("expected avg=0.055, got %s", avg)
 	}
 
 	// Find highest 2-slot window
 	// Slot pairs: (0,1)=0.09, (1,2)=0.065, (2,3)=0.055, (3,4)=0.105, (4,5)=0.175, (5,6)=0.19, (6,7)=0.15
 	// Highest is (5,6) = 0.19
-	startIdx, avg, found = findBestWindow(prices, 0, 2, false)
+	startIdx, avg, found = findBestWindow(slots, 0, 2, false)
 	if !found {
 		t.Fatal("expected to find a window")
 	}
 	if startIdx != 5 { // slots 5-6 have 0.20 and 0.18, avg = 0.19
 		t.Errorf("expected startIdx=5, got %d", startIdx)
 	}
-	if !floatEqual(avg, 0.19) {
-		t.Errorf("expected avg=0.19, got %f", avg)
+	if !decimalEqual(avg, 0.19) {
+		t.Errorf("expected avg=0.19, got %s", avg)
 	}
 
 	// Find highest after index 5 (only (5,6) and (6,7) are valid)
 	// (5,6)=0.19, (6,7)=0.15
-	startIdx, avg, found = findBestWindow(prices, 5, 2, false)
+	startIdx, avg, found = findBestWindow(slots, 5, 2, false)
 	if !found {
 		t.Fatal("expected to find a window")
 	}
 	if startIdx != 5 { // slots 5-6 have 0.20 and 0.18, avg = 0.19
 		t.Errorf("expected startIdx=5, got %d", startIdx)
 	}
-	if !floatEqual(avg, 0.19) {
-		t.Errorf("expected avg=0.19, got %f", avg)
+	if !decimalEqual(avg, 0.19) {
+		t.Errorf("expected avg=0.19, got %s", avg)
 	}
 }
 
@@ -504,8 +515,8 @@ func TestGetCurrentPrice(t *testing.T) {
 			if ok != tt.wantOK {
 				t.Errorf("expected ok=%v, got %v", tt.wantOK, ok)
 			}
-			if price != tt.wantPrice {
-				t.Errorf("expected price=%f, got %f", tt.wantPrice, price)
+			if !decimalEqual(price, tt.wantPrice) {
+				t.Errorf("expected price=%f, got %s", tt.wantPrice, price)
 			}
 		})
 	}

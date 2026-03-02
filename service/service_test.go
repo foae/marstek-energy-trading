@@ -607,7 +607,7 @@ func TestTick_NotProfitablePlan(t *testing.T) {
 	svc := newTestService(cfg, mockBattery, prices, clockTime)
 
 	if svc.currentPlan.IsProfitable {
-		t.Fatalf("expected plan to be not profitable (spread=%f)", svc.currentPlan.Spread)
+		t.Fatalf("expected plan to be not profitable (spread=%s)", svc.currentPlan.Spread)
 	}
 
 	ctx := context.Background()

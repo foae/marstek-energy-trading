@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/caarlos0/env/v11"
@@ -48,7 +49,24 @@ func Load() (*Config, error) {
 	if err := env.Parse(cfg); err != nil {
 		return nil, err
 	}
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
 	return cfg, nil
+}
+
+// validate checks that config values are within expected bounds.
+func (c *Config) validate() error {
+	if c.BatteryEfficiency <= 0 || c.BatteryEfficiency > 1.0 {
+		return fmt.Errorf("BATTERY_EFFICIENCY must be in (0.0, 1.0], got %f", c.BatteryEfficiency)
+	}
+	if c.BatteryMinSOC < 0 || c.BatteryMinSOC >= 1.0 {
+		return fmt.Errorf("BATTERY_MIN_SOC must be in [0.0, 1.0), got %f", c.BatteryMinSOC)
+	}
+	if c.MinPriceSpread < 0 {
+		return fmt.Errorf("MIN_PRICE_SPREAD must be >= 0, got %f", c.MinPriceSpread)
+	}
+	return nil
 }
 
 // TelegramEnabled returns true if Telegram notifications are configured.

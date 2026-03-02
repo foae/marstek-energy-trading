@@ -46,6 +46,7 @@ type Service struct {
 	lastChargePrice    decimal.Decimal // track last charge price for profitability check
 	lastErrorNotify    time.Time       // rate limit error notifications
 	lastMidnightSwap   time.Time       // track last midnight price swap to avoid repeated fetches
+	lastDailySummary   time.Time       // track last daily summary to avoid duplicates on restart
 
 	// Solar charging state
 	solarSurplusCount int       // consecutive surplus readings above threshold
@@ -275,23 +276,30 @@ func (s *Service) tick(ctx context.Context) {
 
 	// Check if we have a valid trading plan
 	if s.currentPlan == nil || !s.currentPlan.ShouldTrade() {
-		if s.state != StateIdle {
+		switch s.state {
+		case StateCharging:
 			l.Info("no profitable trading plan, transitioning to idle", "has_plan", s.currentPlan != nil)
-			s.transitionToIdleLocked(ctx, batStatus.SOC)
+			s.stopChargingLocked(ctx, batStatus.SOC)
+		case StateDischarging:
+			l.Info("no profitable trading plan, transitioning to idle", "has_plan", s.currentPlan != nil)
+			s.stopDischargingLocked(ctx, batStatus.SOC)
+		case StateSolarCharging:
+			// Solar charging doesn't depend on trading plan; let solarTick manage it
+		case StateIdle:
+			// Nothing to do
 		}
 		return
 	}
 
 	// Get current price
-	currentPriceF, ok := GetCurrentPrice(s.todayPrices, now)
+	currentPrice, ok := GetCurrentPrice(s.todayPrices, now)
 	if !ok {
 		l.Warn("no price for current time slot")
 		return
 	}
-	currentPrice := decimal.NewFromFloat(currentPriceF)
 
 	// Enrich logger with price context
-	l = l.With("price_eur_kwh", currentPriceF)
+	l = l.With("price_eur_kwh", currentPrice)
 
 	// Decide action based on current time window
 	inChargeWindow := s.currentPlan.IsInChargeWindow(now)
@@ -307,7 +315,7 @@ func (s *Service) tick(ctx context.Context) {
 			} else {
 				l.Info("decision: start charging",
 					"min_price", s.currentPlan.MinPrice,
-					"charge_threshold", s.currentPlan.MinPrice+s.currentPlan.Spread*0.25)
+					"charge_threshold", s.currentPlan.MinPrice.Add(s.currentPlan.Spread.Mul(decimal.NewFromFloat(0.25))))
 				s.startChargingLocked(ctx, currentPrice, batStatus.SOC)
 			}
 		} else if inDischargeWindow {
@@ -321,7 +329,7 @@ func (s *Service) tick(ctx context.Context) {
 				l.Info("decision: start discharging",
 					"last_charge_price", lastChargeF,
 					"max_price", s.currentPlan.MaxPrice,
-					"discharge_threshold", s.currentPlan.MaxPrice-s.currentPlan.Spread*0.25)
+					"discharge_threshold", s.currentPlan.MaxPrice.Sub(s.currentPlan.Spread.Mul(decimal.NewFromFloat(0.25))))
 				s.startDischargingLocked(ctx, currentPrice, batStatus.SOC)
 			}
 		}
@@ -803,8 +811,8 @@ func (s *Service) checkPriceFetch(ctx context.Context) {
 	}
 
 	// At midnight, move tomorrow's prices to today (only once per day)
-	today := now.Truncate(24 * time.Hour)
-	alreadySwappedToday := s.lastMidnightSwap.Truncate(24 * time.Hour).Equal(today)
+	today := localMidnight(now)
+	alreadySwappedToday := localMidnight(s.lastMidnightSwap).Equal(today)
 
 	if now.Hour() == 0 && now.Minute() < 15 && !alreadySwappedToday {
 		s.mu.Lock()
@@ -905,8 +913,9 @@ func (s *Service) fetchTomorrowPrices(ctx context.Context) error {
 // logAndNotifyTradingPlan logs the trading plan and sends a Telegram notification.
 func (s *Service) logAndNotifyTradingPlan(ctx context.Context, l *slog.Logger, plan *TradingPlan, day string, slotsTotal, slotsAnalyzed int) {
 	// Calculate break-even spread needed to overcome efficiency loss
-	breakEvenDischarge := plan.MinPrice / s.cfg.BatteryEfficiency
-	minProfitableSpread := breakEvenDischarge - plan.MinPrice
+	efficiency := decimal.NewFromFloat(s.cfg.BatteryEfficiency)
+	breakEvenDischarge := plan.MinPrice.Div(efficiency)
+	minProfitableSpread := breakEvenDischarge.Sub(plan.MinPrice)
 
 	if !plan.IsProfitable {
 		l.Info("no profitable charge→discharge sequence found",
@@ -936,17 +945,18 @@ func (s *Service) logAndNotifyTradingPlan(ctx context.Context, l *slog.Logger, p
 		return
 	}
 
-	// Build notification data
+	// Build notification data (convert decimal to float64 at Telegram API boundary)
+	minProfitableSpreadF, _ := minProfitableSpread.Float64()
 	data := telegram.TradingPlanData{
 		Day:                    day,
 		Date:                   plan.Date,
 		SlotsTotal:             slotsTotal,
 		SlotsAnalyzed:          slotsAnalyzed,
-		PriceMin:               plan.MinPrice,
-		PriceMax:               plan.MaxPrice,
+		PriceMin:               plan.MinPrice.InexactFloat64(),
+		PriceMax:               plan.MaxPrice.InexactFloat64(),
 		IsProfitable:           plan.IsProfitable,
 		Reason:                 "Window-averaged prices don't meet spread/efficiency requirements",
-		MinSpreadForEfficiency: minProfitableSpread,
+		MinSpreadForEfficiency: minProfitableSpreadF,
 		MinSpreadConfigured:    s.cfg.MinPriceSpread,
 		BatteryEfficiency:      s.cfg.BatteryEfficiency,
 	}
@@ -956,11 +966,11 @@ func (s *Service) logAndNotifyTradingPlan(ctx context.Context, l *slog.Logger, p
 		data.Cycles = append(data.Cycles, telegram.TradingPlanCycle{
 			ChargeStart:    c.ChargeWindow.Start.Format("15:04"),
 			ChargeEnd:      c.ChargeWindow.End.Format("15:04"),
-			ChargePrice:    c.ChargeWindow.Price,
+			ChargePrice:    c.ChargeWindow.Price.InexactFloat64(),
 			DischargeStart: c.DischargeWindow.Start.Format("15:04"),
 			DischargeEnd:   c.DischargeWindow.End.Format("15:04"),
-			DischargePrice: c.DischargeWindow.Price,
-			ProfitPerKWh:   c.Profit,
+			DischargePrice: c.DischargeWindow.Price.InexactFloat64(),
+			ProfitPerKWh:   c.Profit.InexactFloat64(),
 		})
 	}
 
@@ -969,10 +979,11 @@ func (s *Service) logAndNotifyTradingPlan(ctx context.Context, l *slog.Logger, p
 	}
 }
 
-// checkDailySummary sends the daily summary at 23:59.
+// checkDailySummary sends the daily summary at 23:59 (once per day).
 func (s *Service) checkDailySummary(ctx context.Context) {
 	now := s.now()
-	if now.Hour() == 23 && now.Minute() == 59 {
+	if now.Hour() == 23 && now.Minute() == 59 && !localMidnight(s.lastDailySummary).Equal(localMidnight(now)) {
+		s.lastDailySummary = now
 		summary := s.recorder.GetTodaySummary()
 		totalPnL := s.recorder.GetTotalPnL()
 
@@ -1111,9 +1122,9 @@ func (s *Service) GetCurrentStatus() CurrentStatus {
 		BatterySOC: batterySOC,
 	}
 
-	// Get current price
+	// Get current price (convert to float64 for JSON API boundary)
 	if price, ok := GetCurrentPrice(s.todayPrices, now); ok {
-		status.CurrentPrice = price
+		status.CurrentPrice = price.InexactFloat64()
 	}
 
 	// Determine next action

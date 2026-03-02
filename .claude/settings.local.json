@@ -21,7 +21,12 @@
       "Bash(docker logs:*)",
       "Bash(docker ps:*)",
       "Bash(python3:*)",
-      "Bash(ssh:*)"
+      "Bash(ssh:*)",
+      "Bash(chmod:*)",
+      "Bash(__NEW_LINE_07b7003631d3b781__ echo \"\")",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push)"
     ]
   }
 }

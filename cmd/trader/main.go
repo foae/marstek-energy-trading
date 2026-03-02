@@ -59,9 +59,27 @@ func main() {
 	esphomeClient := esphome.New(cfg.ESPHomeURL, minSOC)
 	defer esphomeClient.Close()
 	slog.Info("using ESPHome battery backend", "url", cfg.ESPHomeURL, "min_soc", minSOC)
-	p1Client := homewizard.New(cfg.HomeWizardP1URL)
+	p1URL := cfg.HomeWizardP1URL
+	if p1URL == "" {
+		if discovered, err := homewizard.Discover(context.Background()); err != nil {
+			slog.Info("HomeWizard P1 not discovered, meter disabled", "error", err)
+		} else {
+			p1URL = discovered.URL
+			slog.Info("HomeWizard P1 auto-discovered",
+				"url", p1URL,
+				"serial", discovered.Serial,
+				"hostname", discovered.Hostname,
+				"method", discovered.Method,
+			)
+		}
+	}
+	p1Client := homewizard.New(p1URL)
 	if p1Client.Enabled() {
-		slog.Info("HomeWizard P1 meter enabled", "url", cfg.HomeWizardP1URL)
+		if info, err := p1Client.GetDeviceInfo(); err != nil {
+			slog.Warn("HomeWizard P1 meter unreachable at startup, will retry during operation", "url", p1URL, "error", err)
+		} else {
+			slog.Info("HomeWizard P1 meter enabled", "url", p1URL, "product", info.ProductName, "serial", info.Serial, "firmware", info.Firmware)
+		}
 	} else {
 		slog.Info("HomeWizard P1 meter disabled (no URL configured)")
 	}

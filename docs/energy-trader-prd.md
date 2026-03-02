@@ -34,6 +34,10 @@ A Go service that performs energy price arbitrage using a Marstek Venus E batter
 - **Connectivity check**: `GET /api` - returns device info
 - **Timeout**: 5 seconds
 - **Purpose**: Detects solar surplus (grid export) to trigger battery charging with free energy
+- **Auto-discovery**: When `HOMEWIZARD_P1_URL` is not set, the service attempts two discovery methods in order:
+  1. **mDNS** (3s timeout): Browses `_hwenergy._tcp` on the local network. Filters for `product_type=HWE-P1` and `api_enabled=1` in TXT records.
+  2. **HTTP scan** (30s timeout): Falls back to probing `GET /api` on `192.168.0.x` and `192.168.1.x` (64 concurrent workers, 500ms connect timeout). Checks `product_type=HWE-P1` in JSON response. Useful when mDNS is unavailable (e.g., Docker bridge networks).
+  If both methods fail, P1 features are gracefully disabled.
 
 ### Legacy UDP API (Preserved)
 - **Protocol**: UDP JSON-RPC to `192.168.1.255:30000`
@@ -246,7 +250,7 @@ Load from `.env` file with fallback to environment variables.
 | `CHARGE_POWER_W` | `2500` | Charge power (watts) |
 | `DISCHARGE_POWER_W` | `2500` | Discharge power (watts) |
 | `PASSIVE_MODE_TIMEOUT_S` | `300` | Passive mode timeout |
-| `HOMEWIZARD_P1_URL` | - | HomeWizard P1 meter URL (optional, empty = disabled) |
+| `HOMEWIZARD_P1_URL` | - | HomeWizard P1 meter URL (optional, empty = auto-discover via mDNS + HTTP scan) |
 | `SOLAR_MIN_SURPLUS_W` | `100` | Min surplus watts to start solar charging |
 | `TELEGRAM_BOT_TOKEN` | - | Telegram bot token |
 | `TELEGRAM_CHAT_ID` | - | Telegram chat ID |
@@ -275,7 +279,9 @@ marstek-energy-trading/
 │   └── interfaces.go            # BatteryController interface
 ├── clients/
 │   ├── esphome/client.go        # ESPHome HTTP client (default)
-│   ├── homewizard/client.go     # HomeWizard P1 meter (solar surplus detection)
+│   ├── homewizard/              # HomeWizard P1 meter (solar surplus + mDNS discovery)
+│   │   ├── client.go            # HTTP client for P1 data/device info
+│   │   └── discover.go          # Auto-discovery (mDNS + HTTP scan fallback)
 │   ├── marstek/client.go        # Battery UDP (legacy, preserved)
 │   ├── nordpool/client.go       # NordPool API
 │   └── telegram/client.go       # Telegram bot

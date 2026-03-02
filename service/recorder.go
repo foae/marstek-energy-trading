@@ -39,6 +39,8 @@ type DailySummary struct {
 	DischargedKWh     decimal.Decimal `json:"discharged_kwh"`
 	ChargeCycles      int             `json:"charge_cycles"`
 	DischargeCycles   int             `json:"discharge_cycles"`
+	SolarChargedKWh   decimal.Decimal `json:"solar_charged_kwh"`
+	SolarChargeCycles int             `json:"solar_charge_cycles"`
 	PnLEUR            decimal.Decimal `json:"pnl_eur"`
 	AvgChargePrice    decimal.Decimal `json:"avg_charge_price"`
 	MinChargePrice    decimal.Decimal `json:"min_charge_price"`
@@ -121,7 +123,8 @@ func (r *Recorder) GetHistory() History {
 		dischargedKWh := decimal.Zero
 		chargeCost := decimal.Zero
 		dischargeRevenue := decimal.Zero
-		var chargeCycles, dischargeCycles int
+		solarChargedKWh := decimal.Zero
+		var chargeCycles, dischargeCycles, solarChargeCycles int
 
 		// Track min/max prices with seen flags to handle negative prices correctly
 		var minChargePrice, maxDischargePrice decimal.Decimal
@@ -140,7 +143,8 @@ func (r *Recorder) GetHistory() History {
 			case ActionSolarCharge:
 				// Solar energy is free: add to charged kWh but not to charge cost
 				chargedKWh = chargedKWh.Add(t.EnergyKWh)
-				chargeCycles++
+				solarChargedKWh = solarChargedKWh.Add(t.EnergyKWh)
+				solarChargeCycles++
 			case ActionDischarge:
 				dischargedKWh = dischargedKWh.Add(t.EnergyKWh)
 				dischargeRevenue = dischargeRevenue.Add(t.PriceEUR.Mul(t.EnergyKWh))
@@ -171,6 +175,8 @@ func (r *Recorder) GetHistory() History {
 			DischargedKWh:     dischargedKWh,
 			ChargeCycles:      chargeCycles,
 			DischargeCycles:   dischargeCycles,
+			SolarChargedKWh:   solarChargedKWh,
+			SolarChargeCycles: solarChargeCycles,
 			PnLEUR:            pnl,
 			AvgChargePrice:    avgChargePrice,
 			MinChargePrice:    minChargePrice,

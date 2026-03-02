@@ -198,8 +198,10 @@ Time    Price   Action
 | Startup | "energy-trader started" |
 | Trade start | "Charging started at 0.08 EUR/kWh (SOC: 45%)" |
 | Trade end | "Charging completed. Energy: 2.5 kWh" |
+| Solar charge start | "Solar charging started at 0.0000 EUR/kWh (SOC: 60%)" |
+| Solar charge end | "Solar charging completed. Energy: 1.2 kWh" |
 | Error | "Battery unreachable" |
-| Daily summary (23:59) | P&L, charged/discharged kWh, cycles, cumulative P&L |
+| Daily summary (23:59) | P&L, charged/discharged kWh, solar kWh, cycles, cumulative P&L |
 
 ### Commands (Inbound)
 

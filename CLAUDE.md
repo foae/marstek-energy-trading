@@ -11,7 +11,7 @@ Energy market minitrader - a Go service that performs energy price arbitrage usi
 - **Marstek Venus E battery**: 5.12 kWh capacity, 90% efficiency, 11% min discharge protection
 - **Charge rate**: max 2500 W
 - **Discharge rate**: 800-2500 W
-- **HomeWizard P1 meter**: Planned feature, not yet implemented
+- **HomeWizard P1 meter**: Solar surplus detection via HTTP REST API. Auto-discovers via mDNS (`_hwenergy._tcp`) then HTTP scan (`192.168.0.x/1.x`) when no URL configured.
 
 ## API Documentation
 
@@ -36,6 +36,7 @@ cmd/trader/main.go       # Entry point
 internal/config/         # Configuration (env parsing via caarlos0/env)
 clients/
   esphome/               # ESPHome HTTP client (default battery backend)
+  homewizard/            # HomeWizard P1 meter (solar surplus + auto-discovery)
   marstek/               # Battery UDP client (legacy, preserved but unwired)
   nordpool/              # NordPool API client (timezone-aware)
   telegram/              # Telegram notifications
@@ -57,6 +58,7 @@ handler/                 # HTTP health/metrics/status
 
 Copy `.env.example` to `.env`. Key settings:
 - `ESPHOME_URL`: ESPHome device URL (default `http://192.168.1.50`)
+- `HOMEWIZARD_P1_URL`: P1 meter URL (optional; empty = auto-discover via mDNS + HTTP scan)
 - `MIN_PRICE_SPREAD`: Minimum EUR/kWh spread to trigger trading
 - `BATTERY_EFFICIENCY`: Round-trip efficiency (default 0.90)
 - `CHARGE_POWER_W` / `DISCHARGE_POWER_W`: Power rates in watts

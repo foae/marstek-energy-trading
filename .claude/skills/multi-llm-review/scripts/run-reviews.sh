@@ -105,14 +105,14 @@ trap cleanup EXIT
 
 # Run Gemini review in background
 (
-    gemini --sandbox --prompt "$REVIEW_PROMPT" < "$PRD_FILE" > "$GEMINI_OUTPUT" 2>&1
+    gemini --prompt "$REVIEW_PROMPT" < "$PRD_FILE" > "$GEMINI_OUTPUT" 2>&1
     echo $? > "$GEMINI_EXIT"
 ) &
 GEMINI_PID=$!
 
 # Run Codex review in background
 (
-    echo "$REVIEW_PROMPT" | codex exec --sandbox read-only - > "$CODEX_OUTPUT" 2>&1
+    echo "$REVIEW_PROMPT" | codex exec - > "$CODEX_OUTPUT" 2>&1
     echo $? > "$CODEX_EXIT"
 ) &
 CODEX_PID=$!

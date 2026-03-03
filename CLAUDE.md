@@ -143,7 +143,13 @@ When the HomeWizard P1 meter is enabled, the service captures solar surplus by c
 - **Start condition**: 3 consecutive readings above `SOLAR_MIN_SURPLUS_W` (default 100W)
 - **Stop condition**: 3 consecutive readings below stop threshold (25W = start threshold / 4). The lower stop threshold creates a hysteresis gap that prevents cycling when surplus fluctuates near 100W.
 - **Power tracking**: Charges at the detected surplus power, dynamically adjusted with 50W deadband
-- **Priority**: Yields immediately to scheduled charge/discharge windows
+- **Priority**: Scheduled windows always override solar charging (see below)
+
+### Scheduled window priority
+Solar charging and scheduled trading never conflict — three rules enforce strict priority:
+1. **Yield on entry**: If `StateSolarCharging` is active when `tick()` detects a scheduled charge/discharge window, it stops solar charging (records the solar trade), then immediately starts the scheduled action. (`service.go: tick() → case StateSolarCharging`)
+2. **Block during window**: `solarTick()` refuses to start solar charging while a scheduled window is active — resets surplus counter and returns. (`service.go: solarTick() → case StateIdle → IsInChargeWindow/IsInDischargeWindow check`)
+3. **Resume after window**: When the scheduled window ends and state returns to `StateIdle`, `solarTick()` picks up any available surplus and resumes solar charging automatically.
 
 ### P1 meter feedback loop compensation
 The Marstek Venus E is an AC-coupled battery — its charge power draws through the P1 meter. When the battery starts charging, the measured surplus drops by the charge amount:

@@ -156,13 +156,24 @@ func (c *Client) SendDailySummaryFull(ctx context.Context, data DailySummaryData
 	}
 
 	var text string
-	if data.ChargeCycles == 0 && data.DischargeCycles == 0 {
+	if data.ChargeCycles == 0 && data.DischargeCycles == 0 && data.SolarChargeCycles == 0 {
 		text = fmt.Sprintf(
 			"%s <b>Daily Summary - %s</b>\n\n"+
 				"No trades today.\n\n"+
 				"💰 <b>Cumulative P&L:</b> %s%.4f EUR",
 			pnlEmoji,
 			data.Date.Format("02 Jan 2006"),
+			totalSign, data.TotalPnLEUR,
+		)
+	} else if data.ChargeCycles == 0 && data.DischargeCycles == 0 {
+		// Solar-only day: no grid trades but solar energy was captured
+		text = fmt.Sprintf(
+			"%s <b>Daily Summary - %s</b>\n\n"+
+				"☀️ <b>Solar charged:</b> %.2f kWh (%d sessions)\n\n"+
+				"💰 <b>Cumulative P&L:</b> %s%.4f EUR",
+			pnlEmoji,
+			data.Date.Format("02 Jan 2006"),
+			data.SolarChargedKWh, data.SolarChargeCycles,
 			totalSign, data.TotalPnLEUR,
 		)
 	} else {

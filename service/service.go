@@ -925,6 +925,11 @@ func (s *Service) fetchTomorrowPrices(ctx context.Context) error {
 		return err
 	}
 
+	if len(prices) == 0 {
+		slog.Debug("tomorrow's prices not available yet")
+		return nil
+	}
+
 	s.mu.Lock()
 	s.tomorrowPrices = prices
 	s.mu.Unlock()

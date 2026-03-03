@@ -141,6 +141,7 @@ When the HomeWizard P1 meter is enabled, the service captures solar surplus by c
 - **Polling**: Every 1 second, reads P1 meter (`active_power_w`) and battery status
 - **Surplus calculation**: `surplus = -activePowerW` (negative P1 = exporting to grid)
 - **Start condition**: 3 consecutive readings above `SOLAR_MIN_SURPLUS_W` (default 100W)
+- **Stop condition**: 3 consecutive readings below stop threshold (25W = start threshold / 4). The lower stop threshold creates a hysteresis gap that prevents cycling when surplus fluctuates near 100W.
 - **Power tracking**: Charges at the detected surplus power, dynamically adjusted with 50W deadband
 - **Priority**: Yields immediately to scheduled charge/discharge windows
 

@@ -157,9 +157,11 @@ func (r *Recorder) GetHistory() History {
 		}
 
 		// Calculate energy-weighted average prices: sum(price * energy) / sum(energy)
+		// Use grid-only kWh for avg charge price (solar is free and would dilute the average)
+		gridChargedKWh := chargedKWh.Sub(solarChargedKWh)
 		avgChargePrice := decimal.Zero
-		if !chargedKWh.IsZero() {
-			avgChargePrice = chargeCost.Div(chargedKWh)
+		if !gridChargedKWh.IsZero() {
+			avgChargePrice = chargeCost.Div(gridChargedKWh)
 		}
 		avgDischargePrice := decimal.Zero
 		if !dischargedKWh.IsZero() {

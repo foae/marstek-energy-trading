@@ -121,8 +121,8 @@ func (s *Service) calculateAveragePrice(start, end time.Time) decimal.Decimal {
 		return decimal.Zero
 	}
 
-	var weightedSum float64
-	var totalDuration time.Duration
+	weightedSum := decimal.Zero
+	totalSeconds := decimal.Zero
 
 	for _, p := range s.todayPrices {
 		slotEnd := p.Time.Add(15 * time.Minute)
@@ -140,17 +140,18 @@ func (s *Service) calculateAveragePrice(start, end time.Time) decimal.Decimal {
 			}
 			overlap := overlapEnd.Sub(overlapStart)
 			if overlap > 0 {
-				weightedSum += p.Value * overlap.Seconds()
-				totalDuration += overlap
+				overlapSec := decimal.NewFromFloat(overlap.Seconds())
+				weightedSum = weightedSum.Add(decimal.NewFromFloat(p.Value).Mul(overlapSec))
+				totalSeconds = totalSeconds.Add(overlapSec)
 			}
 		}
 	}
 
-	if totalDuration == 0 {
+	if totalSeconds.IsZero() {
 		return decimal.Zero
 	}
 
-	return decimal.NewFromFloat(weightedSum / totalDuration.Seconds())
+	return weightedSum.Div(totalSeconds)
 }
 
 // Start begins the trading loop.
@@ -505,15 +506,18 @@ func (s *Service) solarTick(ctx context.Context) {
 			slog.Info("solar charging: adjusting power",
 				"old_w", s.solarChargePower, "new_w", targetPower,
 				"measured_surplus_w", surplus, "effective_surplus_w", effectiveSurplus)
-			s.solarChargePower = targetPower
 
 			// Release lock during network I/O
 			s.mu.Unlock()
-			if err := s.battery.Charge(targetPower, s.cfg.PassiveModeTimeoutS); err != nil {
-				slog.Warn("solar charging: failed to adjust power", "error", err)
-			}
+			err := s.battery.Charge(targetPower, s.cfg.PassiveModeTimeoutS)
 			s.mu.Lock()
-			s.lastPassiveRefresh = s.now()
+
+			if err != nil {
+				slog.Warn("solar charging: failed to adjust power", "error", err)
+			} else {
+				s.solarChargePower = targetPower
+				s.lastPassiveRefresh = s.now()
+			}
 		} else {
 			// Refresh passive mode to prevent timeout
 			s.refreshPassiveModeLocked(ctx, -s.solarChargePower)
@@ -626,7 +630,10 @@ func (s *Service) startChargingLocked(ctx context.Context, price decimal.Decimal
 
 	if err != nil {
 		l.Error("failed to start charging", "error", err)
-		s.notifyError(ctx, "Failed to start charging: "+err.Error())
+		errMsg := "Failed to start charging: " + err.Error()
+		s.mu.Unlock()
+		s.notifyError(ctx, errMsg)
+		s.mu.Lock()
 		return
 	}
 
@@ -720,7 +727,10 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 
 	if err != nil {
 		l.Error("failed to start discharging", "error", err)
-		s.notifyError(ctx, "Failed to start discharging: "+err.Error())
+		errMsg := "Failed to start discharging: " + err.Error()
+		s.mu.Unlock()
+		s.notifyError(ctx, errMsg)
+		s.mu.Lock()
 		return
 	}
 

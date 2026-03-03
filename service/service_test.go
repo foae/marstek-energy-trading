@@ -860,8 +860,8 @@ func TestSolarTick_StartAfter3Confirmations(t *testing.T) {
 }
 
 func TestSolarTick_StopOnSurplusDrop(t *testing.T) {
-	// Scenario: Solar charging active, then surplus drops below threshold
-	// Expected: Should stop solar charging
+	// Scenario: Solar charging active, surplus drops below stop threshold (25W).
+	// Requires 3 consecutive low readings (debounce) before stopping.
 
 	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
 	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
@@ -876,17 +876,104 @@ func TestSolarTick_StopOnSurplusDrop(t *testing.T) {
 	svc.currentTradeStart = baseTime.Add(-5 * time.Minute)
 	svc.currentTradeSOC = 45
 	svc.solarChargePower = 500
+	// Recent refresh triggers cooldown — prevents power adjustment from interfering
+	svc.lastPassiveRefresh = baseTime
 
 	ctx := context.Background()
 
-	// Real surplus drops: meter shows +450W (importing from grid) because
-	// battery is still drawing 500W but solar surplus truly dropped.
-	// effective_surplus = -450 (measured) + 500 (charge power) = 50W < 100W threshold → stop
-	meter.SetActivePowerW(450)
-	svc.solarTick(ctx)
+	// Meter shows +490W import → surplus=-490, effective=-490+500=10 < 25W stop threshold.
+	meter.SetActivePowerW(490)
 
+	// First tick: stopCount=1, still charging
+	svc.solarTick(ctx)
+	if svc.state != StateSolarCharging {
+		t.Fatalf("expected still charging after 1 low reading, got %s", svc.state)
+	}
+
+	// Second tick: stopCount=2, still charging
+	svc.solarTick(ctx)
+	if svc.state != StateSolarCharging {
+		t.Fatalf("expected still charging after 2 low readings, got %s", svc.state)
+	}
+
+	// Third tick: stopCount=3, now stops
+	svc.solarTick(ctx)
 	if svc.state != StateIdle {
-		t.Errorf("expected idle after surplus drop, got %s", svc.state)
+		t.Errorf("expected idle after 3 consecutive low readings, got %s", svc.state)
+	}
+}
+
+func TestSolarTick_StopDebounceResets(t *testing.T) {
+	// Scenario: surplus dips below stop threshold briefly then recovers.
+	// The stop counter should reset and charging should continue.
+
+	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
+
+	cfg := testConfigSmallBattery()
+	mockBattery := NewMockBattery(50)
+	meter := NewMockMeter(true, -500)
+
+	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
+	svc.state = StateSolarCharging
+	svc.currentTradeStart = baseTime.Add(-5 * time.Minute)
+	svc.currentTradeSOC = 45
+	svc.solarChargePower = 500
+	// Recent refresh triggers cooldown — isolates stop logic from power adjustment
+	svc.lastPassiveRefresh = baseTime
+
+	ctx := context.Background()
+
+	// Two low readings: meter=+490 → surplus=-490, effective=-490+500=10 < 25W
+	meter.SetActivePowerW(490)
+	svc.solarTick(ctx)
+	svc.solarTick(ctx)
+	if svc.solarStopCount != 2 {
+		t.Fatalf("expected stopCount=2, got %d", svc.solarStopCount)
+	}
+
+	// Surplus recovers: meter=+400 → surplus=-400, effective=-400+500=100 > 25W — counter resets
+	meter.SetActivePowerW(400)
+	svc.solarTick(ctx)
+	if svc.solarStopCount != 0 {
+		t.Errorf("expected stopCount reset to 0, got %d", svc.solarStopCount)
+	}
+	if svc.state != StateSolarCharging {
+		t.Errorf("expected still charging after recovery, got %s", svc.state)
+	}
+}
+
+func TestSolarTick_HysteresisGap(t *testing.T) {
+	// Scenario: effective surplus is between stop threshold (25W) and start
+	// threshold (100W). Should keep charging (hysteresis gap).
+
+	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
+
+	cfg := testConfigSmallBattery()
+	mockBattery := NewMockBattery(50)
+	meter := NewMockMeter(true, -500)
+
+	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
+	svc.state = StateSolarCharging
+	svc.currentTradeStart = baseTime.Add(-5 * time.Minute)
+	svc.currentTradeSOC = 45
+	svc.solarChargePower = 500
+	// Recent refresh triggers cooldown — isolates hysteresis from power adjustment
+	svc.lastPassiveRefresh = baseTime
+
+	ctx := context.Background()
+
+	// Meter shows +450W import → surplus=-450, effective=-450+500=50W.
+	// 50W is above stop threshold (25W) but below start threshold (100W).
+	// Should keep charging (hysteresis gap prevents cycling).
+	meter.SetActivePowerW(450)
+	for i := 0; i < 5; i++ {
+		svc.solarTick(ctx)
+	}
+
+	if svc.state != StateSolarCharging {
+		t.Errorf("expected still charging in hysteresis gap (50W), got %s", svc.state)
 	}
 }
 
@@ -1248,9 +1335,8 @@ func TestSolarTick_RecordsTrade(t *testing.T) {
 
 	cfg := testConfigSmallBattery()
 	mockBattery := NewMockBattery(50)
-	// Meter shows +450W import: real surplus dropped, battery still drawing 500W.
-	// effective_surplus = -450 + 500 = 50 < 100 threshold → stop
-	meter := NewMockMeter(true, 450)
+	// Meter shows +510W import. effective_surplus = -510 + 500 = -10 < 25W stop threshold.
+	meter := NewMockMeter(true, 510)
 
 	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
 	svc.state = StateSolarCharging
@@ -1260,7 +1346,10 @@ func TestSolarTick_RecordsTrade(t *testing.T) {
 	svc.solarLastUpdate = baseTime.Add(-10 * time.Minute)
 
 	ctx := context.Background()
-	svc.solarTick(ctx) // Should stop due to low effective surplus
+	// Need 3 consecutive low readings (debounce) to trigger stop
+	svc.solarTick(ctx)
+	svc.solarTick(ctx)
+	svc.solarTick(ctx)
 
 	// Check trade was recorded
 	history := svc.recorder.GetHistory()
@@ -1288,9 +1377,9 @@ func TestSolarTick_EnergyAccumulatesWithVaryingPower(t *testing.T) {
 
 	cfg := testConfigSmallBattery()
 	mockBattery := NewMockBattery(50)
-	// At stop time, solarChargePower will be 1500. Meter shows +1450W import.
-	// effective_surplus = -1450 + 1500 = 50 < 100 → stops
-	meter := NewMockMeter(true, 1450)
+	// At stop time, solarChargePower will be 1500. Meter shows +1510W import.
+	// effective_surplus = -1510 + 1500 = -10 < 25W stop threshold → stops after 3 ticks
+	meter := NewMockMeter(true, 1510)
 
 	clockTime := baseTime
 	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, clockTime)
@@ -1320,7 +1409,10 @@ func TestSolarTick_EnergyAccumulatesWithVaryingPower(t *testing.T) {
 	svc.SetClock(func() time.Time { return clockTime })
 
 	ctx := context.Background()
-	svc.solarTick(ctx) // will stop due to low effective surplus
+	// Need 3 consecutive low readings to trigger stop
+	svc.solarTick(ctx)
+	svc.solarTick(ctx)
+	svc.solarTick(ctx)
 
 	history := svc.recorder.GetHistory()
 	if len(history.Days) == 0 {

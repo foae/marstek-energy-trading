@@ -50,6 +50,7 @@ type Service struct {
 
 	// Solar charging state
 	solarSurplusCount int       // consecutive surplus readings above threshold
+	solarStopCount    int       // consecutive readings below stop threshold
 	solarChargePower  int       // current solar charge wattage
 	solarEnergyWs     float64   // cumulative watt-seconds during solar charging
 	solarLastUpdate   time.Time // last time solar energy was accumulated
@@ -442,20 +443,26 @@ func (s *Service) solarTick(ctx context.Context) {
 	case StateSolarCharging:
 		s.accumulateSolarEnergyLocked()
 
-		minSurplus := float64(s.cfg.SolarMinSurplusW)
-
 		// Compensate for feedback loop: the battery's charge power is visible on
 		// the P1 meter as consumption, so measured surplus is artificially low.
 		// Real surplus = what P1 sees + what the battery is currently drawing.
 		effectiveSurplus := surplus + float64(s.solarChargePower)
 
-		// Stop if effective surplus drops below threshold
-		if effectiveSurplus < minSurplus {
-			slog.Info("solar charging: surplus dropped below threshold",
-				"measured_surplus_w", surplus, "charge_power_w", s.solarChargePower,
-				"effective_surplus_w", effectiveSurplus, "threshold_w", minSurplus)
-			s.stopSolarChargingLocked(ctx, batStatus.SOC)
-			return
+		// Hysteresis: stop threshold is lower than start threshold to avoid
+		// cycling when surplus hovers near the boundary. Also requires 3
+		// consecutive low readings (debounce) to filter brief dips.
+		stopThreshold := float64(s.cfg.SolarMinSurplusW) / 4 // 25W default (vs 100W start)
+		if effectiveSurplus < stopThreshold {
+			s.solarStopCount++
+			if s.solarStopCount >= 3 {
+				slog.Info("solar charging: surplus dropped below threshold",
+					"measured_surplus_w", surplus, "charge_power_w", s.solarChargePower,
+					"effective_surplus_w", effectiveSurplus, "stop_threshold_w", stopThreshold)
+				s.stopSolarChargingLocked(ctx, batStatus.SOC)
+				return
+			}
+		} else {
+			s.solarStopCount = 0
 		}
 
 		// Stop if battery full
@@ -541,6 +548,7 @@ func (s *Service) startSolarChargingLocked(ctx context.Context, powerW int, soc 
 	s.lastPassiveRefresh = s.now()
 	s.solarChargePower = powerW
 	s.solarSurplusCount = 0
+	s.solarStopCount = 0
 	s.solarEnergyWs = 0
 	s.solarLastUpdate = s.now()
 

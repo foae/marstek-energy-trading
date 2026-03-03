@@ -475,6 +475,15 @@ func (s *Service) solarTick(ctx context.Context) {
 			}
 		}
 
+		// Wait for battery to settle after start/adjustment before re-adjusting.
+		// The battery takes ~3s to ramp to the target power; adjusting during
+		// ramp-up causes a positive feedback spiral (overestimated effective surplus
+		// → higher target → even higher next tick → overshoot → stop).
+		sinceLastChange := s.now().Sub(s.lastPassiveRefresh)
+		if sinceLastChange < 5*time.Second {
+			return
+		}
+
 		// Adjust charge power to match effective surplus (with 50W deadband to avoid flapping)
 		targetPower := int(effectiveSurplus)
 		if targetPower > s.cfg.ChargePowerW {
@@ -486,7 +495,9 @@ func (s *Service) solarTick(ctx context.Context) {
 			diff = -diff
 		}
 		if diff > 50 {
-			slog.Debug("solar charging: adjusting power", "old_w", s.solarChargePower, "new_w", targetPower)
+			slog.Info("solar charging: adjusting power",
+				"old_w", s.solarChargePower, "new_w", targetPower,
+				"measured_surplus_w", surplus, "effective_surplus_w", effectiveSurplus)
 			s.solarChargePower = targetPower
 
 			// Release lock during network I/O

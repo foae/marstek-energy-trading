@@ -106,12 +106,13 @@ The `lastChargePrice` is still tracked for observability logging but no longer g
 When a HomeWizard P1 meter is configured, the service detects grid export (solar surplus) and charges the battery with free energy:
 
 1. **Detection**: P1 meter is polled every 1 second. Negative `active_power_w` = exporting to grid = solar surplus.
-2. **Confirmation**: Requires 3 consecutive readings above `SOLAR_MIN_SURPLUS_W` (default: 100W) to avoid false starts.
+2. **Start confirmation**: Requires 3 consecutive readings above `SOLAR_MIN_SURPLUS_W` (default: 100W) to avoid false starts.
 3. **Charging**: Battery charges at the detected surplus power (clamped to `CHARGE_POWER_W`). Power is dynamically adjusted with a 50W deadband to avoid flapping.
 4. **P1 feedback compensation**: The Marstek Venus E is AC-coupled, so its charge power is visible on the P1 meter as consumption. During active solar charging, the stop-threshold and power adjustment use `effectiveSurplus = measuredSurplus + currentChargePower` to recover the true solar surplus from the P1 reading. Without this, the system would oscillate (start→surplus drops→stop→surplus returns→start).
 5. **Ramp-up cooldown**: After starting or adjusting charge power, a 5-second cooldown prevents re-adjustment while the battery ramps to the new target (~3s). This avoids a positive feedback spiral where transient over-estimation of effective surplus causes the target power to spiral upward.
-6. **Yielding**: Solar charging stops immediately when a scheduled charge or discharge window starts.
-7. **Recording**: Solar charges are recorded as `solar_charge` trades with price = 0 EUR/kWh. They contribute to `chargedKWh` but not to `chargeCost` in P&L.
+6. **Stop hysteresis + debounce**: Stop threshold is 25W (1/4 of start threshold), requiring 3 consecutive low readings. The hysteresis gap (25W–100W) prevents cycling when surplus fluctuates near the start threshold. The debounce filters brief dips from clouds or appliance spikes.
+7. **Yielding**: Solar charging stops immediately when a scheduled charge or discharge window starts.
+8. **Recording**: Solar charges are recorded as `solar_charge` trades with price = 0 EUR/kWh. They contribute to `chargedKWh` but not to `chargeCost` in P&L.
 
 ### Configurable Spread Threshold
 

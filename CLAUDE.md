@@ -133,6 +133,53 @@ Execution (`service/service.go`):
 - Track `lastChargePrice` for per-trade profitability check
 - Restore `lastChargePrice` from trade history on startup (state recovery)
 
+## Solar Self-Consumption Charging
+
+When the HomeWizard P1 meter is enabled, the service captures solar surplus by charging the battery instead of exporting to the grid. This runs independently of scheduled trading.
+
+### How it works (`service/service.go: solarTick`)
+- **Polling**: Every 1 second, reads P1 meter (`active_power_w`) and battery status
+- **Surplus calculation**: `surplus = -activePowerW` (negative P1 = exporting to grid)
+- **Start condition**: 3 consecutive readings above `SOLAR_MIN_SURPLUS_W` (default 100W)
+- **Power tracking**: Charges at the detected surplus power, dynamically adjusted with 50W deadband
+- **Priority**: Yields immediately to scheduled charge/discharge windows
+
+### P1 meter feedback loop compensation
+The Marstek Venus E is an AC-coupled battery — its charge power draws through the P1 meter. When the battery starts charging, the measured surplus drops by the charge amount:
+```
+Real surplus:       300W
+Battery charges at: 300W
+P1 meter sees:      300W - 300W = 0W  (looks like no surplus)
+```
+Without compensation, this causes oscillation (start→surplus drops→stop→surplus returns→start).
+
+**Fix**: When already in `StateSolarCharging`, the stop-threshold and power adjustment use the **effective surplus**:
+```
+effectiveSurplus = measuredSurplus + currentChargePower
+```
+
+### Battery ramp-up cooldown
+The battery takes ~3 seconds to ramp to a new power target. During ramp-up, `effectiveSurplus` overestimates reality (battery draws less than commanded), which can cause a power adjustment spiral. A **5-second cooldown** after any power change (start or adjust) prevents re-adjustment until the battery has settled.
+
+### State machine
+```
+StateIdle → StateSolarCharging → StateIdle
+  ↓                                  ↑
+  └─ (scheduled window starts) ──────┘
+```
+Solar charging occupies its own state (`StateSolarCharging`) distinct from scheduled `StateCharging`/`StateDischarging`. Scheduled windows always take priority.
+
+## Deployment
+
+No CI/CD pipeline — manual deploy to `olivier` machine:
+1. Make code changes locally, commit & push
+2. SSH into olivier, `cd ~/Projects/marstek-energy-trading`, `git pull`
+3. `make docker-build`
+4. `docker stop energy-trader && docker rm energy-trader`
+5. `docker run -d --name energy-trader --network=host --env-file .env -v $(pwd)/data:/app/data energy-trader:latest`
+
+Logs: `docker logs --tail 100 energy-trader`
+
 ## Common Pitfalls
 
 1. **Lock during I/O**: Always release mutex before network calls
@@ -141,3 +188,5 @@ Execution (`service/service.go`):
 4. **Timezone issues**: Use explicit `time.Location` for all time operations
 5. **Non-atomic file writes**: Use temp file + rename pattern
 6. **Notification spam**: Rate limit error notifications
+7. **P1 meter feedback loop**: AC-coupled battery draw is visible on the P1 meter — always compensate with `effectiveSurplus = measured + chargePower` when checking thresholds during active charging
+8. **Battery ramp-up transients**: Don't re-adjust power within 5s of a change — the battery hasn't reached the target yet and readings are unreliable

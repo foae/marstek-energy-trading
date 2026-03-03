@@ -444,10 +444,16 @@ func (s *Service) solarTick(ctx context.Context) {
 
 		minSurplus := float64(s.cfg.SolarMinSurplusW)
 
-		// Stop if surplus drops below threshold
-		if surplus < minSurplus {
+		// Compensate for feedback loop: the battery's charge power is visible on
+		// the P1 meter as consumption, so measured surplus is artificially low.
+		// Real surplus = what P1 sees + what the battery is currently drawing.
+		effectiveSurplus := surplus + float64(s.solarChargePower)
+
+		// Stop if effective surplus drops below threshold
+		if effectiveSurplus < minSurplus {
 			slog.Info("solar charging: surplus dropped below threshold",
-				"surplus_w", surplus, "threshold_w", minSurplus)
+				"measured_surplus_w", surplus, "charge_power_w", s.solarChargePower,
+				"effective_surplus_w", effectiveSurplus, "threshold_w", minSurplus)
 			s.stopSolarChargingLocked(ctx, batStatus.SOC)
 			return
 		}
@@ -469,8 +475,8 @@ func (s *Service) solarTick(ctx context.Context) {
 			}
 		}
 
-		// Adjust charge power to match surplus (with 50W deadband to avoid flapping)
-		targetPower := int(surplus)
+		// Adjust charge power to match effective surplus (with 50W deadband to avoid flapping)
+		targetPower := int(effectiveSurplus)
 		if targetPower > s.cfg.ChargePowerW {
 			targetPower = s.cfg.ChargePowerW
 		}

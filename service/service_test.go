@@ -879,8 +879,10 @@ func TestSolarTick_StopOnSurplusDrop(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Surplus drops to 50W (below 100W threshold)
-	meter.SetActivePowerW(-50)
+	// Real surplus drops: meter shows +450W (importing from grid) because
+	// battery is still drawing 500W but solar surplus truly dropped.
+	// effective_surplus = -450 (measured) + 500 (charge power) = 50W < 100W threshold → stop
+	meter.SetActivePowerW(450)
 	svc.solarTick(ctx)
 
 	if svc.state != StateIdle {
@@ -1188,7 +1190,9 @@ func TestSolarTick_SurplusCountResets(t *testing.T) {
 }
 
 func TestSolarTick_PowerAdjustmentDeadband(t *testing.T) {
-	// Scenario: Solar charging at 500W, surplus changes to 530W (within 50W deadband)
+	// Scenario: Solar charging at 500W, real surplus is 530W (within 50W deadband of current power)
+	// Meter shows -30W (exporting 30W) because battery draws 500W of the 530W surplus.
+	// effective_surplus = 30 + 500 = 530 → target=530 → diff=30 < 50 deadband → no adjust
 	// Expected: Should NOT send a new charge command
 
 	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
@@ -1196,7 +1200,7 @@ func TestSolarTick_PowerAdjustmentDeadband(t *testing.T) {
 
 	cfg := testConfigSmallBattery()
 	mockBattery := NewMockBattery(50)
-	meter := NewMockMeter(true, -530)
+	meter := NewMockMeter(true, -30) // meter sees 30W export (530W real - 500W battery)
 
 	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
 	svc.state = StateSolarCharging
@@ -1244,7 +1248,9 @@ func TestSolarTick_RecordsTrade(t *testing.T) {
 
 	cfg := testConfigSmallBattery()
 	mockBattery := NewMockBattery(50)
-	meter := NewMockMeter(true, -50) // low surplus to stop
+	// Meter shows +450W import: real surplus dropped, battery still drawing 500W.
+	// effective_surplus = -450 + 500 = 50 < 100 threshold → stop
+	meter := NewMockMeter(true, 450)
 
 	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
 	svc.state = StateSolarCharging
@@ -1254,7 +1260,7 @@ func TestSolarTick_RecordsTrade(t *testing.T) {
 	svc.solarLastUpdate = baseTime.Add(-10 * time.Minute)
 
 	ctx := context.Background()
-	svc.solarTick(ctx) // Should stop due to low surplus
+	svc.solarTick(ctx) // Should stop due to low effective surplus
 
 	// Check trade was recorded
 	history := svc.recorder.GetHistory()
@@ -1282,7 +1288,9 @@ func TestSolarTick_EnergyAccumulatesWithVaryingPower(t *testing.T) {
 
 	cfg := testConfigSmallBattery()
 	mockBattery := NewMockBattery(50)
-	meter := NewMockMeter(true, -50)
+	// At stop time, solarChargePower will be 1500. Meter shows +1450W import.
+	// effective_surplus = -1450 + 1500 = 50 < 100 → stops
+	meter := NewMockMeter(true, 1450)
 
 	clockTime := baseTime
 	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, clockTime)
@@ -1312,7 +1320,7 @@ func TestSolarTick_EnergyAccumulatesWithVaryingPower(t *testing.T) {
 	svc.SetClock(func() time.Time { return clockTime })
 
 	ctx := context.Background()
-	svc.solarTick(ctx) // will stop due to low surplus
+	svc.solarTick(ctx) // will stop due to low effective surplus
 
 	history := svc.recorder.GetHistory()
 	if len(history.Days) == 0 {

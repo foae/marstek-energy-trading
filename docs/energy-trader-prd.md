@@ -108,8 +108,10 @@ When a HomeWizard P1 meter is configured, the service detects grid export (solar
 1. **Detection**: P1 meter is polled every 1 second. Negative `active_power_w` = exporting to grid = solar surplus.
 2. **Confirmation**: Requires 3 consecutive readings above `SOLAR_MIN_SURPLUS_W` (default: 100W) to avoid false starts.
 3. **Charging**: Battery charges at the detected surplus power (clamped to `CHARGE_POWER_W`). Power is dynamically adjusted with a 50W deadband to avoid flapping.
-4. **Yielding**: Solar charging stops immediately when a scheduled charge or discharge window starts.
-5. **Recording**: Solar charges are recorded as `solar_charge` trades with price = 0 EUR/kWh. They contribute to `chargedKWh` but not to `chargeCost` in P&L.
+4. **P1 feedback compensation**: The Marstek Venus E is AC-coupled, so its charge power is visible on the P1 meter as consumption. During active solar charging, the stop-threshold and power adjustment use `effectiveSurplus = measuredSurplus + currentChargePower` to recover the true solar surplus from the P1 reading. Without this, the system would oscillate (start→surplus drops→stop→surplus returns→start).
+5. **Ramp-up cooldown**: After starting or adjusting charge power, a 5-second cooldown prevents re-adjustment while the battery ramps to the new target (~3s). This avoids a positive feedback spiral where transient over-estimation of effective surplus causes the target power to spiral upward.
+6. **Yielding**: Solar charging stops immediately when a scheduled charge or discharge window starts.
+7. **Recording**: Solar charges are recorded as `solar_charge` trades with price = 0 EUR/kWh. They contribute to `chargedKWh` but not to `chargeCost` in P&L.
 
 ### Configurable Spread Threshold
 

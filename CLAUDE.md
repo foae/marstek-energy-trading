@@ -140,9 +140,12 @@ When the HomeWizard P1 meter is enabled, the service captures solar surplus by c
 ### How it works (`service/service.go: solarTick`)
 - **Polling**: Every 1 second, reads P1 meter (`active_power_w`) and battery status
 - **Surplus calculation**: `surplus = -activePowerW` (negative P1 = exporting to grid)
-- **Start condition**: 3 consecutive readings above `SOLAR_MIN_SURPLUS_W` (default 100W)
-- **Stop condition**: 3 consecutive readings below stop threshold (25W = start threshold / 4). The lower stop threshold creates a hysteresis gap that prevents cycling when surplus fluctuates near 100W.
-- **Power tracking**: Charges at the detected surplus power, dynamically adjusted with 50W deadband
+- **EMA smoothing**: Surplus readings are smoothed with an exponential moving average (alpha=0.15, ~7s effective window). All threshold comparisons and power targets use the EMA, not raw readings. This prevents wild power swings from transient cloud shadows.
+- **Start condition**: 3 consecutive EMA readings above `SOLAR_MIN_SURPLUS_W` (default 100W)
+- **Stop condition**: 10 consecutive EMA readings below stop threshold (25W = start threshold / 4), AND session must be at least 30 seconds old. The lower stop threshold creates a hysteresis gap that prevents cycling when surplus fluctuates near 100W.
+- **Restart cooldown**: After a solar session stops, no new session can start for 60 seconds. This prevents rapid start/stop cycling when surplus hovers near the threshold.
+- **Power floor**: Charge power is clamped to a minimum of 75W. Prevents negative or trivially low charge commands.
+- **Power tracking**: Charges at the EMA-smoothed surplus power, dynamically adjusted with 50W deadband
 - **Priority**: Scheduled windows always override solar charging (see below)
 
 ### Scheduled window priority
@@ -197,3 +200,4 @@ Logs: `docker logs --tail 100 energy-trader`
 6. **Notification spam**: Rate limit error notifications
 7. **P1 meter feedback loop**: AC-coupled battery draw is visible on the P1 meter — always compensate with `effectiveSurplus = measured + chargePower` when checking thresholds during active charging
 8. **Battery ramp-up transients**: Don't re-adjust power within 5s of a change — the battery hasn't reached the target yet and readings are unreliable
+9. **Solar micro-cycling**: Anti-cycling constants (`solarMinSessionDuration`, `solarRestartCooldown`, `solarStopDebounceCount`, `solarMinChargePowerW`, `solarEMAAlpha`) are defined in `service.go` as package-level constants, not env vars — they're implementation details of the control loop, not user-facing config

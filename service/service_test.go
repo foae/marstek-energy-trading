@@ -1240,8 +1240,8 @@ func TestSolarTick_StopWhenBatteryFull(t *testing.T) {
 }
 
 func TestSolarTick_SurplusCountResets(t *testing.T) {
-	// Scenario: Surplus readings interrupted by EMA dropping below threshold
-	// Expected: Counter resets and needs 3 new readings above threshold to start
+	// Scenario: Surplus readings interrupted by a below-threshold reading
+	// Expected: Counter resets and needs 3 new readings to start
 
 	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
 	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
@@ -1254,23 +1254,21 @@ func TestSolarTick_SurplusCountResets(t *testing.T) {
 
 	ctx := context.Background()
 
-	// 2 surplus readings (EMA initializes to 500 on first tick, stays there)
+	// 2 surplus readings
 	svc.solarTick(ctx)
 	svc.solarTick(ctx)
 	if svc.solarSurplusCount != 2 {
 		t.Fatalf("expected count=2, got %d", svc.solarSurplusCount)
 	}
 
-	// EMA drops below threshold (simulates sustained low surplus)
-	svc.solarSurplusEMA = 50 // below 100W start threshold
-	meter.SetActivePowerW(-50)
+	// Surplus drops below threshold (raw surplus used for start, not EMA)
+	meter.SetActivePowerW(-50) // 50W surplus < 100W threshold
 	svc.solarTick(ctx)
 	if svc.solarSurplusCount != 0 {
 		t.Errorf("expected count reset to 0, got %d", svc.solarSurplusCount)
 	}
 
-	// Need 3 more readings with EMA above threshold to start
-	svc.solarSurplusEMA = 500 // restore EMA above threshold
+	// Need 3 more readings to start
 	meter.SetActivePowerW(-500)
 	svc.solarTick(ctx)
 	svc.solarTick(ctx)
@@ -1351,13 +1349,10 @@ func TestSolarTick_RecordsTrade(t *testing.T) {
 	svc.currentTradeSOC = 45
 	svc.solarChargePower = 500
 	svc.solarLastUpdate = baseTime.Add(-10 * time.Minute)
-	svc.solarSurplusEMA = 5 // pre-seed low so EMA stays below stop threshold
+	svc.solarSurplusEMA = 5 // below min charge power → triggers floor-based stop
 
 	ctx := context.Background()
-	// Need solarStopDebounceCount consecutive low readings to trigger stop
-	for range solarStopDebounceCount {
-		svc.solarTick(ctx)
-	}
+	svc.solarTick(ctx)
 
 	// Check trade was recorded
 	history := svc.recorder.GetHistory()
@@ -1415,13 +1410,10 @@ func TestSolarTick_EnergyAccumulatesWithVaryingPower(t *testing.T) {
 	// Advance another 5 minutes and stop
 	clockTime = baseTime.Add(10 * time.Minute)
 	svc.SetClock(func() time.Time { return clockTime })
-	svc.solarSurplusEMA = 5 // pre-seed low so EMA stays below stop threshold
+	svc.solarSurplusEMA = 5 // below min charge power → triggers floor-based stop
 
 	ctx := context.Background()
-	// Need solarStopDebounceCount consecutive low readings to trigger stop
-	for range solarStopDebounceCount {
-		svc.solarTick(ctx)
-	}
+	svc.solarTick(ctx)
 
 	history := svc.recorder.GetHistory()
 	if len(history.Days) == 0 {
@@ -1520,32 +1512,60 @@ func TestSolarTick_MinSessionDuration(t *testing.T) {
 	}
 }
 
-func TestSolarTick_PowerFloorClamp(t *testing.T) {
-	// Power target should never go below solarMinChargePowerW.
+func TestSolarTick_PowerFloorStopsSession(t *testing.T) {
+	// When EMA drops below solarMinChargePowerW and session is old enough,
+	// the session should stop instead of clamping up (which would import from grid).
 
 	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
 	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
 
 	cfg := testConfigSmallBattery()
 	mockBattery := NewMockBattery(50)
-	// Meter shows 490W import → surplus=-490, effective=-490+500=10
-	meter := NewMockMeter(true, 490)
+	meter := NewMockMeter(true, 490) // surplus=-490, effective=10
 
 	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
 	svc.state = StateSolarCharging
-	svc.currentTradeStart = baseTime.Add(-5 * time.Minute)
+	svc.currentTradeStart = baseTime.Add(-5 * time.Minute) // old enough
 	svc.currentTradeSOC = 45
 	svc.solarChargePower = 500
-	// Set EMA to a low-but-positive value (e.g., 20W) that would normally become
-	// the target power, but should be clamped to the 75W floor.
-	svc.solarSurplusEMA = 20
-	// Expired cooldown so power adjustment runs
+	svc.solarSurplusEMA = 20 // below solarMinChargePowerW
 	svc.lastPassiveRefresh = baseTime.Add(-10 * time.Second)
 
 	ctx := context.Background()
 	svc.solarTick(ctx)
 
-	// Should have adjusted to the floor, not to 20 or negative
+	// Should stop, not clamp to floor
+	if svc.state != StateIdle {
+		t.Errorf("expected idle when EMA below min charge power, got %s", svc.state)
+	}
+}
+
+func TestSolarTick_PowerFloorClampsBeforeMinDuration(t *testing.T) {
+	// During minimum session duration, if EMA drops below floor,
+	// clamp to floor as safety bound (don't stop yet).
+
+	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
+
+	cfg := testConfigSmallBattery()
+	mockBattery := NewMockBattery(50)
+	meter := NewMockMeter(true, 490) // surplus=-490, effective=10
+
+	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
+	svc.state = StateSolarCharging
+	svc.currentTradeStart = baseTime.Add(-5 * time.Second) // under min duration
+	svc.currentTradeSOC = 45
+	svc.solarChargePower = 500
+	svc.solarSurplusEMA = 20 // below floor
+	svc.lastPassiveRefresh = baseTime.Add(-10 * time.Second)
+
+	ctx := context.Background()
+	svc.solarTick(ctx)
+
+	// Should still be charging, clamped to floor
+	if svc.state != StateSolarCharging {
+		t.Errorf("expected still charging during min session, got %s", svc.state)
+	}
 	if svc.solarChargePower != solarMinChargePowerW {
 		t.Errorf("expected power clamped to %d, got %d", solarMinChargePowerW, svc.solarChargePower)
 	}

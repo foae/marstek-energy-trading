@@ -427,15 +427,10 @@ func (s *Service) solarTick(ctx context.Context) {
 			return
 		}
 
-		// Update EMA with current surplus reading
-		if s.solarSurplusEMA == 0 && surplus > 0 {
-			s.solarSurplusEMA = surplus
-		} else {
-			s.solarSurplusEMA = solarEMAAlpha*surplus + (1-solarEMAAlpha)*s.solarSurplusEMA
-		}
-
+		// Use raw surplus (not EMA) for start decision — EMA memory from
+		// previous sessions could cause false starts from a single spike.
 		minSurplus := float64(s.cfg.SolarMinSurplusW)
-		if s.solarSurplusEMA < minSurplus {
+		if surplus < minSurplus {
 			s.solarSurplusCount = 0
 			return
 		}
@@ -457,7 +452,7 @@ func (s *Service) solarTick(ctx context.Context) {
 
 		s.solarSurplusCount++
 		if s.solarSurplusCount >= 3 {
-			power := int(s.solarSurplusEMA)
+			power := int(surplus)
 			power = max(power, solarMinChargePowerW)
 			power = min(power, s.cfg.ChargePowerW)
 			s.startSolarChargingLocked(ctx, power, batStatus.SOC)
@@ -523,9 +518,20 @@ func (s *Service) solarTick(ctx context.Context) {
 			return
 		}
 
-		// Adjust charge power to match smoothed effective surplus (with 50W deadband)
+		// Adjust charge power to match smoothed effective surplus (with 50W deadband).
+		// If EMA drops below the minimum useful charge power, stop the session
+		// instead of clamping up — clamping would import from grid.
 		targetPower := int(s.solarSurplusEMA)
-		targetPower = max(targetPower, solarMinChargePowerW)
+		if targetPower < solarMinChargePowerW {
+			if sessionAge >= solarMinSessionDuration {
+				slog.Info("solar charging: surplus too low for minimum charge power",
+					"ema_w", s.solarSurplusEMA, "min_charge_w", solarMinChargePowerW)
+				s.stopSolarChargingLocked(ctx, batStatus.SOC)
+				return
+			}
+			// During min session, clamp to floor as safety bound
+			targetPower = solarMinChargePowerW
+		}
 		targetPower = min(targetPower, s.cfg.ChargePowerW)
 
 		diff := targetPower - s.solarChargePower

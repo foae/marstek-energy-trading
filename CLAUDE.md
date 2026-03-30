@@ -140,11 +140,11 @@ When the HomeWizard P1 meter is enabled, the service captures solar surplus by c
 ### How it works (`service/service.go: solarTick`)
 - **Polling**: Every 1 second, reads P1 meter (`active_power_w`) and battery status
 - **Surplus calculation**: `surplus = -activePowerW` (negative P1 = exporting to grid)
-- **EMA smoothing**: Surplus readings are smoothed with an exponential moving average (alpha=0.15, ~7s effective window). All threshold comparisons and power targets use the EMA, not raw readings. This prevents wild power swings from transient cloud shadows.
-- **Start condition**: 3 consecutive EMA readings above `SOLAR_MIN_SURPLUS_W` (default 100W)
-- **Stop condition**: 10 consecutive EMA readings below stop threshold (25W = start threshold / 4), AND session must be at least 30 seconds old. The lower stop threshold creates a hysteresis gap that prevents cycling when surplus fluctuates near 100W.
+- **Start condition**: 3 consecutive raw surplus readings above `SOLAR_MIN_SURPLUS_W` (default 100W). Uses raw readings (not EMA) to avoid false starts from stale EMA state.
+- **EMA smoothing**: During active charging, effective surplus is smoothed with an exponential moving average (alpha=0.15, ~6s time constant). Power targets and stop thresholds use the EMA, not raw readings. This prevents wild power swings from transient cloud shadows.
+- **Stop condition**: 10 consecutive EMA readings below stop threshold (25W = start threshold / 4), AND session must be at least 30 seconds old. The lower stop threshold creates a hysteresis gap that prevents cycling when surplus fluctuates near 100W. Additionally, if EMA drops below the 75W minimum charge power, the session stops immediately (after min duration) to prevent grid import.
 - **Restart cooldown**: After a solar session stops, no new session can start for 60 seconds. This prevents rapid start/stop cycling when surplus hovers near the threshold.
-- **Power floor**: Charge power is clamped to a minimum of 75W. Prevents negative or trivially low charge commands.
+- **Power floor**: During minimum session duration, charge power is clamped to a floor of 75W. After min duration, surplus below 75W triggers a session stop instead of clamping (to avoid importing from grid).
 - **Power tracking**: Charges at the EMA-smoothed surplus power, dynamically adjusted with 50W deadband
 - **Priority**: Scheduled windows always override solar charging (see below)
 

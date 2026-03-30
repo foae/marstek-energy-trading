@@ -23,6 +23,15 @@ const (
 	StateSolarCharging State = "solar_charging"
 )
 
+// Solar anti-cycling constants.
+const (
+	solarMinSessionDuration = 30 * time.Second // don't stop a session before this
+	solarRestartCooldown    = 60 * time.Second // wait after stop before restarting
+	solarMinChargePowerW    = 75               // floor clamp for charge power
+	solarStopDebounceCount  = 10               // consecutive low readings before stop
+	solarEMAAlpha           = 0.15             // EMA smoothing factor (~7s effective window)
+)
+
 // Service is the main trading engine.
 type Service struct {
 	cfg      *config.Config
@@ -54,6 +63,8 @@ type Service struct {
 	solarChargePower  int       // current solar charge wattage
 	solarEnergyWs     float64   // cumulative watt-seconds during solar charging
 	solarLastUpdate   time.Time // last time solar energy was accumulated
+	solarLastStop     time.Time // when last solar session ended (restart cooldown)
+	solarSurplusEMA   float64   // exponentially weighted moving average of surplus
 }
 
 // New creates a new trading service.
@@ -411,8 +422,20 @@ func (s *Service) solarTick(ctx context.Context) {
 
 	switch s.state {
 	case StateIdle:
+		// Restart cooldown: don't start a new session too soon after stopping
+		if !s.solarLastStop.IsZero() && s.now().Sub(s.solarLastStop) < solarRestartCooldown {
+			return
+		}
+
+		// Update EMA with current surplus reading
+		if s.solarSurplusEMA == 0 && surplus > 0 {
+			s.solarSurplusEMA = surplus
+		} else {
+			s.solarSurplusEMA = solarEMAAlpha*surplus + (1-solarEMAAlpha)*s.solarSurplusEMA
+		}
+
 		minSurplus := float64(s.cfg.SolarMinSurplusW)
-		if surplus < minSurplus {
+		if s.solarSurplusEMA < minSurplus {
 			s.solarSurplusCount = 0
 			return
 		}
@@ -434,10 +457,9 @@ func (s *Service) solarTick(ctx context.Context) {
 
 		s.solarSurplusCount++
 		if s.solarSurplusCount >= 3 {
-			power := int(surplus)
-			if power > s.cfg.ChargePowerW {
-				power = s.cfg.ChargePowerW
-			}
+			power := int(s.solarSurplusEMA)
+			power = max(power, solarMinChargePowerW)
+			power = min(power, s.cfg.ChargePowerW)
 			s.startSolarChargingLocked(ctx, power, batStatus.SOC)
 		}
 
@@ -449,13 +471,39 @@ func (s *Service) solarTick(ctx context.Context) {
 		// Real surplus = what P1 sees + what the battery is currently drawing.
 		effectiveSurplus := surplus + float64(s.solarChargePower)
 
+		// Update EMA with effective surplus during charging
+		if s.solarSurplusEMA == 0 {
+			s.solarSurplusEMA = effectiveSurplus
+		} else {
+			s.solarSurplusEMA = solarEMAAlpha*effectiveSurplus + (1-solarEMAAlpha)*s.solarSurplusEMA
+		}
+
+		sessionAge := s.now().Sub(s.currentTradeStart)
+
+		// Stop if battery full (unconditional safety check)
+		if batStatus.SOC >= 100 {
+			slog.Info("solar charging: battery full")
+			s.stopSolarChargingLocked(ctx, batStatus.SOC)
+			return
+		}
+
+		// Yield immediately to scheduled windows (unconditional priority check)
+		if s.currentPlan != nil {
+			now := s.now()
+			if s.currentPlan.IsInChargeWindow(now) || s.currentPlan.IsInDischargeWindow(now) {
+				slog.Info("solar charging: yielding to scheduled window")
+				s.stopSolarChargingLocked(ctx, batStatus.SOC)
+				return
+			}
+		}
+
 		// Hysteresis: stop threshold is lower than start threshold to avoid
-		// cycling when surplus hovers near the boundary. Also requires 3
-		// consecutive low readings (debounce) to filter brief dips.
+		// cycling when surplus hovers near the boundary. Requires solarStopDebounceCount
+		// consecutive low readings AND minimum session duration before stopping.
 		stopThreshold := float64(s.cfg.SolarMinSurplusW) / 4 // 25W default (vs 100W start)
-		if effectiveSurplus < stopThreshold {
+		if s.solarSurplusEMA < stopThreshold {
 			s.solarStopCount++
-			if s.solarStopCount >= 3 {
+			if s.solarStopCount >= solarStopDebounceCount && sessionAge >= solarMinSessionDuration {
 				slog.Info("solar charging: surplus dropped below threshold",
 					"measured_surplus_w", surplus, "charge_power_w", s.solarChargePower,
 					"effective_surplus_w", effectiveSurplus, "stop_threshold_w", stopThreshold)
@@ -464,23 +512,6 @@ func (s *Service) solarTick(ctx context.Context) {
 			}
 		} else {
 			s.solarStopCount = 0
-		}
-
-		// Stop if battery full
-		if batStatus.SOC >= 100 {
-			slog.Info("solar charging: battery full")
-			s.stopSolarChargingLocked(ctx, batStatus.SOC)
-			return
-		}
-
-		// Yield immediately to scheduled windows
-		if s.currentPlan != nil {
-			now := s.now()
-			if s.currentPlan.IsInChargeWindow(now) || s.currentPlan.IsInDischargeWindow(now) {
-				slog.Info("solar charging: yielding to scheduled window")
-				s.stopSolarChargingLocked(ctx, batStatus.SOC)
-				return
-			}
 		}
 
 		// Wait for battery to settle after start/adjustment before re-adjusting.
@@ -492,11 +523,10 @@ func (s *Service) solarTick(ctx context.Context) {
 			return
 		}
 
-		// Adjust charge power to match effective surplus (with 50W deadband to avoid flapping)
-		targetPower := int(effectiveSurplus)
-		if targetPower > s.cfg.ChargePowerW {
-			targetPower = s.cfg.ChargePowerW
-		}
+		// Adjust charge power to match smoothed effective surplus (with 50W deadband)
+		targetPower := int(s.solarSurplusEMA)
+		targetPower = max(targetPower, solarMinChargePowerW)
+		targetPower = min(targetPower, s.cfg.ChargePowerW)
 
 		diff := targetPower - s.solarChargePower
 		if diff < 0 {
@@ -555,6 +585,7 @@ func (s *Service) startSolarChargingLocked(ctx context.Context, powerW int, soc 
 	s.solarStopCount = 0
 	s.solarEnergyWs = 0
 	s.solarLastUpdate = s.now()
+	s.solarSurplusEMA = 0
 
 	l.Info("solar charge session started", "state", s.state)
 
@@ -604,8 +635,11 @@ func (s *Service) stopSolarChargingLocked(ctx context.Context, endSOC int) {
 	s.mu.Lock()
 
 	s.solarSurplusCount = 0
+	s.solarStopCount = 0
 	s.solarChargePower = 0
 	s.solarEnergyWs = 0
+	s.solarLastStop = s.now()
+	s.solarSurplusEMA = 0
 	s.transitionToIdleLocked(ctx, endSOC)
 
 	s.mu.Unlock()

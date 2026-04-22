@@ -140,11 +140,15 @@ When the HomeWizard P1 meter is enabled, the service captures solar surplus by c
 ### How it works (`service/service.go: solarTick`)
 - **Polling**: Every 1 second, reads P1 meter (`active_power_w`) and battery status
 - **Surplus calculation**: `surplus = -activePowerW` (negative P1 = exporting to grid)
-- **Start condition**: 3 consecutive raw surplus readings above `SOLAR_MIN_SURPLUS_W` (default 100W). Uses raw readings (not EMA) to avoid false starts from stale EMA state.
-- **EMA smoothing**: During active charging, effective surplus is smoothed with an exponential moving average (alpha=0.15, ~6s time constant). Power targets and stop thresholds use the EMA, not raw readings. This prevents wild power swings from transient cloud shadows.
-- **Stop condition**: 10 consecutive EMA readings below stop threshold (25W = start threshold / 4), AND session must be at least 30 seconds old. The lower stop threshold creates a hysteresis gap that prevents cycling when surplus fluctuates near 100W. Additionally, if EMA drops below the 75W minimum charge power, the session stops immediately (after min duration) to prevent grid import.
-- **Restart cooldown**: After a solar session stops, no new session can start for 60 seconds. This prevents rapid start/stop cycling when surplus hovers near the threshold.
-- **Power floor**: During minimum session duration, charge power is clamped to a floor of 75W. After min duration, surplus below 75W triggers a session stop instead of clamping (to avoid importing from grid).
+- **Start condition**: 10 consecutive raw surplus readings above `SOLAR_MIN_SURPLUS_W` (default 100W, i.e. 10 s of sustained surplus). Uses raw readings (not EMA) to avoid false starts from stale EMA state. The longer qualification window rejects brief transients (cloud edge, appliance cycling off) that would otherwise trigger ineffective micro-sessions.
+- **EMA smoothing**: During active charging, effective surplus is smoothed with an exponential moving average (alpha=0.05, ~20s time constant). Power targets and stop thresholds use the EMA, not raw readings. Heavier smoothing reduces power-adjustment churn when household loads oscillate.
+- **Stop condition**: 10 consecutive EMA readings below stop threshold (25W = start threshold / 4), AND session must be at least 60 seconds old. The lower stop threshold creates a hysteresis gap that prevents cycling when surplus fluctuates near 100W. Additionally, if EMA drops below the 75W minimum charge power, the session stops immediately (after min duration) to prevent grid import.
+- **Adaptive restart cooldown**: After a session stops, no new session can start until `solarCooldownUntil`. The cooldown is computed at stop time based on why/how long the session ran:
+  - Legitimate stop (battery full, yielding to scheduled window) OR session ≥ 2 min: `solarRestartCooldown` (60 s baseline).
+  - "Surplus gone" stop on a short session (< 2 min): `solarShortSessionCooldown` (5 min).
+  - After `solarShortSessionBackoffCount` (3) consecutive short surplus-gone sessions: `solarLongBackoffCooldown` (15 min).
+  The consecutive-short counter resets on any legitimate stop OR any session that runs past the short threshold.
+- **Power floor**: During minimum session duration (60 s), charge power is clamped to a floor of 75W. After min duration, surplus below 75W triggers a session stop instead of clamping (to avoid importing from grid).
 - **Power tracking**: Charges at the EMA-smoothed surplus power, dynamically adjusted with 50W deadband
 - **Priority**: Scheduled windows always override solar charging (see below)
 
@@ -200,4 +204,4 @@ Logs: `docker logs --tail 100 energy-trader`
 6. **Notification spam**: Rate limit error notifications
 7. **P1 meter feedback loop**: AC-coupled battery draw is visible on the P1 meter — always compensate with `effectiveSurplus = measured + chargePower` when checking thresholds during active charging
 8. **Battery ramp-up transients**: Don't re-adjust power within 5s of a change — the battery hasn't reached the target yet and readings are unreliable
-9. **Solar micro-cycling**: Anti-cycling constants (`solarMinSessionDuration`, `solarRestartCooldown`, `solarStopDebounceCount`, `solarMinChargePowerW`, `solarEMAAlpha`) are defined in `service.go` as package-level constants, not env vars — they're implementation details of the control loop, not user-facing config
+9. **Solar micro-cycling**: Anti-cycling constants (`solarMinSessionDuration`, `solarRestartCooldown`, `solarShortSessionCooldown`, `solarLongBackoffCooldown`, `solarShortSessionThreshold`, `solarShortSessionBackoffCount`, `solarStartQualificationCount`, `solarStopDebounceCount`, `solarMinChargePowerW`, `solarEMAAlpha`) are defined in `service.go` as package-level constants, not env vars — they're implementation details of the control loop, not user-facing config

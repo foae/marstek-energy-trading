@@ -29,10 +29,11 @@ go.work.sum
 
 # Runtime data
 data/
+vendor/
 
 # Binary
 energy-trader
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/

@@ -122,8 +122,11 @@ func TestDiscoverMDNS_SkipsNonP1Device(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, err = discoverMDNS(ctx)
+	result, err := discoverMDNS(ctx)
 	if err == nil {
+		if result.Serial != "kwhserial" {
+			t.Skipf("real P1 meter present on network (serial %s), cannot test absence", result.Serial)
+		}
 		t.Fatal("expected error when no P1 device is present, got nil")
 	}
 }
@@ -151,8 +154,11 @@ func TestDiscoverMDNS_SkipsAPIDisabled(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, err = discoverMDNS(ctx)
+	result, err := discoverMDNS(ctx)
 	if err == nil {
+		if result.Serial != "noapiserial" {
+			t.Skipf("real P1 meter present on network (serial %s), cannot test absence", result.Serial)
+		}
 		t.Fatal("expected error when P1 has API disabled, got nil")
 	}
 }
@@ -165,8 +171,11 @@ func TestDiscoverMDNS_TimeoutWhenNoServices(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
-	_, err := discoverMDNS(ctx)
+	result, err := discoverMDNS(ctx)
 	if err == nil {
+		if result.Serial != "" {
+			t.Skipf("real P1 meter present on network (serial %s), cannot test absence", result.Serial)
+		}
 		t.Fatal("expected timeout error, got nil")
 	}
 }

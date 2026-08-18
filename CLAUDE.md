@@ -190,7 +190,7 @@ No CI/CD pipeline — manual deploy to `olivier` machine:
 2. SSH into olivier, `cd ~/Projects/marstek-energy-trading`, `git pull`
 3. `make docker-build`
 4. `docker stop energy-trader && docker rm energy-trader`
-5. `docker run -d --name energy-trader --network=host --env-file .env -v $(pwd)/data:/app/data energy-trader:latest`
+5. `docker run -d --name energy-trader --restart unless-stopped --network=host --env-file .env -v $(pwd)/data:/app/data energy-trader:latest`
 
 Logs: `docker logs --tail 100 energy-trader`
 

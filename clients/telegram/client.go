@@ -221,12 +221,14 @@ func (c *Client) SendStartup(ctx context.Context, serviceName string) error {
 
 // StatusData contains current status for the /status command.
 type StatusData struct {
-	State        string
-	BatterySOC   int
-	CurrentPrice float64
-	NextAction   string
-	TodayPnL     float64
-	TotalPnL     float64
+	State            string
+	BatteryAvailable bool
+	BatterySOC       int
+	BatteryPowerW    float64
+	CurrentPrice     float64
+	NextAction       string
+	TodayPnL         float64
+	TotalPnL         float64
 }
 
 // SendStatus sends the current status.
@@ -240,18 +242,26 @@ func (c *Client) SendStatus(ctx context.Context, data StatusData) error {
 	case "discharging":
 		stateEmoji = "⚡"
 	}
+	batterySOC := "unavailable"
+	batteryPower := "unavailable"
+	if data.BatteryAvailable {
+		batterySOC = fmt.Sprintf("%d%%", data.BatterySOC)
+		batteryPower = fmt.Sprintf("%.0f W", data.BatteryPowerW)
+	}
 
 	text := fmt.Sprintf(
 		"%s <b>Current Status</b>\n\n"+
 			"<b>State:</b> %s\n"+
-			"<b>Battery:</b> %d%%\n"+
+			"<b>Battery:</b> %s\n"+
+			"<b>Battery power:</b> %s\n"+
 			"<b>Price:</b> %.4f EUR/kWh\n"+
 			"<b>Next:</b> %s\n\n"+
 			"<b>Today P&L:</b> %.4f EUR\n"+
 			"<b>Total P&L:</b> %.4f EUR",
 		stateEmoji,
 		data.State,
-		data.BatterySOC,
+		batterySOC,
+		batteryPower,
 		data.CurrentPrice,
 		data.NextAction,
 		data.TodayPnL,

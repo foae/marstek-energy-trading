@@ -132,6 +132,7 @@ func main() {
 		defer wg.Done()
 		if err := tradingSvc.Start(ctx); err != nil && err != context.Canceled {
 			slog.Error("trading service error", "error", err)
+			stop()
 		}
 	}()
 

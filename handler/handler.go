@@ -1,7 +1,9 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -58,7 +60,7 @@ func (h *Handler) statusHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := StatusResponse{
-		Current: h.svc.GetCurrentStatus(),
+		Current: h.svc.GetCurrentStatus(r.Context()),
 		History: h.svc.GetRecorder().GetHistory(),
 	}
 
@@ -101,13 +103,13 @@ func (h *Handler) metricsHandler() http.HandlerFunc {
 	promHandler := promhttp.Handler()
 
 	return func(w http.ResponseWriter, r *http.Request) {
-		h.updateMetrics()
+		h.updateMetrics(r.Context())
 		promHandler.ServeHTTP(w, r)
 	}
 }
 
 // updateMetrics updates the Prometheus metrics from current state.
-func (h *Handler) updateMetrics() {
+func (h *Handler) updateMetrics(ctx context.Context) {
 	if h.svc == nil {
 		return
 	}
@@ -123,6 +125,10 @@ func (h *Handler) updateMetrics() {
 	}
 
 	// Update battery SOC from current status
-	status := h.svc.GetCurrentStatus()
-	batterySOC.Set(float64(status.BatterySOC))
+	status := h.svc.GetCurrentStatus(ctx)
+	if status.BatteryAvailable {
+		batterySOC.Set(float64(status.BatterySOC))
+	} else {
+		batterySOC.Set(math.NaN())
+	}
 }

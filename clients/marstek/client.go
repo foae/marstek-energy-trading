@@ -1,6 +1,7 @@
 package marstek
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -127,13 +128,21 @@ type ESMode struct {
 
 // send sends a request and waits for response with matching ID.
 func (c *Client) send(method string, params interface{}) (*response, error) {
-	c.mu.Lock()
+	return c.sendContext(context.Background(), method, params)
+}
+
+func (c *Client) sendContext(ctx context.Context, method string, params interface{}) (*response, error) {
+	if err := c.lockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer c.mu.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if c.conn == nil {
 		return nil, fmt.Errorf("not connected")
 	}
-
 	id := c.requestID.Add(1)
 	req := request{
 		ID:     id,
@@ -159,13 +168,31 @@ func (c *Client) send(method string, params interface{}) (*response, error) {
 
 	// Set read deadline
 	deadline := time.Now().Add(defaultTimeout)
-	c.conn.SetReadDeadline(deadline)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if err := c.conn.SetReadDeadline(deadline); err != nil {
+		return nil, fmt.Errorf("set read deadline: %w", err)
+	}
+	cancelDone := make(chan struct{})
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = c.conn.SetReadDeadline(time.Now())
+		close(cancelDone)
+	})
+	defer func() {
+		if !stopCancel() {
+			<-cancelDone
+		}
+	}()
 
 	// Read responses until we get one with matching ID or timeout
 	buf := make([]byte, 4096)
 	for {
 		n, _, err := c.conn.ReadFromUDP(buf)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			return nil, fmt.Errorf("read response: %w", err)
 		}
 
@@ -196,6 +223,19 @@ func (c *Client) send(method string, params interface{}) (*response, error) {
 	}
 }
 
+func (c *Client) lockContext(ctx context.Context) error {
+	for {
+		if c.mu.TryLock() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 // Discover discovers Marstek devices on the network.
 func (c *Client) Discover() (*DeviceInfo, error) {
 	params := map[string]string{"ble_mac": "0"}
@@ -215,12 +255,17 @@ func (c *Client) Discover() (*DeviceInfo, error) {
 // GetBatteryStatus gets the current battery status.
 // It retries on timeout and falls back to ES.GetStatus if Bat.GetStatus fails.
 func (c *Client) GetBatteryStatus() (*BatteryStatus, error) {
+	return c.GetBatteryStatusContext(context.Background())
+}
+
+// GetBatteryStatusContext gets battery status with cancellation support.
+func (c *Client) GetBatteryStatusContext(ctx context.Context) (*BatteryStatus, error) {
 	params := map[string]int{"id": 0}
 
 	// Try Bat.GetStatus with retry (battery can be intermittently unresponsive)
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		resp, err := c.send("Bat.GetStatus", params)
+		resp, err := c.sendContext(ctx, "Bat.GetStatus", params)
 		if err != nil {
 			lastErr = err
 			continue
@@ -242,7 +287,7 @@ func (c *Client) GetBatteryStatus() (*BatteryStatus, error) {
 	}
 
 	// Fallback to ES.GetStatus for SOC (more reliable on some firmware)
-	esStatus, err := c.GetESStatus()
+	esStatus, err := c.GetESStatus(ctx)
 	if err != nil {
 		// Return original error if fallback also fails
 		return nil, lastErr
@@ -257,9 +302,9 @@ func (c *Client) GetBatteryStatus() (*BatteryStatus, error) {
 }
 
 // GetESStatus gets the energy system status.
-func (c *Client) GetESStatus() (*ESStatus, error) {
+func (c *Client) GetESStatus(ctx context.Context) (*ESStatus, error) {
 	params := map[string]int{"id": 0}
-	resp, err := c.send("ES.GetStatus", params)
+	resp, err := c.sendContext(ctx, "ES.GetStatus", params)
 	if err != nil {
 		return nil, err
 	}
@@ -270,6 +315,15 @@ func (c *Client) GetESStatus() (*ESStatus, error) {
 	}
 
 	return &status, nil
+}
+
+// GetBatteryPower returns the signed battery power from energy-system status.
+func (c *Client) GetBatteryPower(ctx context.Context) (float64, error) {
+	status, err := c.GetESStatus(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return status.BatteryPower, nil
 }
 
 // GetESMode gets the current operating mode.
@@ -292,6 +346,11 @@ func (c *Client) GetESMode() (*ESMode, error) {
 // Positive power = discharge, negative power = charge.
 // cdTime is the countdown in seconds before reverting to previous mode.
 func (c *Client) SetPassiveMode(power int, cdTime int) error {
+	return c.SetPassiveModeContext(context.Background(), power, cdTime)
+}
+
+// SetPassiveModeContext sets passive mode with cancellation support.
+func (c *Client) SetPassiveModeContext(ctx context.Context, power int, cdTime int) error {
 	params := map[string]interface{}{
 		"id": 0,
 		"config": map[string]interface{}{
@@ -303,7 +362,7 @@ func (c *Client) SetPassiveMode(power int, cdTime int) error {
 		},
 	}
 
-	resp, err := c.send("ES.SetMode", params)
+	resp, err := c.sendContext(ctx, "ES.SetMode", params)
 	if err != nil {
 		return err
 	}
@@ -325,6 +384,11 @@ func (c *Client) SetPassiveMode(power int, cdTime int) error {
 
 // SetAutoMode sets the battery to auto mode.
 func (c *Client) SetAutoMode() error {
+	return c.SetAutoModeContext(context.Background())
+}
+
+// SetAutoModeContext sets auto mode with cancellation support.
+func (c *Client) SetAutoModeContext(ctx context.Context) error {
 	params := map[string]interface{}{
 		"id": 0,
 		"config": map[string]interface{}{
@@ -335,7 +399,7 @@ func (c *Client) SetAutoMode() error {
 		},
 	}
 
-	resp, err := c.send("ES.SetMode", params)
+	resp, err := c.sendContext(ctx, "ES.SetMode", params)
 	if err != nil {
 		return err
 	}
@@ -357,17 +421,32 @@ func (c *Client) SetAutoMode() error {
 
 // Charge starts charging at the specified power (watts).
 func (c *Client) Charge(powerW int, timeoutS int) error {
+	return c.ChargeContext(context.Background(), powerW, timeoutS)
+}
+
+// ChargeContext starts charging with cancellation support.
+func (c *Client) ChargeContext(ctx context.Context, powerW int, timeoutS int) error {
 	// Negative power = charge
-	return c.SetPassiveMode(-powerW, timeoutS)
+	return c.SetPassiveModeContext(ctx, -powerW, timeoutS)
 }
 
 // Discharge starts discharging at the specified power (watts).
 func (c *Client) Discharge(powerW int, timeoutS int) error {
+	return c.DischargeContext(context.Background(), powerW, timeoutS)
+}
+
+// DischargeContext starts discharging with cancellation support.
+func (c *Client) DischargeContext(ctx context.Context, powerW int, timeoutS int) error {
 	// Positive power = discharge
-	return c.SetPassiveMode(powerW, timeoutS)
+	return c.SetPassiveModeContext(ctx, powerW, timeoutS)
 }
 
 // Idle sets the battery to auto/idle mode.
 func (c *Client) Idle() error {
-	return c.SetAutoMode()
+	return c.IdleContext(context.Background())
+}
+
+// IdleContext sets auto/idle mode with cancellation support.
+func (c *Client) IdleContext(ctx context.Context) error {
+	return c.SetAutoModeContext(ctx)
 }

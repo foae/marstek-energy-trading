@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -21,6 +22,7 @@ const (
 	StateCharging      State = "charging"
 	StateDischarging   State = "discharging"
 	StateSolarCharging State = "solar_charging"
+	StateStopping      State = "stopping"
 )
 
 // solarStopReason classifies why a solar charge session ended. Used to decide
@@ -31,20 +33,34 @@ const (
 	solarStopReasonSurplusGone solarStopReason = iota // debounce or EMA-below-floor
 	solarStopReasonBatteryFull
 	solarStopReasonYieldWindow
+	solarStopReasonTelemetryFailure
 )
 
 // Solar anti-cycling constants.
 const (
-	solarMinSessionDuration       = 60 * time.Second  // grace period: no "surplus-gone" stops before this
-	solarRestartCooldown          = 60 * time.Second  // baseline cooldown after a long session
-	solarShortSessionCooldown     = 5 * time.Minute   // cooldown after a short session ended by surplus loss
-	solarLongBackoffCooldown      = 15 * time.Minute  // cooldown after repeated short sessions
-	solarShortSessionThreshold    = 2 * time.Minute   // duration below which a session counts as "short"
-	solarShortSessionBackoffCount = 3                 // consecutive short sessions that trigger long backoff
-	solarStartQualificationCount  = 10                // consecutive raw surplus readings before starting
-	solarMinChargePowerW          = 75                // floor clamp for charge power
-	solarStopDebounceCount        = 10                // consecutive low readings before stop
-	solarEMAAlpha                 = 0.05              // EMA smoothing factor (~20s effective window)
+	solarMinSessionDuration       = 60 * time.Second // grace period: no "surplus-gone" stops before this
+	solarRestartCooldown          = 60 * time.Second // baseline cooldown after a long session
+	solarShortSessionCooldown     = 5 * time.Minute  // cooldown after a short session ended by surplus loss
+	solarLongBackoffCooldown      = 15 * time.Minute // cooldown after repeated short sessions
+	solarShortSessionThreshold    = 2 * time.Minute  // duration below which a session counts as "short"
+	solarShortSessionBackoffCount = 3                // consecutive short sessions that trigger long backoff
+	solarStartQualificationCount  = 10               // consecutive raw surplus readings before starting
+	solarMinChargePowerW          = 75               // floor clamp for charge power
+	solarStopDebounceCount        = 10               // consecutive low readings before stop
+	solarEMAAlpha                 = 0.05             // EMA smoothing factor (~20s effective window)
+)
+
+const (
+	batteryStartVerificationTimeout  = 10 * time.Second
+	batteryStartVerificationInterval = time.Second
+	batteryActivePowerThresholdW     = 50.0
+	batteryControlFailureCooldown    = 5 * time.Minute
+	batteryShutdownTimeout           = 60 * time.Second
+	batteryShutdownAttemptTimeout    = 30 * time.Second
+	batteryStopRetryInterval         = 5 * time.Second
+	statusBatteryTimeout             = 5 * time.Second
+	solarStatusFailureThreshold      = 10
+	solarStatusFallbackTimeout       = 3 * time.Second
 )
 
 // Service is the main trading engine.
@@ -58,29 +74,81 @@ type Service struct {
 	loc      *time.Location   // timezone location
 	nowFunc  func() time.Time // clock function for testing
 
-	mu                 sync.RWMutex
-	state              State
-	currentPlan        *TradingPlan
-	todayPrices        []nordpool.Price
-	tomorrowPrices     []nordpool.Price
-	lastPassiveRefresh time.Time
-	currentTradeStart  time.Time
-	currentTradePrice  decimal.Decimal
-	currentTradeSOC    int
-	lastChargePrice    decimal.Decimal // track last charge price for profitability check
-	lastErrorNotify    time.Time       // rate limit error notifications
-	lastMidnightSwap   time.Time       // track last midnight price swap to avoid repeated fetches
-	lastDailySummary   time.Time       // track last daily summary to avoid duplicates on restart
+	mu                          sync.RWMutex
+	state                       State
+	currentPlan                 *TradingPlan
+	todayPrices                 []nordpool.Price
+	tomorrowPrices              []nordpool.Price
+	lastPassiveRefresh          time.Time
+	currentTradeStart           time.Time
+	currentTradePrice           decimal.Decimal
+	currentTradeSOC             int
+	lastChargePrice             decimal.Decimal // track last charge price for profitability check
+	lastErrorNotify             time.Time       // rate limit error notifications
+	lastMidnightSwap            time.Time       // track last midnight price swap to avoid repeated fetches
+	lastDailySummary            time.Time       // track last daily summary to avoid duplicates on restart
+	batteryCooldownUntil        time.Time       // suppress command retries after the battery ignores a command
+	batteryVerificationTimeout  time.Duration   // test override for battery start verification timeout
+	batteryVerificationInterval time.Duration   // test override for battery start verification polling
+	batteryStopRetryDelay       time.Duration   // test override for failed-stop retry delay
+	lastStopAttempt             time.Time       // throttle retries when a stop command fails
 
 	// Solar charging state
 	solarSurplusCount             int       // consecutive surplus readings above threshold
 	solarStopCount                int       // consecutive readings below stop threshold
 	solarChargePower              int       // current solar charge wattage
+	solarMeasuredChargePowerW     float64   // latest measured battery charge power
 	solarEnergyWs                 float64   // cumulative watt-seconds during solar charging
 	solarLastUpdate               time.Time // last time solar energy was accumulated
 	solarCooldownUntil            time.Time // no new session may start before this time
 	solarSurplusEMA               float64   // exponentially weighted moving average of surplus
 	solarConsecutiveShortSessions int       // count of successive short sessions ended by surplus loss
+	solarStatusFailures           int       // consecutive telemetry failures during solar charging
+}
+
+// waitForBatteryPower confirms that the inverter acted on a successful control request.
+func (s *Service) waitForBatteryPower(ctx context.Context, charging bool, commandedPowerW int) (float64, error) {
+	timeout := s.batteryVerificationTimeout
+	if timeout <= 0 {
+		timeout = batteryStartVerificationTimeout
+	}
+	interval := s.batteryVerificationInterval
+	if interval <= 0 {
+		interval = batteryStartVerificationInterval
+	}
+
+	verificationCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var lastPower float64
+	var lastErr error
+	threshold := min(batteryActivePowerThresholdW, max(10.0, float64(commandedPowerW)*0.5))
+	for {
+		power, err := s.battery.GetBatteryPower(verificationCtx)
+		if err != nil {
+			lastErr = err
+		} else {
+			lastPower = power
+			if (charging && lastPower >= threshold) ||
+				(!charging && lastPower <= -threshold) {
+				return lastPower, nil
+			}
+		}
+
+		select {
+		case <-verificationCtx.Done():
+			if ctx.Err() != nil {
+				return lastPower, ctx.Err()
+			}
+			if lastErr != nil {
+				return lastPower, fmt.Errorf("battery power verification failed: %w", lastErr)
+			}
+			return lastPower, fmt.Errorf("battery remained at %.0f W", lastPower)
+		case <-ticker.C:
+		}
+	}
 }
 
 // New creates a new trading service.
@@ -200,6 +268,9 @@ func (s *Service) Start(ctx context.Context) error {
 	if err := s.battery.Connect(); err != nil {
 		return err
 	}
+	if err := s.battery.IdleContext(ctx); err != nil {
+		return fmt.Errorf("reset battery control on startup: %w", err)
+	}
 
 	// Discover battery
 	device, err := s.battery.Discover()
@@ -254,9 +325,9 @@ func (s *Service) Start(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			slog.Info("stopping trading service")
-			// Return to idle mode
-			if err := s.battery.Idle(); err != nil {
-				slog.Warn("failed to set idle mode on shutdown", "error", err)
+			if err := s.stopBatteryOnShutdown(); err != nil {
+				slog.Error("failed to stop battery during shutdown", "error", err)
+				return fmt.Errorf("stop battery during shutdown: %w", err)
 			}
 			return ctx.Err()
 
@@ -281,9 +352,12 @@ func (s *Service) Start(ctx context.Context) error {
 // tick is called every minute to evaluate trading decisions.
 func (s *Service) tick(ctx context.Context) {
 	now := s.now()
+	if s.retryStopping(ctx) {
+		return
+	}
 
 	// Get battery status OUTSIDE lock (network I/O)
-	batStatus, err := s.battery.GetBatteryStatus()
+	batStatus, err := s.battery.GetBatteryStatusContext(ctx)
 	if err != nil {
 		slog.Error("failed to get battery status", "error", err)
 		s.notifyError(ctx, "Battery unreachable: "+err.Error())
@@ -302,7 +376,6 @@ func (s *Service) tick(ctx context.Context) {
 	)
 
 	l.Debug("tick", "charging_enabled", batStatus.ChargingFlag, "discharging_enabled", batStatus.DischargFlag)
-
 	// Check if we have a valid trading plan
 	if s.currentPlan == nil || !s.currentPlan.ShouldTrade() {
 		switch s.state {
@@ -336,6 +409,10 @@ func (s *Service) tick(ctx context.Context) {
 
 	switch s.state {
 	case StateIdle:
+		if now.Before(s.batteryCooldownUntil) {
+			l.Debug("battery control retry cooling down", "retry_at", s.batteryCooldownUntil)
+			return
+		}
 		if inChargeWindow {
 			if batStatus.SOC >= 100 {
 				l.Debug("in charge window but battery full")
@@ -368,6 +445,9 @@ func (s *Service) tick(ctx context.Context) {
 		if inChargeWindow {
 			l.Info("decision: stop solar charging - scheduled charge window started")
 			s.stopSolarChargingLocked(ctx, batStatus.SOC, solarStopReasonYieldWindow)
+			if s.state != StateIdle {
+				return
+			}
 			if batStatus.SOC < 100 && batStatus.ChargingFlag {
 				s.startChargingLocked(ctx, currentPrice, batStatus.SOC)
 			}
@@ -375,6 +455,9 @@ func (s *Service) tick(ctx context.Context) {
 			minSOC := int(s.cfg.BatteryMinSOC * 100)
 			l.Info("decision: stop solar charging - scheduled discharge window started")
 			s.stopSolarChargingLocked(ctx, batStatus.SOC, solarStopReasonYieldWindow)
+			if s.state != StateIdle {
+				return
+			}
 			if batStatus.SOC > minSOC && batStatus.DischargFlag {
 				s.startDischargingLocked(ctx, currentPrice, batStatus.SOC)
 			}
@@ -405,18 +488,26 @@ func (s *Service) tick(ctx context.Context) {
 	}
 }
 
-// accumulateSolarEnergyLocked adds energy from current power level since last update. Caller must hold s.mu.
-func (s *Service) accumulateSolarEnergyLocked() {
-	if s.solarChargePower <= 0 || s.solarLastUpdate.IsZero() {
-		return
+// accumulateSolarEnergyLocked integrates measured battery power since the previous reading.
+// Caller must hold s.mu.
+func (s *Service) accumulateSolarEnergyLocked(measuredChargePowerW float64) {
+	now := s.now()
+	if !s.solarLastUpdate.IsZero() {
+		elapsed := now.Sub(s.solarLastUpdate).Seconds()
+		if elapsed > 0 {
+			s.solarEnergyWs += s.solarMeasuredChargePowerW * elapsed
+		}
 	}
-	elapsed := s.now().Sub(s.solarLastUpdate).Seconds()
-	s.solarEnergyWs += float64(s.solarChargePower) * elapsed
-	s.solarLastUpdate = s.now()
+	s.solarMeasuredChargePowerW = measuredChargePowerW
+	s.solarLastUpdate = now
 }
 
 // solarTick is called every 1 second to manage solar self-consumption charging.
 func (s *Service) solarTick(ctx context.Context) {
+	if s.retryStopping(ctx) {
+		return
+	}
+
 	// Read P1 meter + battery status OUTSIDE lock (network I/O)
 	activePowerW, err := s.meter.GetActivePowerW()
 	if err != nil {
@@ -424,20 +515,28 @@ func (s *Service) solarTick(ctx context.Context) {
 		return
 	}
 
-	batStatus, err := s.battery.GetBatteryStatus()
+	esStatus, err := s.battery.GetESStatus(ctx)
 	if err != nil {
-		slog.Debug("solar tick: failed to get battery status", "error", err)
+		s.handleSolarStatusFailure(ctx, err)
 		return
 	}
+	batterySOC := esStatus.BatterySOC
+	measuredChargePowerW := max(esStatus.BatteryPower, 0)
 
 	// surplus = negative active power means exporting to grid
 	surplus := -activePowerW
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.solarStatusFailures = 0
 
 	switch s.state {
 	case StateIdle:
+		if s.now().Before(s.batteryCooldownUntil) {
+			s.solarSurplusCount = 0
+			return
+		}
+
 		// Restart cooldown: don't start a new session too soon after stopping.
 		// The cooldown duration is adaptive — short/repeated sessions set a longer
 		// cooldown when stopSolarChargingLocked records the stop.
@@ -463,7 +562,7 @@ func (s *Service) solarTick(ctx context.Context) {
 		}
 
 		// Skip if battery full
-		if batStatus.SOC >= 100 {
+		if batterySOC >= 100 {
 			s.solarSurplusCount = 0
 			return
 		}
@@ -473,16 +572,16 @@ func (s *Service) solarTick(ctx context.Context) {
 			power := int(surplus)
 			power = max(power, solarMinChargePowerW)
 			power = min(power, s.cfg.ChargePowerW)
-			s.startSolarChargingLocked(ctx, power, batStatus.SOC)
+			s.startSolarChargingLocked(ctx, power, batterySOC)
 		}
 
 	case StateSolarCharging:
-		s.accumulateSolarEnergyLocked()
+		s.accumulateSolarEnergyLocked(measuredChargePowerW)
 
 		// Compensate for feedback loop: the battery's charge power is visible on
 		// the P1 meter as consumption, so measured surplus is artificially low.
 		// Real surplus = what P1 sees + what the battery is currently drawing.
-		effectiveSurplus := surplus + float64(s.solarChargePower)
+		effectiveSurplus := surplus + measuredChargePowerW
 
 		// Update EMA with effective surplus during charging
 		if s.solarSurplusEMA == 0 {
@@ -494,9 +593,9 @@ func (s *Service) solarTick(ctx context.Context) {
 		sessionAge := s.now().Sub(s.currentTradeStart)
 
 		// Stop if battery full (unconditional safety check)
-		if batStatus.SOC >= 100 {
+		if batterySOC >= 100 {
 			slog.Info("solar charging: battery full")
-			s.stopSolarChargingLocked(ctx, batStatus.SOC, solarStopReasonBatteryFull)
+			s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonBatteryFull)
 			return
 		}
 
@@ -505,7 +604,7 @@ func (s *Service) solarTick(ctx context.Context) {
 			now := s.now()
 			if s.currentPlan.IsInChargeWindow(now) || s.currentPlan.IsInDischargeWindow(now) {
 				slog.Info("solar charging: yielding to scheduled window")
-				s.stopSolarChargingLocked(ctx, batStatus.SOC, solarStopReasonYieldWindow)
+				s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonYieldWindow)
 				return
 			}
 		}
@@ -519,8 +618,9 @@ func (s *Service) solarTick(ctx context.Context) {
 			if s.solarStopCount >= solarStopDebounceCount && sessionAge >= solarMinSessionDuration {
 				slog.Info("solar charging: surplus dropped below threshold",
 					"measured_surplus_w", surplus, "charge_power_w", s.solarChargePower,
+					"measured_battery_power_w", measuredChargePowerW,
 					"effective_surplus_w", effectiveSurplus, "stop_threshold_w", stopThreshold)
-				s.stopSolarChargingLocked(ctx, batStatus.SOC, solarStopReasonSurplusGone)
+				s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonSurplusGone)
 				return
 			}
 		} else {
@@ -544,7 +644,7 @@ func (s *Service) solarTick(ctx context.Context) {
 			if sessionAge >= solarMinSessionDuration {
 				slog.Info("solar charging: surplus too low for minimum charge power",
 					"ema_w", s.solarSurplusEMA, "min_charge_w", solarMinChargePowerW)
-				s.stopSolarChargingLocked(ctx, batStatus.SOC, solarStopReasonSurplusGone)
+				s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonSurplusGone)
 				return
 			}
 			// During min session, clamp to floor as safety bound
@@ -559,11 +659,12 @@ func (s *Service) solarTick(ctx context.Context) {
 		if diff > 50 {
 			slog.Info("solar charging: adjusting power",
 				"old_w", s.solarChargePower, "new_w", targetPower,
-				"measured_surplus_w", surplus, "effective_surplus_w", effectiveSurplus)
+				"measured_surplus_w", surplus, "measured_battery_power_w", measuredChargePowerW,
+				"effective_surplus_w", effectiveSurplus)
 
 			// Release lock during network I/O
 			s.mu.Unlock()
-			err := s.battery.Charge(targetPower, s.cfg.PassiveModeTimeoutS)
+			err := s.battery.ChargeContext(ctx, targetPower, s.cfg.PassiveModeTimeoutS)
 			s.mu.Lock()
 
 			if err != nil {
@@ -583,6 +684,48 @@ func (s *Service) solarTick(ctx context.Context) {
 	}
 }
 
+func (s *Service) handleSolarStatusFailure(ctx context.Context, telemetryErr error) {
+	s.mu.Lock()
+	if s.state != StateSolarCharging {
+		s.mu.Unlock()
+		slog.Debug("solar tick: failed to get battery telemetry", "error", telemetryErr)
+		return
+	}
+
+	s.solarStatusFailures++
+	failures := s.solarStatusFailures
+	if failures < solarStatusFailureThreshold {
+		s.mu.Unlock()
+		slog.Warn("solar charging telemetry unavailable", "consecutive_failures", failures, "error", telemetryErr)
+		return
+	}
+
+	endSOC := s.currentTradeSOC
+	s.mu.Unlock()
+	statusCtx, cancel := context.WithTimeout(ctx, solarStatusFallbackTimeout)
+	status, statusErr := s.battery.GetBatteryStatusContext(statusCtx)
+	cancel()
+
+	s.mu.Lock()
+	if s.state != StateSolarCharging {
+		s.mu.Unlock()
+		return
+	}
+	if statusErr == nil {
+		endSOC = status.SOC
+	}
+	slog.Error("stopping solar charging after repeated telemetry failures",
+		"consecutive_failures", failures, "status_error", statusErr, "error", telemetryErr)
+	s.stopSolarChargingLocked(ctx, endSOC, solarStopReasonTelemetryFailure)
+	stopped := s.state == StateIdle
+	s.mu.Unlock()
+	if stopped {
+		s.notifyError(ctx, "Solar charging stopped because battery telemetry is unavailable: "+telemetryErr.Error())
+	} else {
+		s.notifyError(ctx, "Solar charging telemetry is unavailable and the battery stop is not yet confirmed: "+telemetryErr.Error())
+	}
+}
+
 // startSolarChargingLocked begins a solar charge session. Caller must hold s.mu.
 func (s *Service) startSolarChargingLocked(ctx context.Context, powerW int, soc int) {
 	l := slog.With("action", "solar_charge", "power_w", powerW, "soc", soc)
@@ -590,12 +733,30 @@ func (s *Service) startSolarChargingLocked(ctx context.Context, powerW int, soc 
 
 	// Release lock during network I/O
 	s.mu.Unlock()
-	err := s.battery.Charge(powerW, s.cfg.PassiveModeTimeoutS)
+	err := s.battery.ChargeContext(ctx, powerW, s.cfg.PassiveModeTimeoutS)
+	var measuredPowerW float64
+	var idleErr error
+	if err == nil {
+		measuredPowerW, err = s.waitForBatteryPower(ctx, true, powerW)
+	}
+	if err != nil {
+		if idleErr = s.idleBattery(ctx); idleErr != nil {
+			l.Warn("failed to return battery to idle after start failure", "error", idleErr)
+		}
+	}
 	s.mu.Lock()
 
 	if err != nil {
+		if idleErr != nil {
+			s.state = StateStopping
+			s.lastStopAttempt = s.now()
+		}
 		l.Error("failed to start solar charging", "error", err)
 		s.solarSurplusCount = 0
+		s.batteryCooldownUntil = s.now().Add(batteryControlFailureCooldown)
+		s.mu.Unlock()
+		s.notifyError(ctx, "Battery did not start solar charging: "+err.Error())
+		s.mu.Lock()
 		return
 	}
 
@@ -609,9 +770,11 @@ func (s *Service) startSolarChargingLocked(ctx context.Context, powerW int, soc 
 	s.solarStopCount = 0
 	s.solarEnergyWs = 0
 	s.solarLastUpdate = s.now()
+	s.solarMeasuredChargePowerW = max(measuredPowerW, 0)
 	s.solarSurplusEMA = 0
+	s.batteryCooldownUntil = time.Time{}
 
-	l.Info("solar charge session started", "state", s.state)
+	l.Info("solar charge session started", "state", s.state, "measured_battery_power_w", measuredPowerW)
 
 	// Release lock for notification
 	s.mu.Unlock()
@@ -627,9 +790,12 @@ func (s *Service) startSolarChargingLocked(ctx context.Context, powerW int, soc 
 // The reason classifies the stop for anti-cycling purposes: only surplus-gone stops on short
 // sessions extend the restart cooldown.
 func (s *Service) stopSolarChargingLocked(ctx context.Context, endSOC int, reason solarStopReason) {
-	s.accumulateSolarEnergyLocked()
-	now := s.now()
-	duration := now.Sub(s.currentTradeStart)
+	stopTime := s.now()
+	s.accumulateSolarEnergyLocked(s.solarMeasuredChargePowerW)
+	if !s.transitionToIdleLocked(ctx, endSOC) {
+		return
+	}
+	duration := stopTime.Sub(s.currentTradeStart)
 	energyKWh := decimal.NewFromFloat(s.solarEnergyWs / 3_600_000.0) // watt-seconds to kWh
 	energyF, _ := energyKWh.Float64()
 
@@ -637,7 +803,10 @@ func (s *Service) stopSolarChargingLocked(ctx context.Context, endSOC int, reaso
 	// Only "surplus gone" on a short session indicates marginal conditions; battery-full
 	// and window-yield are legitimate and should not trigger backoff.
 	cooldown := solarRestartCooldown
-	if reason == solarStopReasonSurplusGone && duration < solarShortSessionThreshold {
+	if reason == solarStopReasonTelemetryFailure {
+		cooldown = batteryControlFailureCooldown
+		s.solarConsecutiveShortSessions = 0
+	} else if reason == solarStopReasonSurplusGone && duration < solarShortSessionThreshold {
 		s.solarConsecutiveShortSessions++
 		if s.solarConsecutiveShortSessions >= solarShortSessionBackoffCount {
 			cooldown = solarLongBackoffCooldown
@@ -680,11 +849,11 @@ func (s *Service) stopSolarChargingLocked(ctx context.Context, endSOC int, reaso
 	s.solarSurplusCount = 0
 	s.solarStopCount = 0
 	s.solarChargePower = 0
+	s.solarMeasuredChargePowerW = 0
+	s.solarStatusFailures = 0
 	s.solarEnergyWs = 0
 	s.solarCooldownUntil = s.now().Add(cooldown)
 	s.solarSurplusEMA = 0
-	s.transitionToIdleLocked(ctx, endSOC)
-
 	s.mu.Unlock()
 	if s.telegramEnabled() {
 		if err := s.telegram.SendTradeEnd(ctx, "Solar charging", energyF, 0, endSOC); err != nil {
@@ -702,11 +871,26 @@ func (s *Service) startChargingLocked(ctx context.Context, price decimal.Decimal
 
 	// Release lock during network I/O
 	s.mu.Unlock()
-	err := s.battery.Charge(s.cfg.ChargePowerW, s.cfg.PassiveModeTimeoutS)
+	err := s.battery.ChargeContext(ctx, s.cfg.ChargePowerW, s.cfg.PassiveModeTimeoutS)
+	var measuredPowerW float64
+	var idleErr error
+	if err == nil {
+		measuredPowerW, err = s.waitForBatteryPower(ctx, true, s.cfg.ChargePowerW)
+	}
+	if err != nil {
+		if idleErr = s.idleBattery(ctx); idleErr != nil {
+			l.Warn("failed to return battery to idle after start failure", "error", idleErr)
+		}
+	}
 	s.mu.Lock()
 
 	if err != nil {
+		if idleErr != nil {
+			s.state = StateStopping
+			s.lastStopAttempt = s.now()
+		}
 		l.Error("failed to start charging", "error", err)
+		s.batteryCooldownUntil = s.now().Add(batteryControlFailureCooldown)
 		errMsg := "Failed to start charging: " + err.Error()
 		s.mu.Unlock()
 		s.notifyError(ctx, errMsg)
@@ -720,8 +904,9 @@ func (s *Service) startChargingLocked(ctx context.Context, price decimal.Decimal
 	s.currentTradeSOC = soc
 	s.lastPassiveRefresh = s.now()
 	s.lastChargePrice = price // Track for per-trade profitability
+	s.batteryCooldownUntil = time.Time{}
 
-	l.Info("charge session started", "state", s.state)
+	l.Info("charge session started", "state", s.state, "measured_battery_power_w", measuredPowerW)
 
 	// Release lock for notification
 	s.mu.Unlock()
@@ -735,13 +920,19 @@ func (s *Service) startChargingLocked(ctx context.Context, price decimal.Decimal
 
 // stopChargingLocked ends a charge session and records the trade. Caller must hold s.mu.
 func (s *Service) stopChargingLocked(ctx context.Context, endSOC int) {
-	now := s.now()
-	duration := now.Sub(s.currentTradeStart)
-	energyKWh := decimal.NewFromFloat(float64(s.cfg.ChargePowerW) * duration.Hours() / 1000.0)
+	stopTime := s.now()
+	if !s.transitionToIdleLocked(ctx, endSOC) {
+		return
+	}
+	duration := stopTime.Sub(s.currentTradeStart)
+	socDelta := max(endSOC-s.currentTradeSOC, 0)
+	energyKWh := decimal.NewFromFloat(s.cfg.BatteryCapacityKWh).
+		Mul(decimal.NewFromInt(int64(socDelta))).
+		Div(decimal.NewFromInt(100))
 	energyF, _ := energyKWh.Float64()
 
 	// Calculate average price paid during the actual charge period
-	avgPrice := s.calculateAveragePrice(s.currentTradeStart, now)
+	avgPrice := s.calculateAveragePrice(s.currentTradeStart, stopTime)
 	if avgPrice.IsZero() {
 		// Fallback to start price if we can't calculate average
 		avgPrice = s.currentTradePrice
@@ -779,8 +970,6 @@ func (s *Service) stopChargingLocked(ctx context.Context, endSOC int) {
 	}
 	s.mu.Lock()
 
-	s.transitionToIdleLocked(ctx, endSOC)
-
 	s.mu.Unlock()
 	if s.telegramEnabled() {
 		if err := s.telegram.SendTradeEnd(ctx, "Charging", energyF, avgPriceF, endSOC); err != nil {
@@ -799,11 +988,26 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 
 	// Release lock during network I/O
 	s.mu.Unlock()
-	err := s.battery.Discharge(s.cfg.DischargePowerW, s.cfg.PassiveModeTimeoutS)
+	err := s.battery.DischargeContext(ctx, s.cfg.DischargePowerW, s.cfg.PassiveModeTimeoutS)
+	var measuredPowerW float64
+	var idleErr error
+	if err == nil {
+		measuredPowerW, err = s.waitForBatteryPower(ctx, false, s.cfg.DischargePowerW)
+	}
+	if err != nil {
+		if idleErr = s.idleBattery(ctx); idleErr != nil {
+			l.Warn("failed to return battery to idle after start failure", "error", idleErr)
+		}
+	}
 	s.mu.Lock()
 
 	if err != nil {
+		if idleErr != nil {
+			s.state = StateStopping
+			s.lastStopAttempt = s.now()
+		}
 		l.Error("failed to start discharging", "error", err)
+		s.batteryCooldownUntil = s.now().Add(batteryControlFailureCooldown)
 		errMsg := "Failed to start discharging: " + err.Error()
 		s.mu.Unlock()
 		s.notifyError(ctx, errMsg)
@@ -816,8 +1020,9 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 	s.currentTradePrice = price
 	s.currentTradeSOC = soc
 	s.lastPassiveRefresh = s.now()
+	s.batteryCooldownUntil = time.Time{}
 
-	l.Info("discharge session started", "state", s.state)
+	l.Info("discharge session started", "state", s.state, "measured_battery_power_w", measuredPowerW)
 
 	// Release lock for notification
 	s.mu.Unlock()
@@ -831,8 +1036,16 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 
 // stopDischargingLocked ends a discharge session and records the trade. Caller must hold s.mu.
 func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
-	duration := time.Since(s.currentTradeStart)
-	energyKWh := decimal.NewFromFloat(float64(s.cfg.DischargePowerW) * duration.Hours() / 1000.0)
+	stopTime := s.now()
+	if !s.transitionToIdleLocked(ctx, endSOC) {
+		return
+	}
+	duration := stopTime.Sub(s.currentTradeStart)
+	socDelta := max(s.currentTradeSOC-endSOC, 0)
+	energyKWh := decimal.NewFromFloat(s.cfg.BatteryCapacityKWh).
+		Mul(decimal.NewFromInt(int64(socDelta))).
+		Div(decimal.NewFromInt(100)).
+		Mul(decimal.NewFromFloat(s.cfg.BatteryEfficiency))
 	energyF, _ := energyKWh.Float64()
 	priceF, _ := s.currentTradePrice.Float64()
 
@@ -864,8 +1077,6 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 	}
 	s.mu.Lock()
 
-	s.transitionToIdleLocked(ctx, endSOC)
-
 	s.mu.Unlock()
 	if s.telegramEnabled() {
 		if err := s.telegram.SendTradeEnd(ctx, "Discharging", energyF, priceF, endSOC); err != nil {
@@ -876,23 +1087,86 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 }
 
 // transitionToIdleLocked returns to idle state. Caller must hold s.mu.
-func (s *Service) transitionToIdleLocked(ctx context.Context, soc int) {
+func (s *Service) transitionToIdleLocked(ctx context.Context, soc int) bool {
+	if !s.lastStopAttempt.IsZero() && s.now().Sub(s.lastStopAttempt) < s.stopRetryDelay() {
+		return false
+	}
+	s.lastStopAttempt = s.now()
+
 	// Release lock during network I/O
 	s.mu.Unlock()
-	if err := s.battery.Idle(); err != nil {
-		slog.Warn("failed to set idle mode", "error", err)
+	if err := s.idleBattery(ctx); err != nil {
+		s.mu.Lock()
+		slog.Error("failed to set idle mode; retaining active state for retry", "state", s.state, "error", err)
+		s.mu.Unlock()
+		s.notifyError(ctx, "Battery stop failed; forced operation may still be active: "+err.Error())
+		s.mu.Lock()
+		return false
 	}
 	s.mu.Lock()
 
 	s.state = StateIdle
+	s.lastStopAttempt = time.Time{}
 	slog.Info("transitioned to idle", "soc", soc)
+	return true
+}
+
+func (s *Service) stopRetryDelay() time.Duration {
+	if s.batteryStopRetryDelay > 0 {
+		return s.batteryStopRetryDelay
+	}
+	return batteryStopRetryInterval
+}
+
+func (s *Service) retryStopping(ctx context.Context) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != StateStopping {
+		return false
+	}
+	s.transitionToIdleLocked(ctx, 0)
+	return true
+}
+
+func (s *Service) stopBatteryOnShutdown() error {
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), batteryShutdownTimeout)
+	defer cancel()
+
+	var lastErr error
+	for {
+		attemptCtx, attemptCancel := context.WithTimeout(shutdownCtx, batteryShutdownAttemptTimeout)
+		lastErr = s.battery.IdleContext(attemptCtx)
+		attemptCancel()
+		if lastErr == nil {
+			return nil
+		}
+
+		timer := time.NewTimer(s.stopRetryDelay())
+		select {
+		case <-shutdownCtx.Done():
+			timer.Stop()
+			return lastErr
+		case <-timer.C:
+		}
+	}
+}
+
+func (s *Service) idleBattery(ctx context.Context) error {
+	err := s.battery.IdleContext(ctx)
+	if err == nil || ctx.Err() == nil {
+		return err
+	}
+
+	safetyCtx, cancel := context.WithTimeout(context.Background(), batteryShutdownAttemptTimeout)
+	defer cancel()
+	return s.battery.IdleContext(safetyCtx)
 }
 
 // refreshPassiveModeLocked refreshes the passive mode command before timeout. Caller must hold s.mu.
 func (s *Service) refreshPassiveModeLocked(ctx context.Context, power int) {
 	// Refresh if we're past 80% of the timeout period
 	refreshThreshold := time.Duration(float64(s.cfg.PassiveModeTimeoutS)*0.8) * time.Second
-	if time.Since(s.lastPassiveRefresh) < refreshThreshold {
+	if s.now().Sub(s.lastPassiveRefresh) < refreshThreshold {
 		return
 	}
 
@@ -900,14 +1174,14 @@ func (s *Service) refreshPassiveModeLocked(ctx context.Context, power int) {
 
 	// Release lock during network I/O
 	s.mu.Unlock()
-	err := s.battery.SetPassiveMode(power, s.cfg.PassiveModeTimeoutS)
+	err := s.battery.SetPassiveModeContext(ctx, power, s.cfg.PassiveModeTimeoutS)
 	s.mu.Lock()
 
 	if err != nil {
 		slog.Error("failed to refresh passive mode", "error", err)
 		return
 	}
-	s.lastPassiveRefresh = time.Now()
+	s.lastPassiveRefresh = s.now()
 }
 
 // checkPriceFetch checks if we should fetch new prices.
@@ -1180,7 +1454,7 @@ func (s *Service) sendTelegramStatus(ctx context.Context) {
 	if !s.telegramEnabled() {
 		return
 	}
-	status := s.GetCurrentStatus()
+	status := s.GetCurrentStatus(ctx)
 	summary := s.recorder.GetTodaySummary()
 	totalPnL := s.recorder.GetTotalPnL()
 
@@ -1188,12 +1462,14 @@ func (s *Service) sendTelegramStatus(ctx context.Context) {
 	totalPnLF, _ := totalPnL.Float64()
 
 	data := telegram.StatusData{
-		State:        string(status.State),
-		BatterySOC:   status.BatterySOC,
-		CurrentPrice: status.CurrentPrice,
-		NextAction:   status.NextAction,
-		TodayPnL:     todayPnLF,
-		TotalPnL:     totalPnLF,
+		State:            string(status.State),
+		BatteryAvailable: status.BatteryAvailable,
+		BatterySOC:       status.BatterySOC,
+		BatteryPowerW:    status.BatteryPowerW,
+		CurrentPrice:     status.CurrentPrice,
+		NextAction:       status.NextAction,
+		TodayPnL:         todayPnLF,
+		TotalPnL:         totalPnLF,
 	}
 
 	if err := s.telegram.SendStatus(ctx, data); err != nil {
@@ -1215,18 +1491,26 @@ func (s *Service) GetRecorder() *Recorder {
 
 // CurrentStatus contains all current state info.
 type CurrentStatus struct {
-	State        State   `json:"state"`
-	BatterySOC   int     `json:"battery_soc"`
-	CurrentPrice float64 `json:"current_price_eur_kwh,omitempty"`
-	NextAction   string  `json:"next_action,omitempty"`
+	State            State   `json:"state"`
+	BatteryAvailable bool    `json:"battery_available"`
+	BatterySOC       int     `json:"battery_soc"`
+	BatteryPowerW    float64 `json:"battery_power_w"`
+	CurrentPrice     float64 `json:"current_price_eur_kwh,omitempty"`
+	NextAction       string  `json:"next_action,omitempty"`
 }
 
 // GetCurrentStatus returns the current battery and trading status.
-func (s *Service) GetCurrentStatus() CurrentStatus {
+func (s *Service) GetCurrentStatus(ctx context.Context) CurrentStatus {
 	// Get battery status OUTSIDE lock (network I/O)
 	var batterySOC int
-	if batStatus, err := s.battery.GetBatteryStatus(); err == nil {
-		batterySOC = batStatus.SOC
+	var batteryPowerW float64
+	var batteryAvailable bool
+	batteryCtx, cancel := context.WithTimeout(ctx, statusBatteryTimeout)
+	defer cancel()
+	if esStatus, err := s.battery.GetESStatus(batteryCtx); err == nil {
+		batterySOC = esStatus.BatterySOC
+		batteryPowerW = esStatus.BatteryPower
+		batteryAvailable = true
 	}
 
 	s.mu.RLock()
@@ -1235,8 +1519,10 @@ func (s *Service) GetCurrentStatus() CurrentStatus {
 	now := s.now()
 
 	status := CurrentStatus{
-		State:      s.state,
-		BatterySOC: batterySOC,
+		State:            s.state,
+		BatteryAvailable: batteryAvailable,
+		BatterySOC:       batterySOC,
+		BatteryPowerW:    batteryPowerW,
 	}
 
 	// Get current price (convert to float64 for JSON API boundary)

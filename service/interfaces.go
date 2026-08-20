@@ -18,12 +18,13 @@ type BatteryController interface {
 	Connect() error
 	Close() error
 	Discover() (*marstek.DeviceInfo, error)
-	GetBatteryStatus() (*marstek.BatteryStatus, error)
-	GetESStatus() (*marstek.ESStatus, error)
-	Charge(powerW int, timeoutS int) error
-	Discharge(powerW int, timeoutS int) error
-	SetPassiveMode(power int, cdTime int) error
-	Idle() error
+	GetBatteryStatusContext(ctx context.Context) (*marstek.BatteryStatus, error)
+	GetESStatus(ctx context.Context) (*marstek.ESStatus, error)
+	GetBatteryPower(ctx context.Context) (float64, error)
+	ChargeContext(ctx context.Context, powerW int, timeoutS int) error
+	DischargeContext(ctx context.Context, powerW int, timeoutS int) error
+	SetPassiveModeContext(ctx context.Context, power int, cdTime int) error
+	IdleContext(ctx context.Context) error
 }
 
 // MeterReader reads power data from a smart meter.

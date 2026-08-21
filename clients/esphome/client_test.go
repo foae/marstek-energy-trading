@@ -238,6 +238,16 @@ func TestCharge(t *testing.T) {
 	}
 }
 
+func TestControlConfirmationTimeoutCoversESPHomePublicationCycle(t *testing.T) {
+	if controlConfirmationTimeout <= espHomeControlPublicationInterval {
+		t.Fatalf(
+			"control confirmation timeout %s must exceed ESPHome publication interval %s",
+			controlConfirmationTimeout,
+			espHomeControlPublicationInterval,
+		)
+	}
+}
+
 func TestChargeWaitsForControlConfirmation(t *testing.T) {
 	values := map[string]string{
 		"/select/RS485 Control Mode":        "disable",

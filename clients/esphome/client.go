@@ -18,9 +18,13 @@ import (
 )
 
 const (
-	defaultTimeout              = 10 * time.Second
-	controlConfirmationTimeout  = 15 * time.Second
-	controlConfirmationInterval = 500 * time.Millisecond
+	defaultTimeout = 10 * time.Second
+
+	// The ESPHome Modbus select entities publish only every third 5-second
+	// controller update. Allow a full 15-second publication cycle plus margin.
+	espHomeControlPublicationInterval = 15 * time.Second
+	controlConfirmationTimeout        = espHomeControlPublicationInterval + 5*time.Second
+	controlConfirmationInterval       = 500 * time.Millisecond
 
 	// ESPHome sensor/entity paths (URL-encoded where needed)
 	sensorSOC              = "/sensor/Battery%20State%20Of%20Charge"

@@ -20,11 +20,13 @@ import (
 const (
 	defaultTimeout = 10 * time.Second
 
-	// The ESPHome Modbus select entities publish only every third 5-second
-	// controller update. Allow a full 15-second publication cycle plus margin.
+	// ESPHome can acknowledge a REST select write even when the underlying
+	// Modbus command is dropped. Retry idempotent select writes with backoff
+	// while waiting for the next published value.
 	espHomeControlPublicationInterval = 15 * time.Second
 	controlConfirmationTimeout        = espHomeControlPublicationInterval + 5*time.Second
 	controlConfirmationInterval       = 500 * time.Millisecond
+	controlWriteMaxAttempts           = 3
 
 	// ESPHome sensor/entity paths (URL-encoded where needed)
 	sensorSOC              = "/sensor/Battery%20State%20Of%20Charge"
@@ -415,28 +417,49 @@ func (c *Client) setNumberConfirmed(ctx context.Context, path string, value floa
 func (c *Client) waitForControlValue(ctx context.Context, path string, expected string) error {
 	confirmationCtx, cancel := context.WithTimeout(ctx, controlConfirmationTimeout)
 	defer cancel()
+
+	pollTicker := time.NewTicker(controlConfirmationInterval)
+	defer pollTicker.Stop()
+	retryDelay := controlConfirmationInterval
+	retryTimer := time.NewTimer(retryDelay)
+	defer retryTimer.Stop()
+
+	attempts := 1
 	var lastValue string
-	var lastErr error
+	var lastReadErr error
+	var lastWriteErr error
 	for {
 		actual, err := c.getControlValue(confirmationCtx, path)
 		if err == nil {
 			lastValue = actual
+			lastReadErr = nil
 			if actual == expected {
 				return nil
 			}
 		} else {
-			lastErr = err
+			lastReadErr = err
 		}
+
 		select {
 		case <-confirmationCtx.Done():
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if lastErr != nil {
-				return fmt.Errorf("confirm option %q: %w", expected, lastErr)
+			if lastReadErr != nil {
+				return fmt.Errorf("confirm option %q: %w", expected, lastReadErr)
+			}
+			if lastWriteErr != nil {
+				return fmt.Errorf("confirm option %q after retry: %w", expected, lastWriteErr)
 			}
 			return fmt.Errorf("confirm option %q: still %q", expected, lastValue)
-		case <-time.After(controlConfirmationInterval):
+		case <-retryTimer.C:
+			attempts++
+			lastWriteErr = c.setSelect(confirmationCtx, path, expected)
+			if attempts < controlWriteMaxAttempts {
+				retryDelay *= 2
+				retryTimer.Reset(retryDelay)
+			}
+		case <-pollTicker.C:
 		}
 	}
 }

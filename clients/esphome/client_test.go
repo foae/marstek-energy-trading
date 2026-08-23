@@ -299,6 +299,48 @@ func TestChargeWaitsForControlConfirmation(t *testing.T) {
 	}
 }
 
+func TestChargeRetriesUnconfirmedSelectWrite(t *testing.T) {
+	values := map[string]string{
+		"/select/RS485 Control Mode":        "disable",
+		"/select/Forcible Charge⁄Discharge": "stop",
+		"/number/Forcible Charge Power":     "0",
+	}
+	rs485Writes := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entityPath := strings.TrimSuffix(r.URL.Path, "/set")
+		if r.Method == http.MethodPost {
+			option := r.URL.Query().Get("option")
+			if entityPath == "/select/RS485 Control Mode" {
+				rs485Writes++
+				if rs485Writes == 1 {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+			}
+			if option != "" {
+				values[entityPath] = option
+			}
+			if value := r.URL.Query().Get("value"); value != "" {
+				values[entityPath] = value
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		_ = json.NewEncoder(w).Encode(map[string]string{"value": values[entityPath]})
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := New(server.URL, 11).ChargeContext(ctx, 500, 300); err != nil {
+		t.Fatalf("ChargeContext() error = %v", err)
+	}
+	if rs485Writes != 2 {
+		t.Fatalf("RS485 writes = %d, want 2", rs485Writes)
+	}
+}
+
 func TestChargeContext_CancelsControlConfirmation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {

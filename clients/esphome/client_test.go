@@ -12,11 +12,15 @@ import (
 	"time"
 )
 
-func newControlTestServer(t *testing.T, failOption string) (*httptest.Server, *[]string) {
+func newControlTestServer(t *testing.T, failOption string, initialRSMode ...string) (*httptest.Server, *[]string) {
 	t.Helper()
 	calledPaths := make([]string, 0)
+	rs485Mode := "disable"
+	if len(initialRSMode) > 0 {
+		rs485Mode = initialRSMode[0]
+	}
 	values := map[string]string{
-		"/select/RS485 Control Mode":        "disable",
+		"/select/RS485 Control Mode":        rs485Mode,
 		"/select/Forcible Charge⁄Discharge": "stop",
 		"/number/Forcible Charge Power":     "0",
 		"/number/Forcible Discharge Power":  "0",
@@ -238,6 +242,24 @@ func TestCharge(t *testing.T) {
 	}
 }
 
+func TestChargeDoesNotRewriteEnabledRS485Mode(t *testing.T) {
+	server, calledPathsPtr := newControlTestServer(t, "", "enable")
+	defer server.Close()
+
+	if err := New(server.URL, 11).Charge(500, 300); err != nil {
+		t.Fatalf("Charge() error = %v", err)
+	}
+	calledPaths := *calledPathsPtr
+	if len(calledPaths) != 2 {
+		t.Fatalf("calls = %d, want power + charge mode: %v", len(calledPaths), calledPaths)
+	}
+	for _, path := range calledPaths {
+		if strings.Contains(path, "RS485%20Control%20Mode") {
+			t.Fatalf("already-enabled RS485 mode was rewritten: %v", calledPaths)
+		}
+	}
+}
+
 func TestControlConfirmationTimeoutCoversESPHomePublicationCycle(t *testing.T) {
 	if controlConfirmationTimeout <= espHomeControlPublicationInterval {
 		t.Fatalf(
@@ -403,8 +425,8 @@ func TestIdle(t *testing.T) {
 		t.Fatalf("Idle() error = %v", err)
 	}
 
-	if len(calledPaths) != 3 {
-		t.Fatalf("expected 3 calls, got %d: %v", len(calledPaths), calledPaths)
+	if len(calledPaths) != 2 {
+		t.Fatalf("expected 2 calls, got %d: %v", len(calledPaths), calledPaths)
 	}
 
 	if !strings.Contains(calledPaths[0], "option=enable") {
@@ -413,8 +435,10 @@ func TestIdle(t *testing.T) {
 	if !strings.Contains(calledPaths[1], "option=stop") {
 		t.Errorf("second call should force mode to stop, got: %s", calledPaths[1])
 	}
-	if !strings.Contains(calledPaths[2], "RS485%20Control%20Mode") || !strings.Contains(calledPaths[2], "option=disable") {
-		t.Errorf("third call should disable RS485 control mode, got: %s", calledPaths[2])
+	for _, path := range calledPaths {
+		if strings.Contains(path, "option=disable") {
+			t.Errorf("idle must leave RS485 control enabled: %v", calledPaths)
+		}
 	}
 }
 
@@ -449,26 +473,6 @@ func TestIdle_StopFailureKeepsRS485Enabled(t *testing.T) {
 	// Error should identify the stop failure
 	if !strings.Contains(err.Error(), "stop") {
 		t.Errorf("error should mention stop, got: %v", err)
-	}
-}
-
-func TestIdle_CleanupFailuresAreSafeAfterConfirmedStop(t *testing.T) {
-	for _, failOption := range []string{"enable", "disable"} {
-		t.Run(failOption, func(t *testing.T) {
-			server, calledPathsPtr := newControlTestServer(t, failOption)
-			defer server.Close()
-
-			if err := New(server.URL, 11).Idle(); err != nil {
-				t.Fatalf("Idle() error = %v after confirmed stop", err)
-			}
-			calledPaths := *calledPathsPtr
-			if len(calledPaths) != 3 {
-				t.Fatalf("calls = %d, want enable + stop + disable: %v", len(calledPaths), calledPaths)
-			}
-			if !strings.Contains(calledPaths[1], "option=stop") {
-				t.Errorf("second call should confirm stop, got %s", calledPaths[1])
-			}
-		})
 	}
 }
 
@@ -527,8 +531,8 @@ func TestSetPassiveMode_Idle(t *testing.T) {
 		t.Fatalf("SetPassiveMode() error = %v", err)
 	}
 
-	if len(calledPaths) != 3 {
-		t.Fatalf("expected 3 calls for idle, got %d", len(calledPaths))
+	if len(calledPaths) != 2 {
+		t.Fatalf("expected 2 calls for idle, got %d", len(calledPaths))
 	}
 	if !strings.Contains(calledPaths[0], "option=enable") {
 		t.Errorf("zero power should enable RS485 control mode first, got: %s", calledPaths[0])
@@ -536,8 +540,10 @@ func TestSetPassiveMode_Idle(t *testing.T) {
 	if !strings.Contains(calledPaths[1], "option=stop") {
 		t.Errorf("zero power should trigger idle/stop mode, got: %s", calledPaths[1])
 	}
-	if !strings.Contains(calledPaths[2], "option=disable") {
-		t.Errorf("third call should disable RS485 control mode, got: %s", calledPaths[2])
+	for _, path := range calledPaths {
+		if strings.Contains(path, "option=disable") {
+			t.Errorf("idle must leave RS485 control enabled: %v", calledPaths)
+		}
 	}
 }
 

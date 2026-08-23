@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"math"
 	"net/http"
 	"net/url"
@@ -171,8 +170,7 @@ func (c *Client) Charge(powerW int, _ int) error {
 
 // ChargeContext starts charging and allows cancellation while ESPHome applies each control write.
 func (c *Client) ChargeContext(ctx context.Context, powerW int, _ int) error {
-	// Enable RS485 control mode first
-	if err := c.setSelectConfirmed(ctx, selectRS485ControlMode, "enable"); err != nil {
+	if err := c.ensureRS485ControlMode(ctx); err != nil {
 		return fmt.Errorf("enable RS485 control mode: %w", err)
 	}
 
@@ -197,8 +195,7 @@ func (c *Client) Discharge(powerW int, _ int) error {
 
 // DischargeContext starts discharging and allows cancellation while ESPHome applies each control write.
 func (c *Client) DischargeContext(ctx context.Context, powerW int, _ int) error {
-	// Enable RS485 control mode first
-	if err := c.setSelectConfirmed(ctx, selectRS485ControlMode, "enable"); err != nil {
+	if err := c.ensureRS485ControlMode(ctx); err != nil {
 		return fmt.Errorf("enable RS485 control mode: %w", err)
 	}
 
@@ -245,21 +242,14 @@ func (c *Client) Idle() error {
 // IdleContext stops forced operation and allows cancellation during control confirmation.
 func (c *Client) IdleContext(ctx context.Context) error {
 	var enableErr error
-	if err := c.setSelectConfirmed(ctx, selectRS485ControlMode, "enable"); err != nil {
+	if err := c.ensureRS485ControlMode(ctx); err != nil {
 		enableErr = fmt.Errorf("enable RS485 control mode: %w", err)
 	}
 
 	if err := c.setSelectConfirmed(ctx, selectForceMode, "stop"); err != nil {
 		return errors.Join(enableErr, fmt.Errorf("stop forcible mode: %w", err))
 	}
-
-	// Once stop is confirmed the battery is physically safe; disabling RS485 is cleanup.
-	disableErr := c.setSelectConfirmed(ctx, selectRS485ControlMode, "disable")
-	if enableErr != nil || disableErr != nil {
-		slog.Warn("battery stopped but RS485 control cleanup was incomplete",
-			"error", errors.Join(enableErr, disableErr))
-	}
-	return nil
+	return enableErr
 }
 
 // sensorResponse represents ESPHome sensor JSON response.
@@ -374,6 +364,14 @@ func (c *Client) setSelect(ctx context.Context, path string, option string) erro
 	return nil
 }
 
+func (c *Client) ensureRS485ControlMode(ctx context.Context) error {
+	mode, err := c.getControlValue(ctx, selectRS485ControlMode)
+	if err == nil && mode == "enable" {
+		return nil
+	}
+	return c.setSelectConfirmed(ctx, selectRS485ControlMode, "enable")
+}
+
 func (c *Client) setSelectConfirmed(ctx context.Context, path string, option string) error {
 	if err := c.setSelect(ctx, path, option); err != nil {
 		return err
@@ -393,11 +391,12 @@ func (c *Client) setNumberConfirmed(ctx context.Context, path string, value floa
 		actual, err := c.getControlValue(confirmationCtx, path)
 		if err == nil {
 			lastValue = actual
+			lastErr = nil
 			actualNumber, parseErr := strconv.ParseFloat(actual, 64)
 			if parseErr == nil && math.Abs(actualNumber-value) <= 0.5 {
 				return nil
 			}
-		} else {
+		} else if confirmationCtx.Err() == nil {
 			lastErr = err
 		}
 		select {
@@ -436,7 +435,7 @@ func (c *Client) waitForControlValue(ctx context.Context, path string, expected 
 			if actual == expected {
 				return nil
 			}
-		} else {
+		} else if confirmationCtx.Err() == nil {
 			lastReadErr = err
 		}
 
@@ -454,7 +453,9 @@ func (c *Client) waitForControlValue(ctx context.Context, path string, expected 
 			return fmt.Errorf("confirm option %q: still %q", expected, lastValue)
 		case <-retryTimer.C:
 			attempts++
-			lastWriteErr = c.setSelect(confirmationCtx, path, expected)
+			if err := c.setSelect(confirmationCtx, path, expected); confirmationCtx.Err() == nil {
+				lastWriteErr = err
+			}
 			if attempts < controlWriteMaxAttempts {
 				retryDelay *= 2
 				retryTimer.Reset(retryDelay)

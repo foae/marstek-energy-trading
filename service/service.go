@@ -61,6 +61,9 @@ const (
 	batteryShutdownTimeout           = 60 * time.Second
 	batteryShutdownAttemptTimeout    = 30 * time.Second
 	batteryStopRetryInterval         = 5 * time.Second
+	// A dead RS485 link fails the stop command instantly, so the normal 5s retry
+	// would spin. Writes are provably dropped, so nothing is running to stop.
+	batteryLinkDownStopRetryInterval = 5 * time.Minute
 	statusBatteryTimeout             = 5 * time.Second
 	solarStatusFailureThreshold      = 10
 	solarStatusFallbackTimeout       = 3 * time.Second
@@ -95,6 +98,7 @@ type Service struct {
 	batteryVerificationInterval time.Duration   // test override for battery start verification polling
 	batteryStopRetryDelay       time.Duration   // test override for failed-stop retry delay
 	lastStopAttempt             time.Time       // throttle retries when a stop command fails
+	lastStopLinkDown            bool            // last stop failure was a dead RS485 link; back off harder
 
 	// Solar charging state
 	solarSurplusCount             int       // consecutive surplus readings above threshold
@@ -1100,10 +1104,12 @@ func (s *Service) transitionToIdleLocked(ctx context.Context, soc int) bool {
 	// Release lock during network I/O
 	s.mu.Unlock()
 	if err := s.idleBattery(ctx); err != nil {
+		linkDown := errors.Is(err, marstek.ErrLinkDown)
 		s.mu.Lock()
-		slog.Error("failed to set idle mode; retaining active state for retry", "state", s.state, "error", err)
+		s.lastStopLinkDown = linkDown
+		slog.Error("failed to set idle mode; retaining active state for retry", "state", s.state, "error", err, "link_down", linkDown)
 		s.mu.Unlock()
-		s.notifyError(ctx, "Battery stop failed; forced operation may still be active: "+err.Error())
+		s.notifyError(ctx, batteryFailureMessage("Battery stop failed; forced operation may still be active", err))
 		s.mu.Lock()
 		return false
 	}
@@ -1111,6 +1117,7 @@ func (s *Service) transitionToIdleLocked(ctx context.Context, soc int) bool {
 
 	s.state = StateIdle
 	s.lastStopAttempt = time.Time{}
+	s.lastStopLinkDown = false
 	slog.Info("transitioned to idle", "soc", soc)
 	return true
 }
@@ -1118,6 +1125,9 @@ func (s *Service) transitionToIdleLocked(ctx context.Context, soc int) bool {
 func (s *Service) stopRetryDelay() time.Duration {
 	if s.batteryStopRetryDelay > 0 {
 		return s.batteryStopRetryDelay
+	}
+	if s.lastStopLinkDown {
+		return batteryLinkDownStopRetryInterval
 	}
 	return batteryStopRetryInterval
 }

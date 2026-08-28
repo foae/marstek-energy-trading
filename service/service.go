@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/foae/marstek-energy-trading/clients/marstek"
 	"github.com/foae/marstek-energy-trading/clients/nordpool"
 	"github.com/foae/marstek-energy-trading/clients/telegram"
 	"github.com/foae/marstek-energy-trading/internal/config"
@@ -55,6 +57,7 @@ const (
 	batteryStartVerificationInterval = time.Second
 	batteryActivePowerThresholdW     = 50.0
 	batteryControlFailureCooldown    = 5 * time.Minute
+	batteryLinkDownCooldown          = 30 * time.Minute
 	batteryShutdownTimeout           = 60 * time.Second
 	batteryShutdownAttemptTimeout    = 30 * time.Second
 	batteryStopRetryInterval         = 5 * time.Second
@@ -751,11 +754,12 @@ func (s *Service) startSolarChargingLocked(ctx context.Context, powerW int, soc 
 			s.state = StateStopping
 			s.lastStopAttempt = s.now()
 		}
-		l.Error("failed to start solar charging", "error", err)
+		l.Error("failed to start solar charging", "error", err, "link_down", errors.Is(err, marstek.ErrLinkDown))
 		s.solarSurplusCount = 0
-		s.batteryCooldownUntil = s.now().Add(batteryControlFailureCooldown)
+		s.batteryCooldownUntil = s.now().Add(batteryFailureCooldown(err))
+		errMsg := batteryFailureMessage("Battery did not start solar charging", err)
 		s.mu.Unlock()
-		s.notifyError(ctx, "Battery did not start solar charging: "+err.Error())
+		s.notifyError(ctx, errMsg)
 		s.mu.Lock()
 		return
 	}
@@ -889,9 +893,9 @@ func (s *Service) startChargingLocked(ctx context.Context, price decimal.Decimal
 			s.state = StateStopping
 			s.lastStopAttempt = s.now()
 		}
-		l.Error("failed to start charging", "error", err)
-		s.batteryCooldownUntil = s.now().Add(batteryControlFailureCooldown)
-		errMsg := "Failed to start charging: " + err.Error()
+		l.Error("failed to start charging", "error", err, "link_down", errors.Is(err, marstek.ErrLinkDown))
+		s.batteryCooldownUntil = s.now().Add(batteryFailureCooldown(err))
+		errMsg := batteryFailureMessage("Failed to start charging", err)
 		s.mu.Unlock()
 		s.notifyError(ctx, errMsg)
 		s.mu.Lock()
@@ -1006,9 +1010,9 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 			s.state = StateStopping
 			s.lastStopAttempt = s.now()
 		}
-		l.Error("failed to start discharging", "error", err)
-		s.batteryCooldownUntil = s.now().Add(batteryControlFailureCooldown)
-		errMsg := "Failed to start discharging: " + err.Error()
+		l.Error("failed to start discharging", "error", err, "link_down", errors.Is(err, marstek.ErrLinkDown))
+		s.batteryCooldownUntil = s.now().Add(batteryFailureCooldown(err))
+		errMsg := batteryFailureMessage("Failed to start discharging", err)
 		s.mu.Unlock()
 		s.notifyError(ctx, errMsg)
 		s.mu.Lock()
@@ -1411,6 +1415,23 @@ func (s *Service) checkDailySummary(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// batteryFailureCooldown backs off much harder when the RS485 link is down:
+// retrying every few minutes cannot help and only spams notifications.
+func batteryFailureCooldown(err error) time.Duration {
+	if errors.Is(err, marstek.ErrLinkDown) {
+		return batteryLinkDownCooldown
+	}
+	return batteryControlFailureCooldown
+}
+
+// batteryFailureMessage leads with the actionable cause when the link is down.
+func batteryFailureMessage(prefix string, err error) string {
+	if errors.Is(err, marstek.ErrLinkDown) {
+		return "Battery RS485 link is down — telemetry is frozen and control writes are dropped. Power-cycle the ESPHome dongle. (" + prefix + ": " + err.Error() + ")"
+	}
+	return prefix + ": " + err.Error()
 }
 
 // notifyError sends an error notification with rate limiting (max 1 per 15 minutes).

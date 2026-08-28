@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -398,6 +399,41 @@ func TestTick_ChargeInLowPriceWindow(t *testing.T) {
 	expectedPrice := decimal.NewFromFloat(0.05)
 	if !svc.lastChargePrice.Equal(expectedPrice) {
 		t.Errorf("expected lastChargePrice=%s, got %s", expectedPrice, svc.lastChargePrice)
+	}
+}
+
+func TestTick_ChargeFailureCooldownDependsOnLinkDown(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		cooldown time.Duration
+	}{
+		{
+			name:     "link down",
+			err:      fmt.Errorf("set charge mode: %w", marstek.ErrLinkDown),
+			cooldown: batteryLinkDownCooldown,
+		},
+		{
+			name:     "ordinary error",
+			err:      errors.New("boom"),
+			cooldown: batteryControlFailureCooldown,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+			prices := makePrices(baseTime, 0.05, 0.15, 0.25, 0.10)
+			mockBattery := NewMockBattery(50)
+			mockBattery.ChargeErr = tt.err
+			svc := newTestService(testConfigSmallBattery(), mockBattery, prices, baseTime)
+
+			svc.tick(context.Background())
+
+			if !svc.batteryCooldownUntil.Equal(baseTime.Add(tt.cooldown)) {
+				t.Errorf("cooldown = %s, want %s", svc.batteryCooldownUntil, baseTime.Add(tt.cooldown))
+			}
+		})
 	}
 }
 

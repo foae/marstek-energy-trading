@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+
+	"github.com/foae/marstek-energy-trading/clients/marstek"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -657,5 +660,167 @@ func TestHTTPError(t *testing.T) {
 	err = client.Charge(2500, 300)
 	if err == nil {
 		t.Error("Charge() error = nil, want error for 500 response")
+	}
+}
+
+// frozenLinkServer serves a bridge whose RS485 link is dead: control POSTs are
+// acknowledged, the force-mode select never leaves "stop", and battery-sourced
+// sensors are frozen at constants. sensors is mutated by the test to simulate a
+// live link. postCount counts control writes.
+func newFrozenLinkServer(t *testing.T, sensors map[string]float64, postCount *int, mu *sync.Mutex) *httptest.Server {
+	t.Helper()
+	values := map[string]string{
+		"/select/RS485 Control Mode":        "enable",
+		"/select/Forcible Charge⁄Discharge": "stop",
+		"/number/Forcible Charge Power":     "0",
+		"/number/Forcible Discharge Power":  "0",
+	}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Method == http.MethodPost {
+			*postCount++
+			entityPath := strings.TrimSuffix(r.URL.Path, "/set")
+			// Numbers echo optimistically; the force-mode select never moves.
+			if value := r.URL.Query().Get("value"); value != "" {
+				values[entityPath] = value
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if value, ok := sensors[r.URL.Path]; ok {
+			_ = json.NewEncoder(w).Encode(map[string]any{"value": value})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"value": values[r.URL.Path], "state": values[r.URL.Path]})
+	}))
+}
+
+func frozenSensors() map[string]float64 {
+	return map[string]float64{
+		"/sensor/AC Voltage":              232.5,
+		"/sensor/Battery Power":           -10,
+		"/sensor/Internal Temperature":    32.9,
+		"/sensor/Battery State Of Charge": 50,
+	}
+}
+
+func TestControlFailureWithFrozenTelemetryReportsLinkDown(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	posts := 0
+	server := newFrozenLinkServer(t, frozenSensors(), &posts, &mu)
+	defer server.Close()
+
+	client := New(server.URL, 11)
+	client.probeWindow = 60 * time.Millisecond
+	client.probeInterval = 20 * time.Millisecond
+
+	err := client.ChargeContext(context.Background(), 500, 300)
+	if !errors.Is(err, marstek.ErrLinkDown) {
+		t.Fatalf("ChargeContext() error = %v, want ErrLinkDown", err)
+	}
+}
+
+func TestControlFailureWithLiveTelemetryIsNotLinkDown(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	posts := 0
+	sensors := frozenSensors()
+	server := newFrozenLinkServer(t, sensors, &posts, &mu)
+	defer server.Close()
+
+	client := New(server.URL, 11)
+	client.probeWindow = 60 * time.Millisecond
+	client.probeInterval = 20 * time.Millisecond
+
+	// Move a probed sensor while the probe is sampling.
+	done := make(chan struct{})
+	stop := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		value := 232.5
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				value += 0.1
+				mu.Lock()
+				sensors["/sensor/AC Voltage"] = value
+				mu.Unlock()
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-done
+	}()
+
+	err := client.ChargeContext(context.Background(), 500, 300)
+	if err == nil {
+		t.Fatal("ChargeContext() error = nil, want control failure")
+	}
+	if errors.Is(err, marstek.ErrLinkDown) {
+		t.Fatalf("ChargeContext() error = %v, want plain control failure", err)
+	}
+}
+
+func TestLinkDownVerdictFailsFastAndClearsOnTelemetryChange(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	posts := 0
+	sensors := frozenSensors()
+	server := newFrozenLinkServer(t, sensors, &posts, &mu)
+	defer server.Close()
+
+	client := New(server.URL, 11)
+	client.probeWindow = 60 * time.Millisecond
+	client.probeInterval = 20 * time.Millisecond
+
+	// Seed telemetry so a later change is observable.
+	if _, err := client.GetBatteryStatusContext(context.Background()); err != nil {
+		t.Fatalf("GetBatteryStatusContext() error = %v", err)
+	}
+
+	client.markLinkDown()
+
+	mu.Lock()
+	posts = 0
+	mu.Unlock()
+
+	err := client.ChargeContext(context.Background(), 500, 300)
+	if !errors.Is(err, marstek.ErrLinkDown) {
+		t.Fatalf("ChargeContext() error = %v, want ErrLinkDown", err)
+	}
+	mu.Lock()
+	postsAfter := posts
+	mu.Unlock()
+	if postsAfter != 0 {
+		t.Fatalf("control writes while link down = %d, want 0", postsAfter)
+	}
+
+	// Telemetry moves: the verdict must clear and commands must be attempted again.
+	mu.Lock()
+	sensors["/sensor/Battery State Of Charge"] = 60
+	mu.Unlock()
+	if _, err := client.GetBatteryStatusContext(context.Background()); err != nil {
+		t.Fatalf("GetBatteryStatusContext() error = %v", err)
+	}
+	if _, down := client.linkDown(); down {
+		t.Fatal("link-down verdict still set after telemetry change")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_ = client.ChargeContext(ctx, 500, 300)
+	mu.Lock()
+	postsAfter = posts
+	mu.Unlock()
+	if postsAfter == 0 {
+		t.Fatal("no control writes attempted after link recovered")
 	}
 }

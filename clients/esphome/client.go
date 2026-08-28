@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/foae/marstek-energy-trading/clients/marstek"
@@ -27,12 +28,20 @@ const (
 	controlConfirmationInterval       = 500 * time.Millisecond
 	controlWriteMaxAttempts           = 3
 
+	// The RS485 link is declared down only after telemetry stays bit-identical for
+	// longer than two ESPHome publication cycles, so a slow-publishing but healthy
+	// link is never misread as dead.
+	linkProbeWindow    = 35 * time.Second
+	linkProbeInterval  = 5 * time.Second
+	linkDownVerdictTTL = 10 * time.Minute
+
 	// ESPHome sensor/entity paths (URL-encoded where needed)
 	sensorSOC              = "/sensor/Battery%20State%20Of%20Charge"
 	sensorTemperature      = "/sensor/Internal%20Temperature"
 	sensorRemainingCap     = "/sensor/Battery%20Remaining%20Capacity"
 	sensorTotalEnergy      = "/sensor/Battery%20Total%20Energy"
 	sensorBatteryPower     = "/sensor/Battery%20Power"
+	sensorACVoltage        = "/sensor/AC%20Voltage"
 	textSensorDeviceName   = "/text_sensor/Device%20Name"
 	textSensorEspIP        = "/text_sensor/Esp%20ip"
 	numberChargepower      = "/number/Forcible%20Charge%20Power"
@@ -48,6 +57,13 @@ type Client struct {
 	baseURL    string
 	httpClient *http.Client
 	minSOC     int // Minimum SOC percentage for discharge flag
+
+	mu            sync.Mutex
+	lastValues    map[string]float64 // battery-sourced telemetry, keyed by entity path
+	linkDownAt    time.Time          // zero when the link is believed healthy
+	now           func() time.Time   // clock, overridable in tests
+	probeWindow   time.Duration      // test override
+	probeInterval time.Duration      // test override
 }
 
 // New creates a new ESPHome client.
@@ -64,6 +80,10 @@ func New(baseURL string, minSOC int) *Client {
 		httpClient: &http.Client{
 			Timeout: defaultTimeout,
 		},
+		lastValues:    make(map[string]float64),
+		now:           time.Now,
+		probeWindow:   linkProbeWindow,
+		probeInterval: linkProbeInterval,
 	}
 }
 
@@ -171,17 +191,17 @@ func (c *Client) Charge(powerW int, _ int) error {
 // ChargeContext starts charging and allows cancellation while ESPHome applies each control write.
 func (c *Client) ChargeContext(ctx context.Context, powerW int, _ int) error {
 	if err := c.ensureRS485ControlMode(ctx); err != nil {
-		return fmt.Errorf("enable RS485 control mode: %w", err)
+		return c.classifyControlFailure(ctx, fmt.Errorf("enable RS485 control mode: %w", err))
 	}
 
 	// Then set charge power
 	if err := c.setNumberConfirmed(ctx, numberChargepower, float64(powerW)); err != nil {
-		return fmt.Errorf("set charge power: %w", err)
+		return c.classifyControlFailure(ctx, fmt.Errorf("set charge power: %w", err))
 	}
 
 	// Finally activate charge mode
 	if err := c.setSelectConfirmed(ctx, selectForceMode, "charge"); err != nil {
-		return fmt.Errorf("set charge mode: %w", err)
+		return c.classifyControlFailure(ctx, fmt.Errorf("set charge mode: %w", err))
 	}
 
 	return nil
@@ -196,17 +216,17 @@ func (c *Client) Discharge(powerW int, _ int) error {
 // DischargeContext starts discharging and allows cancellation while ESPHome applies each control write.
 func (c *Client) DischargeContext(ctx context.Context, powerW int, _ int) error {
 	if err := c.ensureRS485ControlMode(ctx); err != nil {
-		return fmt.Errorf("enable RS485 control mode: %w", err)
+		return c.classifyControlFailure(ctx, fmt.Errorf("enable RS485 control mode: %w", err))
 	}
 
 	// Then set discharge power
 	if err := c.setNumberConfirmed(ctx, numberDischargePower, float64(powerW)); err != nil {
-		return fmt.Errorf("set discharge power: %w", err)
+		return c.classifyControlFailure(ctx, fmt.Errorf("set discharge power: %w", err))
 	}
 
 	// Finally activate discharge mode
 	if err := c.setSelectConfirmed(ctx, selectForceMode, "discharge"); err != nil {
-		return fmt.Errorf("set discharge mode: %w", err)
+		return c.classifyControlFailure(ctx, fmt.Errorf("set discharge mode: %w", err))
 	}
 
 	return nil
@@ -247,9 +267,12 @@ func (c *Client) IdleContext(ctx context.Context) error {
 	}
 
 	if err := c.setSelectConfirmed(ctx, selectForceMode, "stop"); err != nil {
-		return errors.Join(enableErr, fmt.Errorf("stop forcible mode: %w", err))
+		return c.classifyControlFailure(ctx, errors.Join(enableErr, fmt.Errorf("stop forcible mode: %w", err)))
 	}
-	return enableErr
+	if enableErr != nil {
+		return c.classifyControlFailure(ctx, enableErr)
+	}
+	return nil
 }
 
 // sensorResponse represents ESPHome sensor JSON response.
@@ -294,7 +317,103 @@ func (c *Client) getSensorFloatContext(ctx context.Context, path string) (float6
 		return 0, fmt.Errorf("decode sensor response: %w", err)
 	}
 
+	c.recordTelemetry(path, sensor.Value)
+
 	return sensor.Value, nil
+}
+
+// recordTelemetry notes a battery-sourced reading. Any change proves the RS485
+// link is alive, which clears a previous link-down verdict.
+func (c *Client) recordTelemetry(path string, value float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prev, seen := c.lastValues[path]
+	c.lastValues[path] = value
+	if seen && prev != value {
+		c.linkDownAt = time.Time{}
+	}
+}
+
+// linkDown reports whether a recent probe concluded the RS485 link is down.
+// The verdict expires so a recovered link is always retried eventually.
+func (c *Client) linkDown() (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.linkDownAt.IsZero() {
+		return time.Time{}, false
+	}
+	if c.now().Sub(c.linkDownAt) > linkDownVerdictTTL {
+		return time.Time{}, false
+	}
+	return c.linkDownAt, true
+}
+
+// markLinkDown records a link-down verdict, keeping any earlier still-valid
+// timestamp so the reported age keeps growing.
+func (c *Client) markLinkDown() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.now()
+	if !c.linkDownAt.IsZero() && now.Sub(c.linkDownAt) <= linkDownVerdictTTL {
+		return
+	}
+	c.linkDownAt = now
+}
+
+// probeLinkDown samples battery-sourced telemetry repeatedly and reports true
+// only if every value stayed bit-identical for the whole window. It returns as
+// soon as any value moves, so a healthy link costs one extra read.
+func (c *Client) probeLinkDown(ctx context.Context) bool {
+	paths := []string{sensorACVoltage, sensorBatteryPower, sensorTemperature}
+
+	baseline := make(map[string]float64, len(paths))
+	for _, path := range paths {
+		value, err := c.getSensorFloatContext(ctx, path)
+		if err != nil {
+			return false
+		}
+		baseline[path] = value
+	}
+
+	start := c.now()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(c.probeInterval):
+		}
+
+		for _, path := range paths {
+			value, err := c.getSensorFloatContext(ctx, path)
+			if err != nil {
+				return false
+			}
+			if value != baseline[path] {
+				return false
+			}
+		}
+
+		if c.now().Sub(start) >= c.probeWindow {
+			return true
+		}
+	}
+}
+
+// classifyControlFailure upgrades a control failure to ErrLinkDown when telemetry
+// proves the RS485 link is dead. ESPHome acknowledges REST writes and echoes
+// number writes optimistically, so a dropped Modbus frame is otherwise invisible.
+func (c *Client) classifyControlFailure(ctx context.Context, err error) error {
+	if err == nil || ctx.Err() != nil {
+		return err
+	}
+	if errors.Is(err, marstek.ErrLinkDown) {
+		return err
+	}
+	if !c.probeLinkDown(ctx) {
+		return err
+	}
+	c.markLinkDown()
+	return fmt.Errorf("%w: telemetry frozen and control writes dropped: %w", marstek.ErrLinkDown, err)
 }
 
 // getTextSensor retrieves a text sensor value.
@@ -365,6 +484,9 @@ func (c *Client) setSelect(ctx context.Context, path string, option string) erro
 }
 
 func (c *Client) ensureRS485ControlMode(ctx context.Context) error {
+	if since, down := c.linkDown(); down {
+		return fmt.Errorf("%w for %s", marstek.ErrLinkDown, c.now().Sub(since).Round(time.Second))
+	}
 	mode, err := c.getControlValue(ctx, selectRS485ControlMode)
 	if err == nil && mode == "enable" {
 		return nil
@@ -379,6 +501,10 @@ func (c *Client) setSelectConfirmed(ctx context.Context, path string, option str
 	return c.waitForControlValue(ctx, path, option)
 }
 
+// setNumberConfirmed writes a number entity and reads it back. NOTE: ESPHome
+// publishes number writes optimistically — the read-back returns the requested
+// value even when the Modbus frame was dropped — so this confirms the ESPHome
+// entity, not the battery. Dropped writes are detected by probeLinkDown instead.
 func (c *Client) setNumberConfirmed(ctx context.Context, path string, value float64) error {
 	if err := c.setNumber(ctx, path, value); err != nil {
 		return err

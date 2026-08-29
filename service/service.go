@@ -48,6 +48,7 @@ const (
 	solarShortSessionBackoffCount = 3                // consecutive short sessions that trigger long backoff
 	solarStartQualificationCount  = 10               // consecutive raw surplus readings before starting
 	solarMinChargePowerW          = 75               // floor clamp for charge power
+	solarChargeUpperSOC           = 99               // treat integer-reported 99% as full to prevent top-of-charge cycling
 	solarStopDebounceCount        = 10               // consecutive low readings before stop
 	solarEMAAlpha                 = 0.05             // EMA smoothing factor (~20s effective window)
 )
@@ -568,8 +569,9 @@ func (s *Service) solarTick(ctx context.Context) {
 			}
 		}
 
-		// Skip if battery full
-		if batterySOC >= 100 {
+		// The battery reports integer SOC and repeatedly oscillates at 99% near
+		// full. Treat 99% as full for solar capture to avoid shallow cycling.
+		if batterySOC >= solarChargeUpperSOC {
 			s.solarSurplusCount = 0
 			return
 		}
@@ -599,9 +601,10 @@ func (s *Service) solarTick(ctx context.Context) {
 
 		sessionAge := s.now().Sub(s.currentTradeStart)
 
-		// Stop if battery full (unconditional safety check)
-		if batterySOC >= 100 {
-			slog.Info("solar charging: battery full")
+		// Stop at the solar upper SOC limit even during the minimum session
+		// duration. Continuing at 99% causes repeated shallow charge sessions.
+		if batterySOC >= solarChargeUpperSOC {
+			slog.Info("solar charging: battery at upper SOC limit", "upper_soc", solarChargeUpperSOC)
 			s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonBatteryFull)
 			return
 		}

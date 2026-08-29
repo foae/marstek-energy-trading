@@ -1511,38 +1511,39 @@ func TestSolarTick_IgnoresStateDischarging(t *testing.T) {
 	}
 }
 
-func TestSolarTick_NoStartWhenBatteryFull(t *testing.T) {
-	// Scenario: Surplus available but battery at 100%
-	// Expected: Should not start solar charging
-
+func TestSolarTick_NoStartAtUpperSOC(t *testing.T) {
+	// Integer SOC telemetry stays at 99% near full. Solar capture must not start
+	// there, or exported surplus repeatedly creates shallow charge sessions.
 	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
 	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
 
 	cfg := testConfigSmallBattery()
-	mockBattery := NewMockBattery(100) // Full
+	mockBattery := NewMockBattery(solarChargeUpperSOC)
 	meter := NewMockMeter(true, -500)
 
 	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
 
 	ctx := context.Background()
-	svc.solarTick(ctx)
-	svc.solarTick(ctx)
-	svc.solarTick(ctx)
+	for range solarStartQualificationCount {
+		svc.solarTick(ctx)
+	}
 
 	if svc.state != StateIdle {
-		t.Errorf("expected idle when battery full, got %s", svc.state)
+		t.Errorf("expected idle at solar upper SOC limit, got %s", svc.state)
+	}
+	if len(mockBattery.ChargeCalls) != 0 {
+		t.Errorf("expected no charge calls at solar upper SOC limit, got %d", len(mockBattery.ChargeCalls))
 	}
 }
 
-func TestSolarTick_StopWhenBatteryFull(t *testing.T) {
-	// Scenario: Solar charging active, battery reaches 100%
-	// Expected: Should stop solar charging
-
+func TestSolarTick_StopAtUpperSOC(t *testing.T) {
+	// A solar session that reaches the upper SOC limit must stop immediately,
+	// even though the battery has not rounded its telemetry up to 100%.
 	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
 	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
 
 	cfg := testConfigSmallBattery()
-	mockBattery := NewMockBattery(100) // Just became full
+	mockBattery := NewMockBattery(solarChargeUpperSOC)
 	meter := NewMockMeter(true, -500)
 
 	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
@@ -1555,7 +1556,10 @@ func TestSolarTick_StopWhenBatteryFull(t *testing.T) {
 	svc.solarTick(ctx)
 
 	if svc.state != StateIdle {
-		t.Errorf("expected idle when battery full during solar, got %s", svc.state)
+		t.Errorf("expected idle at solar upper SOC limit, got %s", svc.state)
+	}
+	if mockBattery.IdleCalls != 1 {
+		t.Errorf("expected one idle command at solar upper SOC limit, got %d", mockBattery.IdleCalls)
 	}
 }
 

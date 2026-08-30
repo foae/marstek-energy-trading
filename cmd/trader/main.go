@@ -110,7 +110,11 @@ func main() {
 	}
 
 	if telegramClient.Enabled() {
-		slog.Info("telegram notifications enabled")
+		if err := telegramClient.RegisterCommands(context.Background()); err != nil {
+			slog.Warn("failed to register Telegram commands", "error", err)
+		} else {
+			slog.Info("telegram notifications and commands enabled")
+		}
 	}
 
 	// Initialize recorder with configured timezone

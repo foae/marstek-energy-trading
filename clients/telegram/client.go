@@ -16,6 +16,7 @@ import (
 const (
 	sendMessageAPI       = "https://api.telegram.org/bot%s/sendMessage"
 	getUpdatesAPI        = "https://api.telegram.org/bot%s/getUpdates"
+	setMyCommandsAPI     = "https://api.telegram.org/bot%s/setMyCommands"
 	commandMaxAge        = 30 * time.Second
 	updateOffsetFileMode = 0o600
 )
@@ -64,6 +65,74 @@ type sendMessageRequest struct {
 	ChatID    string `json:"chat_id"`
 	Text      string `json:"text"`
 	ParseMode string `json:"parse_mode,omitempty"`
+}
+
+type botCommand struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
+type botCommandScope struct {
+	Type   string `json:"type"`
+	ChatID string `json:"chat_id"`
+}
+
+type setMyCommandsRequest struct {
+	Commands []botCommand    `json:"commands"`
+	Scope    botCommandScope `json:"scope"`
+}
+
+type setMyCommandsResponse struct {
+	OK          bool   `json:"ok"`
+	Description string `json:"description"`
+}
+
+// RegisterCommands publishes the command menu for the configured private chat.
+func (c *Client) RegisterCommands(ctx context.Context) error {
+	if !c.enabled {
+		return nil
+	}
+
+	reqBody := setMyCommandsRequest{
+		Commands: []botCommand{
+			{Command: "status", Description: "Show battery and trading status"},
+			{Command: "discharge", Description: "Start manual discharge (optional watts)"},
+			{Command: "auto", Description: "Stop manual discharge and resume automatic control"},
+		},
+		Scope: botCommandScope{
+			Type:   "chat",
+			ChatID: c.chatID,
+		},
+	}
+	data, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("marshal Telegram commands: %w", err)
+	}
+
+	url := fmt.Sprintf(setMyCommandsAPI, c.botToken)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("create Telegram command request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("register Telegram commands: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("register Telegram commands: status %d", resp.StatusCode)
+	}
+
+	var result setMyCommandsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode Telegram command response: %w", err)
+	}
+	if !result.OK {
+		return fmt.Errorf("register Telegram commands: %s", result.Description)
+	}
+	return nil
 }
 
 // SendMessage sends a message to the configured chat.

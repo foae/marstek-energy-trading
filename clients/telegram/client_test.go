@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -87,5 +88,58 @@ func TestPollCommandsAcceptsOnlyFreshPrivateChatCommands(t *testing.T) {
 	}
 	if client.lastUpdateID != 4 {
 		t.Fatalf("lastUpdateID = %d, want 4", client.lastUpdateID)
+	}
+}
+
+func TestRegisterCommandsPublishesPrivateChatMenu(t *testing.T) {
+	client, err := New("token", "123", filepath.Join(t.TempDir(), "telegram-update-offset"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	var request setMyCommandsRequest
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost || req.URL.Path != "/bottoken/setMyCommands" {
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL)
+		}
+		if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		return telegramUpdatesResponse(`{"ok":true,"result":true}`), nil
+	})}
+
+	if err := client.RegisterCommands(context.Background()); err != nil {
+		t.Fatalf("RegisterCommands() error = %v", err)
+	}
+	if request.Scope.Type != "chat" || request.Scope.ChatID != "123" {
+		t.Fatalf("scope = %+v, want configured private chat", request.Scope)
+	}
+	want := []botCommand{
+		{Command: "status", Description: "Show battery and trading status"},
+		{Command: "discharge", Description: "Start manual discharge (optional watts)"},
+		{Command: "auto", Description: "Stop manual discharge and resume automatic control"},
+	}
+	if len(request.Commands) != len(want) {
+		t.Fatalf("commands = %+v, want %+v", request.Commands, want)
+	}
+	for i := range want {
+		if request.Commands[i] != want[i] {
+			t.Fatalf("command %d = %+v, want %+v", i, request.Commands[i], want[i])
+		}
+	}
+}
+
+func TestRegisterCommandsReturnsTelegramAPIFailure(t *testing.T) {
+	client, err := New("token", "123", filepath.Join(t.TempDir(), "telegram-update-offset"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return telegramUpdatesResponse(`{"ok":false,"description":"commands rejected"}`), nil
+	})}
+
+	err = client.RegisterCommands(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "commands rejected") {
+		t.Fatalf("RegisterCommands() error = %v, want Telegram failure", err)
 	}
 }

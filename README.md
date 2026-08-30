@@ -83,7 +83,7 @@ See `.env.example` for all options.
 
 ## Telegram Commands
 
-Commands are accepted only from the configured private `TELEGRAM_CHAT_ID`; group chats are ignored for battery-control safety.
+Commands are accepted only from the configured private `TELEGRAM_CHAT_ID`; group chats are ignored for battery-control safety. At startup, the service publishes the supported commands to that chat's Telegram command menu.
 
 | Command | Behavior |
 |---------|----------|

@@ -215,9 +215,16 @@ Time    Price   Action
 
 ### Commands (Inbound)
 
+Commands are accepted only from the configured private `TELEGRAM_CHAT_ID`; group chats and other senders are ignored. At startup, the service registers the command menu for that private chat.
+
 | Command | Response |
 |---------|----------|
 | `/status` | Current state, battery SOC, price, next action, P&L |
+| `/discharge` | Start manual discharge at `DISCHARGE_POWER_W` |
+| `/discharge 800` | Start manual discharge at a chosen power from 800-2500 W |
+| `/auto` | Stop manual discharge and return control to automatic trading and solar charging |
+
+Manual discharge stops at the configured minimum SOC, when battery status or command refresh fails, or after two hours. The completed discharge is included in trade history and P&L.
 
 ### Status Command Response
 
@@ -258,8 +265,8 @@ Load from `.env` file with fallback to environment variables.
 | `PASSIVE_MODE_TIMEOUT_S` | `300` | Passive mode timeout |
 | `HOMEWIZARD_P1_URL` | - | HomeWizard P1 meter URL (optional, empty = auto-discover via mDNS + HTTP scan) |
 | `SOLAR_MIN_SURPLUS_W` | `100` | Min surplus watts to start solar charging |
-| `TELEGRAM_BOT_TOKEN` | - | Telegram bot token |
-| `TELEGRAM_CHAT_ID` | - | Telegram chat ID |
+| `TELEGRAM_BOT_TOKEN` | - | Telegram bot token (enables notifications and command registration) |
+| `TELEGRAM_CHAT_ID` | - | Private Telegram chat allowed to issue commands |
 
 ## Scheduling
 

@@ -3,6 +3,8 @@ package config
 import (
 	"testing"
 	"time"
+
+	"github.com/shopspring/decimal"
 )
 
 func TestTelegramEnabled(t *testing.T) {
@@ -62,7 +64,8 @@ func TestLoad_Defaults(t *testing.T) {
 	// Clear relevant env vars to test defaults
 	for _, key := range []string{
 		"SERVICE_NAME", "LOG_LEVEL", "HTTP_LISTEN_ADDR", "DATA_DIR", "TZ",
-		"NORDPOOL_AREA", "NORDPOOL_CURRENCY",
+		"NORDPOOL_AREA", "NORDPOOL_CURRENCY", "ENERGY_TAX_EUR_PER_KWH",
+		"VAT_RATE", "SUPPLIER_FEE_EUR_PER_KWH",
 		"MIN_PRICE_SPREAD", "BATTERY_EFFICIENCY", "BATTERY_CAPACITY_KWH",
 		"BATTERY_MIN_SOC", "MAX_CYCLES_PER_DAY",
 		"ESPHOME_URL", "CHARGE_POWER_W", "DISCHARGE_POWER_W", "PASSIVE_MODE_TIMEOUT_S",
@@ -73,10 +76,9 @@ func TestLoad_Defaults(t *testing.T) {
 		t.Setenv(key, "")
 	}
 
-	// env/v11 treats empty string as "set" for string fields, so we need to
-	// just verify the numeric defaults work when env vars are unset.
-	// Unset the numeric ones so they fall back to envDefault.
-	t.Setenv("SOLAR_MIN_SURPLUS_W", "")
+	// All-in pricing is deliberately EUR-only; keep the string field valid
+	// while empty numeric fields exercise envDefault parsing.
+	t.Setenv("NORDPOOL_CURRENCY", "EUR")
 
 	cfg, err := Load()
 	if err != nil {
@@ -91,6 +93,15 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 	if cfg.ChargePowerW != 2500 {
 		t.Errorf("ChargePowerW = %d, want 2500", cfg.ChargePowerW)
+	}
+	if !cfg.EnergyTaxEURPerKWh.Equal(decimal.RequireFromString("0.09161")) {
+		t.Errorf("EnergyTaxEURPerKWh = %s, want 0.09161 (2026 rate)", cfg.EnergyTaxEURPerKWh)
+	}
+	if !cfg.VATRate.Equal(decimal.RequireFromString("0.21")) {
+		t.Errorf("VATRate = %s, want 0.21", cfg.VATRate)
+	}
+	if !cfg.SupplierFeeEURPerKWh.Equal(decimal.RequireFromString("0.02")) {
+		t.Errorf("SupplierFeeEURPerKWh = %s, want 0.02", cfg.SupplierFeeEURPerKWh)
 	}
 }
 
@@ -111,7 +122,7 @@ func TestValidate_BatteryEfficiency(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := &Config{BatteryEfficiency: tt.value, BatteryMinSOC: 0.11}
+			cfg := &Config{NordPoolCurrency: "EUR", BatteryEfficiency: tt.value, BatteryMinSOC: 0.11}
 			err := cfg.validate()
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validate() error = %v, wantErr %v", err, tt.wantErr)
@@ -136,7 +147,7 @@ func TestValidate_BatteryMinSOC(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := &Config{BatteryEfficiency: 0.90, BatteryMinSOC: tt.value}
+			cfg := &Config{NordPoolCurrency: "EUR", BatteryEfficiency: 0.90, BatteryMinSOC: tt.value}
 			err := cfg.validate()
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validate() error = %v, wantErr %v", err, tt.wantErr)
@@ -146,7 +157,7 @@ func TestValidate_BatteryMinSOC(t *testing.T) {
 }
 
 func TestValidate_MinPriceSpread(t *testing.T) {
-	cfg := &Config{BatteryEfficiency: 0.90, BatteryMinSOC: 0.11, MinPriceSpread: -0.01}
+	cfg := &Config{NordPoolCurrency: "EUR", BatteryEfficiency: 0.90, BatteryMinSOC: 0.11, MinPriceSpread: -0.01}
 	if err := cfg.validate(); err == nil {
 		t.Error("expected error for negative MinPriceSpread")
 	}
@@ -154,6 +165,66 @@ func TestValidate_MinPriceSpread(t *testing.T) {
 	cfg.MinPriceSpread = 0
 	if err := cfg.validate(); err != nil {
 		t.Errorf("unexpected error for zero MinPriceSpread: %v", err)
+	}
+}
+
+func TestValidate_AllInPricing(t *testing.T) {
+	valid := Config{
+		NordPoolCurrency:     "EUR",
+		BatteryEfficiency:    0.90,
+		BatteryMinSOC:        0.11,
+		EnergyTaxEURPerKWh:   decimal.RequireFromString("0.09161"),
+		VATRate:              decimal.RequireFromString("0.21"),
+		SupplierFeeEURPerKWh: decimal.RequireFromString("0.02"),
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name: "non-EUR NordPool currency",
+			mutate: func(cfg *Config) {
+				cfg.NordPoolCurrency = "GBP"
+			},
+		},
+		{
+			name: "negative energy tax",
+			mutate: func(cfg *Config) {
+				cfg.EnergyTaxEURPerKWh = decimal.RequireFromString("-0.01")
+			},
+		},
+		{
+			name: "negative VAT",
+			mutate: func(cfg *Config) {
+				cfg.VATRate = decimal.RequireFromString("-0.01")
+			},
+		},
+		{
+			name: "VAT above one",
+			mutate: func(cfg *Config) {
+				cfg.VATRate = decimal.RequireFromString("1.01")
+			},
+		},
+		{
+			name: "negative supplier fee",
+			mutate: func(cfg *Config) {
+				cfg.SupplierFeeEURPerKWh = decimal.RequireFromString("-0.01")
+			},
+		},
+	}
+
+	if err := valid.validate(); err != nil {
+		t.Fatalf("valid config: %v", err)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := valid
+			tt.mutate(&cfg)
+			if err := cfg.validate(); err == nil {
+				t.Fatal("validate() error = nil, want error")
+			}
+		})
 	}
 }
 

@@ -61,6 +61,9 @@ func Load() (*Config, error) {
 
 // validate checks that config values are within expected bounds.
 func (c *Config) validate() error {
+	if c.NordPoolCurrency != "EUR" {
+		return fmt.Errorf("NORDPOOL_CURRENCY must be EUR when all-in pricing is enabled, got %q", c.NordPoolCurrency)
+	}
 	if c.BatteryEfficiency <= 0 || c.BatteryEfficiency > 1.0 {
 		return fmt.Errorf("BATTERY_EFFICIENCY must be in (0.0, 1.0], got %f", c.BatteryEfficiency)
 	}

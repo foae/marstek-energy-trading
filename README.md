@@ -40,7 +40,7 @@ Direct UDP control is available but not enabled by default. See [docs/marstek-ap
 ### NordPool API
 - **Endpoint**: `https://dataportal-api.nordpoolgroup.com/api/DayAheadPriceIndices`
 - **Resolution**: 15-minute intervals
-- **Prices**: EUR/MWh (converted to EUR/kWh internally)
+- **Prices**: EUR/MWh, converted internally to all-in EUR/kWh using `(NordPool + energy tax) × (1 + VAT) + supplier fee`
 
 ### HomeWizard P1 Energy Meter (planned)
 Provides real-time house energy consumption. Future enhancement to pause charging when consumption exceeds ~17kWh total or ~5.7kWh per phase.
@@ -67,6 +67,10 @@ Copy `.env.example` to `.env`. Key settings:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `NORDPOOL_CURRENCY` | `EUR` | Required currency for all-in pricing |
+| `ENERGY_TAX_EUR_PER_KWH` | `0.09161` | Dutch 2026 energy tax for the first 10,000 kWh |
+| `VAT_RATE` | `0.21` | VAT applied to NordPool price and energy tax |
+| `SUPPLIER_FEE_EUR_PER_KWH` | `0.02` | Contract-specific per-kWh supplier fee, VAT-inclusive |
 | `MIN_PRICE_SPREAD` | `0.05` | Minimum EUR/kWh spread to trigger trading |
 | `BATTERY_EFFICIENCY` | `0.90` | Round-trip efficiency (0.0-1.0) |
 | `ESPHOME_URL` | `http://192.168.1.50` | ESPHome device URL |

@@ -74,11 +74,7 @@ const (
 	solarStatusFallbackTimeout       = 3 * time.Second
 )
 
-const (
-	manualDischargeMinPowerW  = 800
-	manualDischargeMaxPowerW  = 2500
-	manualOverrideMaxDuration = 2 * time.Hour
-)
+const manualOverrideMaxDuration = 2 * time.Hour
 
 // Service is the main trading engine.
 type Service struct {
@@ -100,6 +96,7 @@ type Service struct {
 	currentTradeStart           time.Time
 	currentTradePrice           decimal.Decimal
 	currentTradeSOC             int
+	currentTradeLastSOC         int
 	lastChargePrice             decimal.Decimal // track last charge price for profitability check
 	currentTradePowerW          int
 	manualOverrideUntil         time.Time
@@ -383,7 +380,7 @@ func (s *Service) tick(ctx context.Context) {
 		s.mu.Lock()
 		if s.state == StateManualDischarging {
 			slog.Error("manual discharge telemetry failed; stopping override", "error", err)
-			s.stopDischargingLocked(ctx, s.currentTradeSOC)
+			s.stopDischargingLocked(ctx, s.currentTradeLastSOC)
 		}
 		s.mu.Unlock()
 		slog.Error("failed to get battery status", "error", err)
@@ -405,6 +402,7 @@ func (s *Service) tick(ctx context.Context) {
 	l.Debug("tick", "charging_enabled", batStatus.ChargingFlag, "discharging_enabled", batStatus.DischargFlag)
 
 	if s.state == StateManualDischarging {
+		s.currentTradeLastSOC = batStatus.SOC
 		minSOC := int(s.cfg.BatteryMinSOC * 100)
 		switch {
 		case batStatus.SOC <= minSOC:
@@ -417,7 +415,10 @@ func (s *Service) tick(ctx context.Context) {
 			l.Info("stopping manual discharge - safety timeout reached")
 			s.stopDischargingLocked(ctx, batStatus.SOC)
 		default:
-			s.refreshPassiveModeLocked(ctx, s.currentTradePowerW)
+			if !s.refreshPassiveModeLocked(ctx, s.currentTradePowerW) {
+				l.Error("manual discharge refresh failed; stopping override")
+				s.stopDischargingLocked(ctx, batStatus.SOC)
+			}
 		}
 		return
 	}
@@ -550,6 +551,12 @@ func (s *Service) accumulateSolarEnergyLocked(measuredChargePowerW float64) {
 // solarTick is called every 1 second to manage solar self-consumption charging.
 func (s *Service) solarTick(ctx context.Context) {
 	if s.retryStopping(ctx) {
+		return
+	}
+	s.mu.RLock()
+	state := s.state
+	s.mu.RUnlock()
+	if state != StateIdle && state != StateSolarCharging {
 		return
 	}
 
@@ -1074,6 +1081,7 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 	s.currentTradeStart = s.now()
 	s.currentTradePrice = price
 	s.currentTradeSOC = soc
+	s.currentTradeLastSOC = soc
 	s.currentTradePowerW = powerW
 	s.lastPassiveRefresh = s.now()
 	s.batteryCooldownUntil = time.Time{}
@@ -1114,7 +1122,11 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 		Div(decimal.NewFromInt(100)).
 		Mul(decimal.NewFromFloat(s.cfg.BatteryEfficiency))
 	energyF, _ := energyKWh.Float64()
-	priceF, _ := s.currentTradePrice.Float64()
+	avgPrice := s.calculateAveragePrice(s.currentTradeStart, stopTime)
+	if avgPrice.IsZero() {
+		avgPrice = s.currentTradePrice
+	}
+	priceF, _ := avgPrice.Float64()
 
 	l := slog.With(
 		"action", "discharge",
@@ -1129,7 +1141,7 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 	trade := Trade{
 		Timestamp: s.currentTradeStart,
 		Action:    ActionDischarge,
-		PriceEUR:  s.currentTradePrice,
+		PriceEUR:  avgPrice,
 		PowerW:    tradePowerW,
 		DurationS: int(duration.Seconds()),
 		EnergyKWh: energyKWh,
@@ -1241,12 +1253,13 @@ func (s *Service) idleBattery(ctx context.Context) error {
 	return s.battery.IdleContext(safetyCtx)
 }
 
-// refreshPassiveModeLocked refreshes the passive mode command before timeout. Caller must hold s.mu.
-func (s *Service) refreshPassiveModeLocked(ctx context.Context, power int) {
+// refreshPassiveModeLocked refreshes the passive mode command before timeout.
+// It returns false when a required refresh fails. Caller must hold s.mu.
+func (s *Service) refreshPassiveModeLocked(ctx context.Context, power int) bool {
 	// Refresh if we're past 80% of the timeout period
 	refreshThreshold := time.Duration(float64(s.cfg.PassiveModeTimeoutS)*0.8) * time.Second
 	if s.now().Sub(s.lastPassiveRefresh) < refreshThreshold {
-		return
+		return true
 	}
 
 	slog.Debug("refreshing passive mode", "power", power)
@@ -1258,9 +1271,11 @@ func (s *Service) refreshPassiveModeLocked(ctx context.Context, power int) {
 
 	if err != nil {
 		slog.Error("failed to refresh passive mode", "error", err)
-		return
+		s.batteryCooldownUntil = s.now().Add(batteryFailureCooldown(err))
+		return false
 	}
 	s.lastPassiveRefresh = s.now()
+	return true
 }
 
 // checkPriceFetch checks if we should fetch new prices.
@@ -1542,6 +1557,9 @@ func (s *Service) handleTelegramCommands(ctx context.Context) {
 		return
 	}
 
+	var controlCommand string
+	var controlArgs []string
+	statusRequested := false
 	for _, rawCommand := range commands {
 		fields := strings.Fields(rawCommand)
 		if len(fields) == 0 {
@@ -1550,12 +1568,21 @@ func (s *Service) handleTelegramCommands(ctx context.Context) {
 		command := strings.ToLower(strings.SplitN(fields[0], "@", 2)[0])
 		switch command {
 		case "/status":
-			s.sendTelegramStatus(ctx)
-		case "/discharge":
-			s.handleManualDischargeCommand(ctx, fields[1:])
-		case "/auto":
-			s.handleAutoCommand(ctx)
+			statusRequested = true
+		case "/discharge", "/auto":
+			controlCommand = command
+			controlArgs = fields[1:]
 		}
+	}
+
+	switch controlCommand {
+	case "/discharge":
+		s.handleManualDischargeCommand(ctx, controlArgs)
+	case "/auto":
+		s.handleAutoCommand(ctx)
+	}
+	if statusRequested {
+		s.sendTelegramStatus(ctx)
 	}
 }
 
@@ -1573,8 +1600,8 @@ func (s *Service) handleManualDischargeCommand(ctx context.Context, args []strin
 		}
 		powerW = parsedPowerW
 	}
-	if powerW < manualDischargeMinPowerW || powerW > manualDischargeMaxPowerW {
-		s.sendTelegramCommandResponse(ctx, fmt.Sprintf("Discharge power must be between %d W and %d W.", manualDischargeMinPowerW, manualDischargeMaxPowerW))
+	if powerW < config.MinDischargePowerW || powerW > config.MaxDischargePowerW {
+		s.sendTelegramCommandResponse(ctx, fmt.Sprintf("Discharge power must be between %d W and %d W.", config.MinDischargePowerW, config.MaxDischargePowerW))
 		return
 	}
 
@@ -1584,21 +1611,14 @@ func (s *Service) handleManualDischargeCommand(ctx context.Context, args []strin
 		return
 	}
 	minSOC := int(s.cfg.BatteryMinSOC * 100)
-	if batStatus.SOC <= minSOC || !batStatus.DischargFlag {
-		s.sendTelegramCommandResponse(ctx, fmt.Sprintf("Manual discharge not started: battery SOC is %d%% (minimum %d%%).", batStatus.SOC, minSOC))
-		return
-	}
 
 	now := s.now()
 	s.mu.RLock()
-	currentPrice, priceAvailable := GetCurrentPrice(s.todayPrices, now)
+	currentPrice, _ := GetCurrentPrice(s.todayPrices, now)
 	s.mu.RUnlock()
-	if !priceAvailable {
-		s.sendTelegramCommandResponse(ctx, "Manual discharge not started: the current energy price is unavailable.")
-		return
-	}
 
 	s.mu.Lock()
+	stoppedPreviousOperation := false
 	switch s.state {
 	case StateManualDischarging:
 		s.mu.Unlock()
@@ -1610,23 +1630,62 @@ func (s *Service) handleManualDischargeCommand(ctx context.Context, args []strin
 		return
 	case StateCharging:
 		s.stopChargingLocked(ctx, batStatus.SOC)
+		stoppedPreviousOperation = true
 	case StateDischarging:
 		s.stopDischargingLocked(ctx, batStatus.SOC)
+		stoppedPreviousOperation = true
 	case StateSolarCharging:
 		s.stopSolarChargingLocked(ctx, batStatus.SOC, solarStopReasonYieldWindow)
+		stoppedPreviousOperation = true
 	}
 	if s.state != StateIdle {
 		s.mu.Unlock()
 		s.sendTelegramCommandResponse(ctx, "Manual discharge not started: the previous battery operation could not be stopped.")
 		return
 	}
+	if now.Before(s.batteryCooldownUntil) {
+		retryAt := s.batteryCooldownUntil.In(s.loc).Format("15:04 MST")
+		s.mu.Unlock()
+		s.sendTelegramCommandResponse(ctx, "Manual discharge not started: battery control is cooling down after a failure. Retry after "+retryAt+".")
+		return
+	}
+	if stoppedPreviousOperation {
+		s.mu.Unlock()
+		batStatus, err = s.battery.GetBatteryStatusContext(ctx)
+		s.mu.Lock()
+		if err != nil {
+			s.mu.Unlock()
+			s.sendTelegramCommandResponse(ctx, "Manual discharge not started: fresh battery status is unavailable after stopping the previous operation.")
+			return
+		}
+		if s.state != StateIdle {
+			s.mu.Unlock()
+			s.sendTelegramCommandResponse(ctx, "Manual discharge not started: battery state changed while status was refreshed.")
+			return
+		}
+	}
+	if batStatus.SOC <= minSOC {
+		s.mu.Unlock()
+		s.sendTelegramCommandResponse(ctx, fmt.Sprintf("Manual discharge not started: battery SOC is %d%% (minimum %d%%).", batStatus.SOC, minSOC))
+		return
+	}
+	if !batStatus.DischargFlag {
+		s.mu.Unlock()
+		s.sendTelegramCommandResponse(ctx, "Manual discharge not started: battery discharging is disabled.")
+		return
+	}
 
 	s.startDischargingLocked(ctx, currentPrice, batStatus.SOC, powerW, StateManualDischarging)
 	started := s.state == StateManualDischarging
+	stopPending := s.state == StateStopping
 	overrideUntil := s.manualOverrideUntil
 	s.mu.Unlock()
 	if !started {
-		s.sendTelegramCommandResponse(ctx, "Manual discharge failed to start. The battery was returned to idle.")
+		if stopPending {
+			s.sendTelegramCommandResponse(ctx, "Manual discharge failed to start, and the battery stop is not yet confirmed. The service will keep retrying.")
+		} else {
+			s.sendTelegramCommandResponse(ctx, "Manual discharge failed to start. The battery is idle.")
+		}
 		return
 	}
 
@@ -1634,12 +1693,34 @@ func (s *Service) handleManualDischargeCommand(ctx context.Context, args []strin
 		"Manual discharge active at <b>%d W</b>. Safety stop: %d%% SOC or %s. Send <code>/auto</code> to stop and restore automatic trading.",
 		powerW,
 		minSOC,
-		overrideUntil.Format("15:04"),
+		overrideUntil.In(s.loc).Format("15:04 MST"),
 	))
 }
 
 func (s *Service) handleAutoCommand(ctx context.Context) {
-	endSOC := 0
+	s.mu.Lock()
+	switch s.state {
+	case StateStopping:
+		s.transitionToIdleLocked(ctx, 0)
+		stopped := s.state == StateIdle
+		s.mu.Unlock()
+		if stopped {
+			s.sendTelegramCommandResponse(ctx, "Battery stop confirmed. Automatic trading and solar control are active again.")
+		} else {
+			s.sendTelegramCommandResponse(ctx, "Automatic control requested, but the battery stop is not yet confirmed. The service will keep retrying.")
+		}
+		return
+	case StateManualDischarging:
+		// Continue below after obtaining current SOC without holding the lock.
+	default:
+		s.mu.Unlock()
+		s.sendTelegramCommandResponse(ctx, "Automatic trading is already in control.")
+		return
+	}
+	fallbackSOC := s.currentTradeLastSOC
+	s.mu.Unlock()
+
+	endSOC := fallbackSOC
 	if batStatus, err := s.battery.GetBatteryStatusContext(ctx); err == nil {
 		endSOC = batStatus.SOC
 	}
@@ -1647,11 +1728,8 @@ func (s *Service) handleAutoCommand(ctx context.Context) {
 	s.mu.Lock()
 	if s.state != StateManualDischarging {
 		s.mu.Unlock()
-		s.sendTelegramCommandResponse(ctx, "Automatic trading is already in control.")
+		s.sendTelegramCommandResponse(ctx, "Automatic control was requested, but the battery state changed before the stop command.")
 		return
-	}
-	if endSOC == 0 {
-		endSOC = s.currentTradeSOC
 	}
 	s.stopDischargingLocked(ctx, endSOC)
 	stopped := s.state == StateIdle

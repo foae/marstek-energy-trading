@@ -8,6 +8,11 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+const (
+	MinDischargePowerW = 800
+	MaxDischargePowerW = 2500
+)
+
 // Config holds all configuration for the energy trader service.
 type Config struct {
 	// Service
@@ -81,6 +86,9 @@ func (c *Config) validate() error {
 	}
 	if c.SupplierFeeEURPerKWh.IsNegative() {
 		return fmt.Errorf("SUPPLIER_FEE_EUR_PER_KWH must be >= 0, got %s", c.SupplierFeeEURPerKWh)
+	}
+	if c.DischargePowerW < MinDischargePowerW || c.DischargePowerW > MaxDischargePowerW {
+		return fmt.Errorf("DISCHARGE_POWER_W must be between %d and %d, got %d", MinDischargePowerW, MaxDischargePowerW, c.DischargePowerW)
 	}
 	return nil
 }

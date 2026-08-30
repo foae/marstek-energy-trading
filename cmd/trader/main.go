@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -98,7 +99,15 @@ func main() {
 		slog.Info("HomeWizard P1 meter disabled (no URL configured)")
 	}
 
-	telegramClient := telegram.New(cfg.TelegramBotToken, cfg.TelegramChatID)
+	telegramClient, err := telegram.New(
+		cfg.TelegramBotToken,
+		cfg.TelegramChatID,
+		filepath.Join(cfg.DataDir, "telegram-update-offset"),
+	)
+	if err != nil {
+		slog.Error("failed to initialize Telegram client", "error", err)
+		os.Exit(1)
+	}
 
 	if telegramClient.Enabled() {
 		slog.Info("telegram notifications enabled")

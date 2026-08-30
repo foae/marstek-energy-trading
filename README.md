@@ -83,7 +83,7 @@ See `.env.example` for all options.
 
 ## Telegram Commands
 
-Commands are accepted only from `TELEGRAM_CHAT_ID`.
+Commands are accepted only from the configured private `TELEGRAM_CHAT_ID`; group chats are ignored for battery-control safety.
 
 | Command | Behavior |
 |---------|----------|
@@ -92,7 +92,7 @@ Commands are accepted only from `TELEGRAM_CHAT_ID`.
 | `/discharge 800` | Start manual discharge at a chosen power from 800-2500 W |
 | `/auto` | Stop the manual discharge and return control to automatic trading and solar charging |
 
-Manual discharge stops automatically at the configured minimum SOC, when battery telemetry is unavailable, or after two hours. Completed manual discharges are included in trade history and P&L.
+Manual discharge stops automatically at the configured minimum SOC, when the battery API cannot be read or refreshed, or after two hours. Completed manual discharges are included in trade history and P&L.
 
 ## HTTP Endpoints
 

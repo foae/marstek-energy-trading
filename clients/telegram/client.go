@@ -6,18 +6,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 )
 
 const (
-	sendMessageAPI = "https://api.telegram.org/bot%s/sendMessage"
-	getUpdatesAPI  = "https://api.telegram.org/bot%s/getUpdates"
+	sendMessageAPI       = "https://api.telegram.org/bot%s/sendMessage"
+	getUpdatesAPI        = "https://api.telegram.org/bot%s/getUpdates"
+	commandMaxAge        = 30 * time.Second
+	updateOffsetFileMode = 0o600
 )
 
 // Client is a Telegram bot client.
 type Client struct {
 	botToken     string
 	chatID       string
+	statePath    string
 	httpClient   *http.Client
 	enabled      bool
 	lastUpdateID int64
@@ -25,15 +32,31 @@ type Client struct {
 
 // New creates a new Telegram client.
 // If botToken or chatID is empty, the client will be disabled (no-op).
-func New(botToken, chatID string) *Client {
-	return &Client{
-		botToken: botToken,
-		chatID:   chatID,
+func New(botToken, chatID, statePath string) (*Client, error) {
+	c := &Client{
+		botToken:  botToken,
+		chatID:    chatID,
+		statePath: statePath,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
 		enabled: botToken != "" && chatID != "",
 	}
+	if !c.enabled {
+		return c, nil
+	}
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return c, nil
+		}
+		return nil, fmt.Errorf("read Telegram update offset: %w", err)
+	}
+	c.lastUpdateID, err = strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("parse Telegram update offset: %w", err)
+	}
+	return c, nil
 }
 
 // sendMessageRequest is the Telegram API request body.
@@ -97,10 +120,10 @@ func (c *Client) SendTradeStart(ctx context.Context, action string, priceEUR flo
 
 // SendTradeEnd sends a notification when a trade ends.
 func (c *Client) SendTradeEnd(ctx context.Context, action string, energyKWh float64, avgPriceEUR float64, endSOC int) error {
-	totalCost := energyKWh * avgPriceEUR
+	totalValue := energyKWh * avgPriceEUR
 	text := fmt.Sprintf(
-		"<b>%s completed</b>\nEnergy: %.2f kWh\nAvg price: %.4f EUR/kWh\nTotal cost: %.4f EUR\nSOC: %d%%",
-		action, energyKWh, avgPriceEUR, totalCost, endSOC,
+		"<b>%s completed</b>\nEnergy: %.2f kWh\nAvg price: %.4f EUR/kWh\nTotal value: %.4f EUR\nSOC: %d%%",
+		action, energyKWh, avgPriceEUR, totalValue, endSOC,
 	)
 	return c.SendMessage(ctx, text)
 }
@@ -278,13 +301,21 @@ type Update struct {
 
 // Message represents a Telegram message.
 type Message struct {
+	From User   `json:"from"`
 	Chat Chat   `json:"chat"`
 	Text string `json:"text"`
+	Date int64  `json:"date"`
+}
+
+// User represents a Telegram message sender.
+type User struct {
+	ID int64 `json:"id"`
 }
 
 // Chat represents a Telegram chat.
 type Chat struct {
-	ID int64 `json:"id"`
+	ID   int64  `json:"id"`
+	Type string `json:"type"`
 }
 
 // getUpdatesResponse is the Telegram API response for getUpdates.
@@ -377,7 +408,7 @@ func (c *Client) SendTradingPlan(ctx context.Context, data TradingPlanData) erro
 }
 
 // PollCommands checks for new commands and returns them.
-// Returns command strings (e.g., "/status") from the configured chat.
+// Commands are accepted only from the configured private chat.
 func (c *Client) PollCommands(ctx context.Context) ([]string, error) {
 	if !c.enabled {
 		return nil, nil
@@ -394,22 +425,61 @@ func (c *Client) PollCommands(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("get Telegram updates: status %d", resp.StatusCode)
+	}
 
 	var result getUpdatesResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
+	if !result.OK {
+		return nil, fmt.Errorf("Telegram getUpdates returned ok=false")
+	}
 
+	maxUpdateID := c.lastUpdateID
+	for _, update := range result.Result {
+		maxUpdateID = max(maxUpdateID, update.UpdateID)
+	}
+	if maxUpdateID > c.lastUpdateID {
+		if err := c.persistLastUpdateID(maxUpdateID); err != nil {
+			return nil, err
+		}
+		c.lastUpdateID = maxUpdateID
+	}
+
+	now := time.Now()
 	var commands []string
 	for _, update := range result.Result {
-		c.lastUpdateID = update.UpdateID
-		// Only process messages from configured chat
-		if fmt.Sprintf("%d", update.Message.Chat.ID) == c.chatID {
-			if len(update.Message.Text) > 0 && update.Message.Text[0] == '/' {
-				commands = append(commands, update.Message.Text)
-			}
+		message := update.Message
+		if fmt.Sprintf("%d", message.Chat.ID) != c.chatID ||
+			message.Chat.Type != "private" ||
+			message.From.ID != message.Chat.ID {
+			continue
+		}
+		sentAt := time.Unix(message.Date, 0)
+		if message.Date <= 0 || now.Sub(sentAt) > commandMaxAge {
+			continue
+		}
+		if strings.HasPrefix(message.Text, "/") {
+			commands = append(commands, message.Text)
 		}
 	}
 
 	return commands, nil
+}
+
+func (c *Client) persistLastUpdateID(updateID int64) error {
+	if err := os.MkdirAll(filepath.Dir(c.statePath), 0o755); err != nil {
+		return fmt.Errorf("create Telegram state directory: %w", err)
+	}
+	tmpPath := c.statePath + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(strconv.FormatInt(updateID, 10)+"\n"), updateOffsetFileMode); err != nil {
+		return fmt.Errorf("write Telegram update offset: %w", err)
+	}
+	if err := os.Rename(tmpPath, c.statePath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("persist Telegram update offset: %w", err)
+	}
+	return nil
 }

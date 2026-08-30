@@ -62,6 +62,7 @@ type MockBattery struct {
 	ChargeErr    error
 	DischargeErr error
 	IdleErr      error
+	PassiveErr   error
 	StatusCalls  int
 	ESCalls      int
 	PowerCalls   int
@@ -166,6 +167,9 @@ func (m *MockBattery) DischargeContext(_ context.Context, powerW int, timeoutS i
 func (m *MockBattery) SetPassiveModeContext(_ context.Context, power int, cdTime int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.PassiveErr != nil {
+		return m.PassiveErr
+	}
 	m.CurrentMode = "Passive"
 	m.CurrentPower = -power
 	return nil
@@ -2173,7 +2177,7 @@ func TestTelegramManualDischargeAndAuto(t *testing.T) {
 		t.Errorf("expected manual override in status, got state=%s next_action=%q", status.State, status.NextAction)
 	}
 
-	currentTime = currentTime.Add(10 * time.Minute)
+	currentTime = currentTime.Add(30 * time.Minute)
 	battery.SOC = 75
 	notifier.Commands = []string{"/auto"}
 	svc.handleTelegramCommands(context.Background())
@@ -2194,6 +2198,9 @@ func TestTelegramManualDischargeAndAuto(t *testing.T) {
 	trade := history.Days[0].Trades[0]
 	if trade.Action != ActionDischarge || trade.PowerW != cfg.DischargePowerW || trade.StartSOC != 80 || trade.EndSOC != 75 {
 		t.Errorf("unexpected recorded trade: %+v", trade)
+	}
+	if !trade.PriceEUR.Equal(decimal.RequireFromString("0.155")) {
+		t.Errorf("expected time-weighted average price 0.155, got %s", trade.PriceEUR)
 	}
 }
 
@@ -2273,6 +2280,10 @@ func TestManualDischargeStopsWhenTelemetryFails(t *testing.T) {
 	svc.telegram = notifier
 
 	svc.handleTelegramCommands(context.Background())
+	currentTime = currentTime.Add(time.Minute)
+	battery.SOC = 70
+	svc.tick(context.Background())
+
 	battery.GetStatusErr = errors.New("telemetry unavailable")
 	currentTime = currentTime.Add(time.Minute)
 	svc.tick(context.Background())
@@ -2285,5 +2296,141 @@ func TestManualDischargeStopsWhenTelemetryFails(t *testing.T) {
 	}
 	if len(notifier.ErrorCalls) == 0 {
 		t.Fatal("expected telemetry failure notification")
+	}
+	history := svc.recorder.GetHistory()
+	if len(history.Days) != 1 || len(history.Days[0].Trades) != 1 {
+		t.Fatalf("expected one recorded manual discharge, got %+v", history.Days)
+	}
+	trade := history.Days[0].Trades[0]
+	if trade.EndSOC != 70 || !trade.EnergyKWh.IsPositive() {
+		t.Errorf("expected last known SOC and non-zero energy, got %+v", trade)
+	}
+}
+
+func TestManualDischargeStopsWhenRefreshFails(t *testing.T) {
+	currentTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	prices := makePrices(currentTime, 0.15, 0.16, 0.17, 0.18)
+	cfg := testConfigSmallBattery()
+	battery := NewMockBattery(80)
+	notifier := &MockNotifier{Commands: []string{"/discharge"}}
+	svc := newTestService(cfg, battery, prices, currentTime)
+	svc.nowFunc = func() time.Time { return currentTime }
+	svc.telegram = notifier
+
+	svc.handleTelegramCommands(context.Background())
+	battery.PassiveErr = errors.New("refresh failed")
+	currentTime = currentTime.Add(time.Duration(cfg.PassiveModeTimeoutS) * time.Second)
+	svc.tick(context.Background())
+
+	if svc.state != StateIdle {
+		t.Fatalf("expected refresh failure to stop manual discharge, got %s", svc.state)
+	}
+	if battery.IdleCalls != 1 {
+		t.Errorf("expected one idle command after refresh failure, got %d", battery.IdleCalls)
+	}
+}
+
+func TestManualDischargeStopsAtRuntimeMinimumSOC(t *testing.T) {
+	currentTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	prices := makePrices(currentTime, 0.15, 0.16, 0.17, 0.18)
+	battery := NewMockBattery(80)
+	notifier := &MockNotifier{Commands: []string{"/discharge"}}
+	svc := newTestService(testConfigSmallBattery(), battery, prices, currentTime)
+	svc.nowFunc = func() time.Time { return currentTime }
+	svc.telegram = notifier
+
+	svc.handleTelegramCommands(context.Background())
+	battery.SOC = 11
+	currentTime = currentTime.Add(time.Minute)
+	svc.tick(context.Background())
+
+	if svc.state != StateIdle {
+		t.Fatalf("expected minimum SOC to stop manual discharge, got %s", svc.state)
+	}
+	if battery.IdleCalls != 1 {
+		t.Errorf("expected one idle command at minimum SOC, got %d", battery.IdleCalls)
+	}
+}
+
+func TestTelegramManualDischargeStartsWithoutCurrentPrice(t *testing.T) {
+	currentTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	battery := NewMockBattery(80)
+	notifier := &MockNotifier{Commands: []string{"/discharge"}}
+	svc := newTestService(testConfigSmallBattery(), battery, nil, currentTime)
+	svc.telegram = notifier
+
+	svc.handleTelegramCommands(context.Background())
+
+	if svc.state != StateManualDischarging {
+		t.Fatalf("expected manual discharge without price data, got %s", svc.state)
+	}
+	if len(battery.DischargeCalls) != 1 {
+		t.Fatalf("expected one discharge command, got %+v", battery.DischargeCalls)
+	}
+}
+
+func TestTelegramControlCommandBurstUsesLatestCommand(t *testing.T) {
+	currentTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	prices := makePrices(currentTime, 0.15, 0.16, 0.17, 0.18)
+	battery := NewMockBattery(80)
+	notifier := &MockNotifier{Commands: []string{"/discharge 800", "/auto", "/discharge 1500"}}
+	svc := newTestService(testConfigSmallBattery(), battery, prices, currentTime)
+	svc.telegram = notifier
+
+	svc.handleTelegramCommands(context.Background())
+
+	if svc.state != StateManualDischarging {
+		t.Fatalf("expected latest command to start manual discharge, got %s", svc.state)
+	}
+	if len(battery.DischargeCalls) != 1 || battery.DischargeCalls[0].PowerW != 1500 {
+		t.Fatalf("expected only the latest 1500 W command, got %+v", battery.DischargeCalls)
+	}
+	if battery.IdleCalls != 0 {
+		t.Fatalf("expected intermediate /auto to be collapsed, got %d idle calls", battery.IdleCalls)
+	}
+}
+
+func TestTelegramAutoReportsUnconfirmedStop(t *testing.T) {
+	currentTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	battery := NewMockBattery(80)
+	battery.IdleErr = errors.New("stop failed")
+	notifier := &MockNotifier{Commands: []string{"/auto"}}
+	svc := newTestService(testConfigSmallBattery(), battery, nil, currentTime)
+	svc.state = StateStopping
+	svc.telegram = notifier
+
+	svc.handleTelegramCommands(context.Background())
+
+	if svc.state != StateStopping {
+		t.Fatalf("expected failed stop to remain stopping, got %s", svc.state)
+	}
+	if len(notifier.Messages) != 1 || !strings.Contains(notifier.Messages[0], "not yet confirmed") {
+		t.Fatalf("expected unconfirmed-stop response, got %v", notifier.Messages)
+	}
+}
+
+func TestTelegramManualDischargeStopsPreviousOperationBeforeStarting(t *testing.T) {
+	currentTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	prices := makePrices(currentTime, 0.15, 0.16, 0.17, 0.18)
+	battery := NewMockBattery(80)
+	notifier := &MockNotifier{Commands: []string{"/discharge"}}
+	svc := newTestService(testConfigSmallBattery(), battery, prices, currentTime)
+	svc.state = StateCharging
+	svc.currentTradeStart = currentTime.Add(-time.Minute)
+	svc.currentTradeSOC = 79
+	svc.currentTradePrice = decimal.RequireFromString("0.15")
+	svc.currentTradePowerW = 2000
+	svc.telegram = notifier
+
+	svc.handleTelegramCommands(context.Background())
+
+	if svc.state != StateManualDischarging {
+		t.Fatalf("expected manual discharge after stopping scheduled charge, got %s", svc.state)
+	}
+	if battery.IdleCalls != 1 || len(battery.DischargeCalls) != 1 {
+		t.Fatalf("expected one stop then one discharge, idle=%d discharge=%+v", battery.IdleCalls, battery.DischargeCalls)
+	}
+	if battery.StatusCalls != 2 {
+		t.Fatalf("expected fresh status after stopping previous operation, got %d reads", battery.StatusCalls)
 	}
 }

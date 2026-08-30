@@ -122,7 +122,7 @@ func TestValidate_BatteryEfficiency(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := &Config{NordPoolCurrency: "EUR", BatteryEfficiency: tt.value, BatteryMinSOC: 0.11}
+			cfg := &Config{NordPoolCurrency: "EUR", BatteryEfficiency: tt.value, BatteryMinSOC: 0.11, DischargePowerW: 2500}
 			err := cfg.validate()
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validate() error = %v, wantErr %v", err, tt.wantErr)
@@ -147,7 +147,7 @@ func TestValidate_BatteryMinSOC(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := &Config{NordPoolCurrency: "EUR", BatteryEfficiency: 0.90, BatteryMinSOC: tt.value}
+			cfg := &Config{NordPoolCurrency: "EUR", BatteryEfficiency: 0.90, BatteryMinSOC: tt.value, DischargePowerW: 2500}
 			err := cfg.validate()
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validate() error = %v, wantErr %v", err, tt.wantErr)
@@ -157,7 +157,7 @@ func TestValidate_BatteryMinSOC(t *testing.T) {
 }
 
 func TestValidate_MinPriceSpread(t *testing.T) {
-	cfg := &Config{NordPoolCurrency: "EUR", BatteryEfficiency: 0.90, BatteryMinSOC: 0.11, MinPriceSpread: -0.01}
+	cfg := &Config{NordPoolCurrency: "EUR", BatteryEfficiency: 0.90, BatteryMinSOC: 0.11, MinPriceSpread: -0.01, DischargePowerW: 2500}
 	if err := cfg.validate(); err == nil {
 		t.Error("expected error for negative MinPriceSpread")
 	}
@@ -176,6 +176,7 @@ func TestValidate_AllInPricing(t *testing.T) {
 		EnergyTaxEURPerKWh:   decimal.RequireFromString("0.09161"),
 		VATRate:              decimal.RequireFromString("0.21"),
 		SupplierFeeEURPerKWh: decimal.RequireFromString("0.02"),
+		DischargePowerW:      2500,
 	}
 
 	tests := []struct {
@@ -225,6 +226,32 @@ func TestValidate_AllInPricing(t *testing.T) {
 				t.Fatal("validate() error = nil, want error")
 			}
 		})
+	}
+}
+
+func TestValidateDischargePower(t *testing.T) {
+	for _, powerW := range []int{MinDischargePowerW, 1500, MaxDischargePowerW} {
+		cfg := Config{
+			NordPoolCurrency:  "EUR",
+			BatteryEfficiency: 0.90,
+			BatteryMinSOC:     0.11,
+			DischargePowerW:   powerW,
+		}
+		if err := cfg.validate(); err != nil {
+			t.Errorf("DischargePowerW %d: unexpected error: %v", powerW, err)
+		}
+	}
+
+	for _, powerW := range []int{MinDischargePowerW - 1, MaxDischargePowerW + 1} {
+		cfg := Config{
+			NordPoolCurrency:  "EUR",
+			BatteryEfficiency: 0.90,
+			BatteryMinSOC:     0.11,
+			DischargePowerW:   powerW,
+		}
+		if err := cfg.validate(); err == nil {
+			t.Errorf("DischargePowerW %d: expected validation error", powerW)
+		}
 	}
 }
 

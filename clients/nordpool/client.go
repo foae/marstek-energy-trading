@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/shopspring/decimal"
 )
 
 const (
@@ -20,27 +22,44 @@ type Price struct {
 	Value float64 // EUR/kWh
 }
 
+// AllInPricing converts wholesale prices to the amount paid or received per kWh.
+type AllInPricing struct {
+	EnergyTaxEURPerKWh   decimal.Decimal
+	VATRate              decimal.Decimal
+	SupplierFeeEURPerKWh decimal.Decimal
+}
+
+// Apply returns (wholesale price + energy tax) including VAT, plus the supplier fee.
+func (p AllInPricing) Apply(wholesaleEURPerKWh decimal.Decimal) decimal.Decimal {
+	return wholesaleEURPerKWh.
+		Add(p.EnergyTaxEURPerKWh).
+		Mul(decimal.NewFromInt(1).Add(p.VATRate)).
+		Add(p.SupplierFeeEURPerKWh)
+}
+
 // Client is a NordPool API client.
 type Client struct {
 	httpClient *http.Client
 	area       string
 	currency   string
 	loc        *time.Location
+	pricing    AllInPricing
 }
 
 // New creates a new NordPool client.
-func New(area, currency string) *Client {
+func New(area, currency string, pricing AllInPricing) *Client {
 	return &Client{
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
 		area:     area,
 		currency: currency,
+		pricing:  pricing,
 	}
 }
 
 // NewWithLocation creates a new NordPool client with a specific timezone.
-func NewWithLocation(area, currency string, loc *time.Location) *Client {
+func NewWithLocation(area, currency string, loc *time.Location, pricing AllInPricing) *Client {
 	return &Client{
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
@@ -48,6 +67,7 @@ func NewWithLocation(area, currency string, loc *time.Location) *Client {
 		area:     area,
 		currency: currency,
 		loc:      loc,
+		pricing:  pricing,
 	}
 }
 
@@ -118,12 +138,12 @@ func (c *Client) FetchDayAheadPrices(ctx context.Context, date time.Time) ([]Pri
 			return nil, fmt.Errorf("no price for area %q at %s", c.area, entry.DeliveryStart)
 		}
 
-		// Convert from EUR/MWh to EUR/kWh
-		pricePerKWh := pricePerMWh / 1000.0
-
+		// Convert from EUR/MWh to EUR/kWh, then add the configured taxes and fee.
+		wholesalePrice := decimal.NewFromFloat(pricePerMWh).Div(decimal.NewFromInt(1000))
+		allInPrice, _ := c.pricing.Apply(wholesalePrice).Float64()
 		prices = append(prices, Price{
 			Time:  t,
-			Value: pricePerKWh,
+			Value: allInPrice,
 		})
 	}
 

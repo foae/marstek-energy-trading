@@ -173,3 +173,24 @@ func TestLoad_CustomValues(t *testing.T) {
 		t.Errorf("SolarMinSurplusW = %d, want 200", cfg.SolarMinSurplusW)
 	}
 }
+
+func TestLoad_AllInPricing(t *testing.T) {
+	t.Setenv("ENERGY_TAX_EUR_PER_KWH", "0.09161")
+	t.Setenv("VAT_RATE", "0.21")
+	t.Setenv("SUPPLIER_FEE_EUR_PER_KWH", "0.02")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if got := cfg.EnergyTaxEURPerKWh.String(); got != "0.09161" {
+		t.Errorf("EnergyTaxEURPerKWh = %s, want 0.09161", got)
+	}
+	if got := cfg.VATRate.String(); got != "0.21" {
+		t.Errorf("VATRate = %s, want 0.21", got)
+	}
+	if got := cfg.SupplierFeeEURPerKWh.String(); got != "0.02" {
+		t.Errorf("SupplierFeeEURPerKWh = %s, want 0.02", got)
+	}
+}

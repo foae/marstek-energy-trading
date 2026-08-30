@@ -329,6 +329,7 @@ func (m *MockTelegram) SendStartup(ctx context.Context, serviceName string) erro
 func (m *MockTelegram) SendTradeStart(ctx context.Context, a string, p float64, s int) error {
 	return nil
 }
+
 func (m *MockTelegram) SendTradeEnd(ctx context.Context, a string, e float64, p float64) error {
 	return nil
 }
@@ -360,7 +361,8 @@ func TestTick_ChargeInLowPriceWindow(t *testing.T) {
 	// Using small battery for shorter window sizes
 
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime,
+	prices := makePrices(
+		baseTime,
 		0.05, // slot 0 - charge window (low price)
 		0.15, // slot 1 - middle
 		0.25, // slot 2 - discharge window (high price)
@@ -555,7 +557,8 @@ func TestTick_DischargeInHighPriceWindow(t *testing.T) {
 	// Using small battery for shorter window sizes
 
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime,
+	prices := makePrices(
+		baseTime,
 		0.05, // slot 0 - charge window (low price)
 		0.15, // slot 1 - middle
 		0.25, // slot 2 - discharge window (high price)
@@ -586,7 +589,8 @@ func TestTick_NoActionOutsideWindows(t *testing.T) {
 	// Using small battery for 1-slot windows to clearly define window boundaries
 
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime,
+	prices := makePrices(
+		baseTime,
 		0.05, // slot 0 - charge window (lowest)
 		0.10, // slot 1 - middle (outside windows)
 		0.25, // slot 2 - discharge window (highest)
@@ -667,7 +671,8 @@ func TestTick_DischargeRegardlessOfProfitability(t *testing.T) {
 	// Using small battery so windows fit in 4 slots
 
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime,
+	prices := makePrices(
+		baseTime,
 		0.05, // slot 0 - charge window
 		0.15, // slot 1 - middle
 		0.25, // slot 2 - discharge window
@@ -700,7 +705,8 @@ func TestTick_StopChargingWhenWindowEnds(t *testing.T) {
 	// Expected: tick() should stop charging and return to idle
 
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime,
+	prices := makePrices(
+		baseTime,
 		0.05, 0.06, // Charge window - slots 0-1
 		0.15, 0.20, // Outside window
 	)
@@ -960,7 +966,8 @@ func TestTick_RecordsTrade(t *testing.T) {
 	// Use "today" as base time so GetTodaySummary matches
 	now := time.Now().UTC()
 	baseTime := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime,
+	prices := makePrices(
+		baseTime,
 		0.05, // slot 0 - charge window
 		0.15, // slot 1 - outside
 		0.25, // slot 2 - discharge window
@@ -1000,7 +1007,8 @@ func TestTick_FullChargeDischargeSequence(t *testing.T) {
 	// Using small battery config for faster window sizes (1 slot = 15 min per window)
 
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime,
+	prices := makePrices(
+		baseTime,
 		0.05, // Charge window slot 0 (00:00-00:15)
 		0.15, // Middle slot 1
 		0.25, // Discharge window slot 2 (00:30-00:45)
@@ -1308,7 +1316,8 @@ func TestSolarTick_YieldToDischargeWindow(t *testing.T) {
 	// Expected: tick() should stop solar charging and start discharging
 
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime,
+	prices := makePrices(
+		baseTime,
 		0.05, // slot 0 - charge window
 		0.15, // slot 1 - middle
 		0.25, // slot 2 - discharge window
@@ -1342,7 +1351,8 @@ func TestSolarTick_YieldToChargeWindow(t *testing.T) {
 	// Expected: tick() should stop solar charging and start scheduled charging
 
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime,
+	prices := makePrices(
+		baseTime,
 		0.05, // slot 0 - charge window
 		0.15, // slot 1 - middle
 		0.25, // slot 2 - discharge window
@@ -1404,7 +1414,8 @@ func TestSolarTick_NoStartDuringDischargeWindow(t *testing.T) {
 	// Expected: Should not start solar charging
 
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime,
+	prices := makePrices(
+		baseTime,
 		0.05, // slot 0 - charge window
 		0.15, // slot 1 - middle
 		0.25, // slot 2 - discharge window
@@ -1434,7 +1445,8 @@ func TestSolarTick_NoStartDuringChargeWindow(t *testing.T) {
 	// Expected: Should not start solar charging (let tick() handle scheduled charging)
 
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime,
+	prices := makePrices(
+		baseTime,
 		0.05, // slot 0 - charge window
 		0.15, // slot 1 - middle
 		0.25, // slot 2 - discharge window
@@ -1560,6 +1572,52 @@ func TestSolarTick_StopAtUpperSOC(t *testing.T) {
 	}
 	if mockBattery.IdleCalls != 1 {
 		t.Errorf("expected one idle command at solar upper SOC limit, got %d", mockBattery.IdleCalls)
+	}
+}
+
+func TestSolarTick_UpperSOCHoldRejectsTelemetryFlicker(t *testing.T) {
+	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	clockTime := baseTime
+	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
+	mockBattery := NewMockBattery(solarChargeUpperSOC)
+	mockBattery.CurrentPower = 500
+	meter := NewMockMeter(true, -500)
+	svc := newTestServiceWithMeter(testConfigSmallBattery(), mockBattery, meter, prices, clockTime)
+	svc.nowFunc = func() time.Time { return clockTime }
+	svc.state = StateSolarCharging
+	svc.currentTradeStart = baseTime.Add(-10 * time.Minute)
+	svc.currentTradeSOC = 95
+	svc.solarChargePower = 500
+	svc.solarMeasuredChargePowerW = 500
+	svc.solarLastUpdate = baseTime.Add(-time.Second)
+
+	ctx := context.Background()
+	svc.solarTick(ctx)
+	if svc.state != StateIdle {
+		t.Fatalf("state after upper-SOC stop = %s, want idle", svc.state)
+	}
+
+	clockTime = clockTime.Add(solarRestartCooldown + time.Second)
+	mockBattery.SOC = solarChargeUpperSOC - 1
+	for range solarStartQualificationCount + 1 {
+		svc.solarTick(ctx)
+	}
+	if svc.state != StateIdle {
+		t.Fatalf("state while SOC flickers to %d = %s, want idle", mockBattery.SOC, svc.state)
+	}
+	if len(mockBattery.ChargeCalls) != 0 {
+		t.Fatalf("charge calls while upper-SOC hold is active = %d, want 0", len(mockBattery.ChargeCalls))
+	}
+
+	mockBattery.SOC = solarChargeResumeSOC
+	for range solarStartQualificationCount {
+		svc.solarTick(ctx)
+	}
+	if svc.state != StateSolarCharging {
+		t.Fatalf("state after SOC falls to resume threshold = %s, want solar_charging", svc.state)
+	}
+	if len(mockBattery.ChargeCalls) != 1 {
+		t.Fatalf("charge calls after SOC falls to resume threshold = %d, want 1", len(mockBattery.ChargeCalls))
 	}
 }
 
@@ -2046,7 +2104,8 @@ func TestSolarTick_YieldsDirectlyToDischargeWindow(t *testing.T) {
 	// (not relying on tick() which runs every 60s)
 
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime,
+	prices := makePrices(
+		baseTime,
 		0.05, // slot 0 - charge window
 		0.15, // slot 1 - middle
 		0.25, // slot 2 - discharge window

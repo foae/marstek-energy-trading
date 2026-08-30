@@ -48,7 +48,8 @@ const (
 	solarShortSessionBackoffCount = 3                // consecutive short sessions that trigger long backoff
 	solarStartQualificationCount  = 10               // consecutive raw surplus readings before starting
 	solarMinChargePowerW          = 75               // floor clamp for charge power
-	solarChargeUpperSOC           = 99               // treat integer-reported 99% as full to prevent top-of-charge cycling
+	solarChargeUpperSOC           = 99               // stop solar charging when integer SOC reaches this limit
+	solarChargeResumeSOC          = 97               // re-arm only after SOC falls enough to reject 98/99 telemetry flicker
 	solarStopDebounceCount        = 10               // consecutive low readings before stop
 	solarEMAAlpha                 = 0.05             // EMA smoothing factor (~20s effective window)
 )
@@ -112,6 +113,7 @@ type Service struct {
 	solarSurplusEMA               float64   // exponentially weighted moving average of surplus
 	solarConsecutiveShortSessions int       // count of successive short sessions ended by surplus loss
 	solarStatusFailures           int       // consecutive telemetry failures during solar charging
+	solarUpperSOCHold             bool      // latch set near full until SOC falls to the resume threshold
 }
 
 // waitForBatteryPower confirms that the inverter acted on a successful control request.
@@ -540,6 +542,16 @@ func (s *Service) solarTick(ctx context.Context) {
 
 	switch s.state {
 	case StateIdle:
+		if batterySOC >= solarChargeUpperSOC {
+			s.solarUpperSOCHold = true
+		}
+		if s.solarUpperSOCHold {
+			if batterySOC > solarChargeResumeSOC {
+				s.solarSurplusCount = 0
+				return
+			}
+			s.solarUpperSOCHold = false
+		}
 		if s.now().Before(s.batteryCooldownUntil) {
 			s.solarSurplusCount = 0
 			return
@@ -569,12 +581,8 @@ func (s *Service) solarTick(ctx context.Context) {
 			}
 		}
 
-		// The battery reports integer SOC and repeatedly oscillates at 99% near
-		// full. Treat 99% as full for solar capture to avoid shallow cycling.
-		if batterySOC >= solarChargeUpperSOC {
-			s.solarSurplusCount = 0
-			return
-		}
+		// The upper-SOC latch above handles both the hard stop and telemetry
+		// flicker near full. Once cleared, SOC is below the resume threshold.
 
 		s.solarSurplusCount++
 		if s.solarSurplusCount >= solarStartQualificationCount {
@@ -604,6 +612,7 @@ func (s *Service) solarTick(ctx context.Context) {
 		// Stop at the solar upper SOC limit even during the minimum session
 		// duration. Continuing at 99% causes repeated shallow charge sessions.
 		if batterySOC >= solarChargeUpperSOC {
+			s.solarUpperSOCHold = true
 			slog.Info("solar charging: battery at upper SOC limit", "upper_soc", solarChargeUpperSOC)
 			s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonBatteryFull)
 			return
@@ -1229,7 +1238,8 @@ func (s *Service) checkPriceFetch(ctx context.Context) {
 			s.mu.Unlock()
 
 			l := slog.With("day", "today", "slots_total", slotsTotal)
-			l.Info("switched to new day's prices",
+			l.Info(
+				"switched to new day's prices",
 				"price_min_eur_kwh", plan.MinPrice,
 				"price_max_eur_kwh", plan.MaxPrice,
 			)
@@ -1275,7 +1285,8 @@ func (s *Service) fetchTodayPrices(ctx context.Context) error {
 		"slots_total", len(prices),
 		"slots_analyzed", len(futurePrices),
 	)
-	l.Info("fetched prices",
+	l.Info(
+		"fetched prices",
 		"price_min_eur_kwh", s.currentPlan.MinPrice,
 		"price_max_eur_kwh", s.currentPlan.MaxPrice,
 	)
@@ -1307,7 +1318,8 @@ func (s *Service) fetchTomorrowPrices(ctx context.Context) error {
 		"day", "tomorrow",
 		"slots_total", len(prices),
 	)
-	l.Info("fetched prices",
+	l.Info(
+		"fetched prices",
 		"price_min_eur_kwh", plan.MinPrice,
 		"price_max_eur_kwh", plan.MaxPrice,
 	)
@@ -1326,7 +1338,8 @@ func (s *Service) logAndNotifyTradingPlan(ctx context.Context, l *slog.Logger, p
 	minProfitableSpread := breakEvenDischarge.Sub(plan.MinPrice)
 
 	if !plan.IsProfitable {
-		l.Info("no profitable charge→discharge sequence found",
+		l.Info(
+			"no profitable charge→discharge sequence found",
 			"reason", "window-averaged prices don't meet spread/efficiency requirements",
 			"min_spread_for_efficiency", minProfitableSpread,
 			"min_spread_configured", s.cfg.MinPriceSpread,
@@ -1335,7 +1348,8 @@ func (s *Service) logAndNotifyTradingPlan(ctx context.Context, l *slog.Logger, p
 	} else {
 		// Log each profitable cycle
 		for i, c := range plan.Cycles {
-			l.Info("profitable cycle found",
+			l.Info(
+				"profitable cycle found",
 				"cycle", i+1,
 				"charge_start", c.ChargeWindow.Start.Format("15:04"),
 				"charge_end", c.ChargeWindow.End.Format("15:04"),

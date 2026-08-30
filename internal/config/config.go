@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/caarlos0/env/v11"
+	"github.com/shopspring/decimal"
 )
 
 // Config holds all configuration for the energy trader service.
@@ -16,9 +17,12 @@ type Config struct {
 	DataDir        string `env:"DATA_DIR" envDefault:"./data"`
 	TZ             string `env:"TZ" envDefault:"Europe/Amsterdam"`
 
-	// NordPool
-	NordPoolArea     string `env:"NORDPOOL_AREA" envDefault:"NL"`
-	NordPoolCurrency string `env:"NORDPOOL_CURRENCY" envDefault:"EUR"`
+	// NordPool and all-in price components
+	NordPoolArea         string          `env:"NORDPOOL_AREA" envDefault:"NL"`
+	NordPoolCurrency     string          `env:"NORDPOOL_CURRENCY" envDefault:"EUR"`
+	EnergyTaxEURPerKWh   decimal.Decimal `env:"ENERGY_TAX_EUR_PER_KWH" envDefault:"0.09161"`
+	VATRate              decimal.Decimal `env:"VAT_RATE" envDefault:"0.21"`
+	SupplierFeeEURPerKWh decimal.Decimal `env:"SUPPLIER_FEE_EUR_PER_KWH" envDefault:"0.02"`
 
 	// Trading
 	MinPriceSpread     float64 `env:"MIN_PRICE_SPREAD" envDefault:"0.05"`
@@ -35,8 +39,8 @@ type Config struct {
 	PassiveModeTimeoutS int    `env:"PASSIVE_MODE_TIMEOUT_S" envDefault:"300"`
 
 	// HomeWizard P1 meter (optional)
-	HomeWizardP1URL string `env:"HOMEWIZARD_P1_URL"`              // Empty = disabled
-	SolarMinSurplusW int   `env:"SOLAR_MIN_SURPLUS_W" envDefault:"100"` // Min surplus watts to start solar charging
+	HomeWizardP1URL  string `env:"HOMEWIZARD_P1_URL"`                    // Empty = disabled
+	SolarMinSurplusW int    `env:"SOLAR_MIN_SURPLUS_W" envDefault:"100"` // Min surplus watts to start solar charging
 
 	// Telegram (optional)
 	TelegramBotToken string `env:"TELEGRAM_BOT_TOKEN"`
@@ -65,6 +69,15 @@ func (c *Config) validate() error {
 	}
 	if c.MinPriceSpread < 0 {
 		return fmt.Errorf("MIN_PRICE_SPREAD must be >= 0, got %f", c.MinPriceSpread)
+	}
+	if c.EnergyTaxEURPerKWh.IsNegative() {
+		return fmt.Errorf("ENERGY_TAX_EUR_PER_KWH must be >= 0, got %s", c.EnergyTaxEURPerKWh)
+	}
+	if c.VATRate.IsNegative() || c.VATRate.GreaterThan(decimal.NewFromInt(1)) {
+		return fmt.Errorf("VAT_RATE must be in [0.0, 1.0], got %s", c.VATRate)
+	}
+	if c.SupplierFeeEURPerKWh.IsNegative() {
+		return fmt.Errorf("SUPPLIER_FEE_EUR_PER_KWH must be >= 0, got %s", c.SupplierFeeEURPerKWh)
 	}
 	return nil
 }

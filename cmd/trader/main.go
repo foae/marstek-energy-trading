@@ -45,16 +45,29 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
 	slog.SetDefault(logger)
 
-	slog.Info("starting energy trader",
+	slog.Info(
+		"starting energy trader",
 		"service", cfg.ServiceName,
 		"listen_addr", cfg.HTTPListenAddr,
 		"nordpool_area", cfg.NordPoolArea,
 		"min_spread", cfg.MinPriceSpread,
 		"efficiency", cfg.BatteryEfficiency,
+		"energy_tax_eur_kwh", cfg.EnergyTaxEURPerKWh,
+		"vat_rate", cfg.VATRate,
+		"supplier_fee_eur_kwh", cfg.SupplierFeeEURPerKWh,
 	)
 
-	// Initialize clients with configured timezone
-	nordpoolClient := nordpool.NewWithLocation(cfg.NordPoolArea, cfg.NordPoolCurrency, cfg.Location())
+	// Initialize clients with configured timezone and all-in pricing.
+	nordpoolClient := nordpool.NewWithLocation(
+		cfg.NordPoolArea,
+		cfg.NordPoolCurrency,
+		cfg.Location(),
+		nordpool.AllInPricing{
+			EnergyTaxEURPerKWh:   cfg.EnergyTaxEURPerKWh,
+			VATRate:              cfg.VATRate,
+			SupplierFeeEURPerKWh: cfg.SupplierFeeEURPerKWh,
+		},
+	)
 	minSOC := int(cfg.BatteryMinSOC * 100)
 	esphomeClient := esphome.New(cfg.ESPHomeURL, minSOC)
 	defer esphomeClient.Close()
@@ -65,7 +78,8 @@ func main() {
 			slog.Info("HomeWizard P1 not discovered, meter disabled", "error", err)
 		} else {
 			p1URL = discovered.URL
-			slog.Info("HomeWizard P1 auto-discovered",
+			slog.Info(
+				"HomeWizard P1 auto-discovered",
 				"url", p1URL,
 				"serial", discovered.Serial,
 				"hostname", discovered.Hostname,

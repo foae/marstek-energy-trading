@@ -239,7 +239,7 @@ func (c *Client) SendStatus(ctx context.Context, data StatusData) error {
 		stateEmoji = "🔋"
 	case "solar_charging":
 		stateEmoji = "☀️"
-	case "discharging":
+	case "discharging", "manual_discharging":
 		stateEmoji = "⚡"
 	}
 	batterySOC := "unavailable"

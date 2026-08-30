@@ -81,6 +81,19 @@ Copy `.env.example` to `.env`. Key settings:
 
 See `.env.example` for all options.
 
+## Telegram Commands
+
+Commands are accepted only from `TELEGRAM_CHAT_ID`.
+
+| Command | Behavior |
+|---------|----------|
+| `/status` | Show battery, price, trading state, and next action |
+| `/discharge` | Start manual discharge at `DISCHARGE_POWER_W` |
+| `/discharge 800` | Start manual discharge at a chosen power from 800-2500 W |
+| `/auto` | Stop the manual discharge and return control to automatic trading and solar charging |
+
+Manual discharge stops automatically at the configured minimum SOC, when battery telemetry is unavailable, or after two hours. Completed manual discharges are included in trade history and P&L.
+
 ## HTTP Endpoints
 
 | Endpoint | Description |

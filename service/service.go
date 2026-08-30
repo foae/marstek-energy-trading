@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,11 +22,12 @@ import (
 type State string
 
 const (
-	StateIdle          State = "idle"
-	StateCharging      State = "charging"
-	StateDischarging   State = "discharging"
-	StateSolarCharging State = "solar_charging"
-	StateStopping      State = "stopping"
+	StateIdle              State = "idle"
+	StateCharging          State = "charging"
+	StateDischarging       State = "discharging"
+	StateManualDischarging State = "manual_discharging"
+	StateSolarCharging     State = "solar_charging"
+	StateStopping          State = "stopping"
 )
 
 // solarStopReason classifies why a solar charge session ended. Used to decide
@@ -71,13 +74,19 @@ const (
 	solarStatusFallbackTimeout       = 3 * time.Second
 )
 
+const (
+	manualDischargeMinPowerW  = 800
+	manualDischargeMaxPowerW  = 2500
+	manualOverrideMaxDuration = 2 * time.Hour
+)
+
 // Service is the main trading engine.
 type Service struct {
 	cfg      *config.Config
 	nordpool PriceProvider
 	battery  BatteryController
 	meter    MeterReader
-	telegram *telegram.Client
+	telegram Notifier
 	recorder *Recorder
 	loc      *time.Location   // timezone location
 	nowFunc  func() time.Time // clock function for testing
@@ -92,15 +101,17 @@ type Service struct {
 	currentTradePrice           decimal.Decimal
 	currentTradeSOC             int
 	lastChargePrice             decimal.Decimal // track last charge price for profitability check
-	lastErrorNotify             time.Time       // rate limit error notifications
-	lastMidnightSwap            time.Time       // track last midnight price swap to avoid repeated fetches
-	lastDailySummary            time.Time       // track last daily summary to avoid duplicates on restart
-	batteryCooldownUntil        time.Time       // suppress command retries after the battery ignores a command
-	batteryVerificationTimeout  time.Duration   // test override for battery start verification timeout
-	batteryVerificationInterval time.Duration   // test override for battery start verification polling
-	batteryStopRetryDelay       time.Duration   // test override for failed-stop retry delay
-	lastStopAttempt             time.Time       // throttle retries when a stop command fails
-	lastStopLinkDown            bool            // last stop failure was a dead RS485 link; back off harder
+	currentTradePowerW          int
+	manualOverrideUntil         time.Time
+	lastErrorNotify             time.Time     // rate limit error notifications
+	lastMidnightSwap            time.Time     // track last midnight price swap to avoid repeated fetches
+	lastDailySummary            time.Time     // track last daily summary to avoid duplicates on restart
+	batteryCooldownUntil        time.Time     // suppress command retries after the battery ignores a command
+	batteryVerificationTimeout  time.Duration // test override for battery start verification timeout
+	batteryVerificationInterval time.Duration // test override for battery start verification polling
+	batteryStopRetryDelay       time.Duration // test override for failed-stop retry delay
+	lastStopAttempt             time.Time     // throttle retries when a stop command fails
+	lastStopLinkDown            bool          // last stop failure was a dead RS485 link; back off harder
 
 	// Solar charging state
 	solarSurplusCount             int       // consecutive surplus readings above threshold
@@ -167,7 +178,7 @@ func New(
 	nordpoolClient PriceProvider,
 	batteryClient BatteryController,
 	meterClient MeterReader,
-	telegramClient *telegram.Client,
+	telegramClient Notifier,
 	recorder *Recorder,
 ) *Service {
 	return &Service{
@@ -369,6 +380,12 @@ func (s *Service) tick(ctx context.Context) {
 	// Get battery status OUTSIDE lock (network I/O)
 	batStatus, err := s.battery.GetBatteryStatusContext(ctx)
 	if err != nil {
+		s.mu.Lock()
+		if s.state == StateManualDischarging {
+			slog.Error("manual discharge telemetry failed; stopping override", "error", err)
+			s.stopDischargingLocked(ctx, s.currentTradeSOC)
+		}
+		s.mu.Unlock()
 		slog.Error("failed to get battery status", "error", err)
 		s.notifyError(ctx, "Battery unreachable: "+err.Error())
 		return
@@ -386,6 +403,24 @@ func (s *Service) tick(ctx context.Context) {
 	)
 
 	l.Debug("tick", "charging_enabled", batStatus.ChargingFlag, "discharging_enabled", batStatus.DischargFlag)
+
+	if s.state == StateManualDischarging {
+		minSOC := int(s.cfg.BatteryMinSOC * 100)
+		switch {
+		case batStatus.SOC <= minSOC:
+			l.Info("stopping manual discharge - battery at min SOC", "min_soc", minSOC)
+			s.stopDischargingLocked(ctx, batStatus.SOC)
+		case !batStatus.DischargFlag:
+			l.Warn("stopping manual discharge - battery discharging disabled")
+			s.stopDischargingLocked(ctx, batStatus.SOC)
+		case !now.Before(s.manualOverrideUntil):
+			l.Info("stopping manual discharge - safety timeout reached")
+			s.stopDischargingLocked(ctx, batStatus.SOC)
+		default:
+			s.refreshPassiveModeLocked(ctx, s.currentTradePowerW)
+		}
+		return
+	}
 	// Check if we have a valid trading plan
 	if s.currentPlan == nil || !s.currentPlan.ShouldTrade() {
 		switch s.state {
@@ -446,7 +481,7 @@ func (s *Service) tick(ctx context.Context) {
 					"last_charge_price", lastChargeF,
 					"max_price", s.currentPlan.MaxPrice,
 					"discharge_threshold", s.currentPlan.MaxPrice.Sub(s.currentPlan.Spread.Mul(decimal.NewFromFloat(0.25))))
-				s.startDischargingLocked(ctx, currentPrice, batStatus.SOC)
+				s.startDischargingLocked(ctx, currentPrice, batStatus.SOC, s.cfg.DischargePowerW, StateDischarging)
 			}
 		}
 
@@ -469,7 +504,7 @@ func (s *Service) tick(ctx context.Context) {
 				return
 			}
 			if batStatus.SOC > minSOC && batStatus.DischargFlag {
-				s.startDischargingLocked(ctx, currentPrice, batStatus.SOC)
+				s.startDischargingLocked(ctx, currentPrice, batStatus.SOC, s.cfg.DischargePowerW, StateDischarging)
 			}
 		}
 
@@ -999,20 +1034,20 @@ func (s *Service) stopChargingLocked(ctx context.Context, endSOC int) {
 	s.mu.Lock()
 }
 
-// startDischargingLocked begins a discharge session. Caller must hold s.mu.
-func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Decimal, soc int) {
+// startDischargingLocked begins a scheduled or manual discharge session. Caller must hold s.mu.
+func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Decimal, soc, powerW int, targetState State) {
 	priceF, _ := price.Float64()
 	lastChargeF, _ := s.lastChargePrice.Float64()
-	l := slog.With("action", "discharge", "price_eur_kwh", priceF, "soc", soc, "power_w", s.cfg.DischargePowerW, "last_charge_price", lastChargeF)
+	l := slog.With("action", "discharge", "price_eur_kwh", priceF, "soc", soc, "power_w", powerW, "last_charge_price", lastChargeF, "target_state", targetState)
 	l.Info("starting discharge session")
 
 	// Release lock during network I/O
 	s.mu.Unlock()
-	err := s.battery.DischargeContext(ctx, s.cfg.DischargePowerW, s.cfg.PassiveModeTimeoutS)
+	err := s.battery.DischargeContext(ctx, powerW, s.cfg.PassiveModeTimeoutS)
 	var measuredPowerW float64
 	var idleErr error
 	if err == nil {
-		measuredPowerW, err = s.waitForBatteryPower(ctx, false, s.cfg.DischargePowerW)
+		measuredPowerW, err = s.waitForBatteryPower(ctx, false, powerW)
 	}
 	if err != nil {
 		if idleErr = s.idleBattery(ctx); idleErr != nil {
@@ -1035,19 +1070,29 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 		return
 	}
 
-	s.state = StateDischarging
+	s.state = targetState
 	s.currentTradeStart = s.now()
 	s.currentTradePrice = price
 	s.currentTradeSOC = soc
+	s.currentTradePowerW = powerW
 	s.lastPassiveRefresh = s.now()
 	s.batteryCooldownUntil = time.Time{}
+	if targetState == StateManualDischarging {
+		s.manualOverrideUntil = s.now().Add(manualOverrideMaxDuration)
+	} else {
+		s.manualOverrideUntil = time.Time{}
+	}
 
 	l.Info("discharge session started", "state", s.state, "measured_battery_power_w", measuredPowerW)
 
+	notificationAction := "Discharging"
+	if targetState == StateManualDischarging {
+		notificationAction = "Manual discharging"
+	}
 	// Release lock for notification
 	s.mu.Unlock()
 	if s.telegramEnabled() {
-		if err := s.telegram.SendTradeStart(ctx, "Discharging", priceF, soc); err != nil {
+		if err := s.telegram.SendTradeStart(ctx, notificationAction, priceF, soc); err != nil {
 			l.Warn("failed to send trade notification", "error", err)
 		}
 	}
@@ -1057,6 +1102,8 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 // stopDischargingLocked ends a discharge session and records the trade. Caller must hold s.mu.
 func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 	stopTime := s.now()
+	previousState := s.state
+	tradePowerW := s.currentTradePowerW
 	if !s.transitionToIdleLocked(ctx, endSOC) {
 		return
 	}
@@ -1083,7 +1130,7 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 		Timestamp: s.currentTradeStart,
 		Action:    ActionDischarge,
 		PriceEUR:  s.currentTradePrice,
-		PowerW:    s.cfg.DischargePowerW,
+		PowerW:    tradePowerW,
 		DurationS: int(duration.Seconds()),
 		EnergyKWh: energyKWh,
 		StartSOC:  s.currentTradeSOC,
@@ -1097,9 +1144,15 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 	}
 	s.mu.Lock()
 
+	notificationAction := "Discharging"
+	if previousState == StateManualDischarging {
+		notificationAction = "Manual discharging"
+	}
+	s.manualOverrideUntil = time.Time{}
+	s.currentTradePowerW = 0
 	s.mu.Unlock()
 	if s.telegramEnabled() {
-		if err := s.telegram.SendTradeEnd(ctx, "Discharging", energyF, priceF, endSOC); err != nil {
+		if err := s.telegram.SendTradeEnd(ctx, notificationAction, energyF, priceF, endSOC); err != nil {
 			l.Warn("failed to send trade notification", "error", err)
 		}
 	}
@@ -1489,11 +1542,134 @@ func (s *Service) handleTelegramCommands(ctx context.Context) {
 		return
 	}
 
-	for _, cmd := range commands {
-		switch cmd {
+	for _, rawCommand := range commands {
+		fields := strings.Fields(rawCommand)
+		if len(fields) == 0 {
+			continue
+		}
+		command := strings.ToLower(strings.SplitN(fields[0], "@", 2)[0])
+		switch command {
 		case "/status":
 			s.sendTelegramStatus(ctx)
+		case "/discharge":
+			s.handleManualDischargeCommand(ctx, fields[1:])
+		case "/auto":
+			s.handleAutoCommand(ctx)
 		}
+	}
+}
+
+func (s *Service) handleManualDischargeCommand(ctx context.Context, args []string) {
+	powerW := s.cfg.DischargePowerW
+	if len(args) > 1 {
+		s.sendTelegramCommandResponse(ctx, "Usage: <code>/discharge [watts]</code>")
+		return
+	}
+	if len(args) == 1 {
+		parsedPowerW, err := strconv.Atoi(args[0])
+		if err != nil {
+			s.sendTelegramCommandResponse(ctx, "Discharge power must be a whole number of watts.")
+			return
+		}
+		powerW = parsedPowerW
+	}
+	if powerW < manualDischargeMinPowerW || powerW > manualDischargeMaxPowerW {
+		s.sendTelegramCommandResponse(ctx, fmt.Sprintf("Discharge power must be between %d W and %d W.", manualDischargeMinPowerW, manualDischargeMaxPowerW))
+		return
+	}
+
+	batStatus, err := s.battery.GetBatteryStatusContext(ctx)
+	if err != nil {
+		s.sendTelegramCommandResponse(ctx, "Manual discharge not started: battery status is unavailable.")
+		return
+	}
+	minSOC := int(s.cfg.BatteryMinSOC * 100)
+	if batStatus.SOC <= minSOC || !batStatus.DischargFlag {
+		s.sendTelegramCommandResponse(ctx, fmt.Sprintf("Manual discharge not started: battery SOC is %d%% (minimum %d%%).", batStatus.SOC, minSOC))
+		return
+	}
+
+	now := s.now()
+	s.mu.RLock()
+	currentPrice, priceAvailable := GetCurrentPrice(s.todayPrices, now)
+	s.mu.RUnlock()
+	if !priceAvailable {
+		s.sendTelegramCommandResponse(ctx, "Manual discharge not started: the current energy price is unavailable.")
+		return
+	}
+
+	s.mu.Lock()
+	switch s.state {
+	case StateManualDischarging:
+		s.mu.Unlock()
+		s.sendTelegramCommandResponse(ctx, "Manual discharge is already active. Send <code>/auto</code> first.")
+		return
+	case StateStopping:
+		s.mu.Unlock()
+		s.sendTelegramCommandResponse(ctx, "Manual discharge not started: the battery is still stopping. Try again after <code>/status</code> shows idle.")
+		return
+	case StateCharging:
+		s.stopChargingLocked(ctx, batStatus.SOC)
+	case StateDischarging:
+		s.stopDischargingLocked(ctx, batStatus.SOC)
+	case StateSolarCharging:
+		s.stopSolarChargingLocked(ctx, batStatus.SOC, solarStopReasonYieldWindow)
+	}
+	if s.state != StateIdle {
+		s.mu.Unlock()
+		s.sendTelegramCommandResponse(ctx, "Manual discharge not started: the previous battery operation could not be stopped.")
+		return
+	}
+
+	s.startDischargingLocked(ctx, currentPrice, batStatus.SOC, powerW, StateManualDischarging)
+	started := s.state == StateManualDischarging
+	overrideUntil := s.manualOverrideUntil
+	s.mu.Unlock()
+	if !started {
+		s.sendTelegramCommandResponse(ctx, "Manual discharge failed to start. The battery was returned to idle.")
+		return
+	}
+
+	s.sendTelegramCommandResponse(ctx, fmt.Sprintf(
+		"Manual discharge active at <b>%d W</b>. Safety stop: %d%% SOC or %s. Send <code>/auto</code> to stop and restore automatic trading.",
+		powerW,
+		minSOC,
+		overrideUntil.Format("15:04"),
+	))
+}
+
+func (s *Service) handleAutoCommand(ctx context.Context) {
+	endSOC := 0
+	if batStatus, err := s.battery.GetBatteryStatusContext(ctx); err == nil {
+		endSOC = batStatus.SOC
+	}
+
+	s.mu.Lock()
+	if s.state != StateManualDischarging {
+		s.mu.Unlock()
+		s.sendTelegramCommandResponse(ctx, "Automatic trading is already in control.")
+		return
+	}
+	if endSOC == 0 {
+		endSOC = s.currentTradeSOC
+	}
+	s.stopDischargingLocked(ctx, endSOC)
+	stopped := s.state == StateIdle
+	if !stopped {
+		s.manualOverrideUntil = s.now()
+	}
+	s.mu.Unlock()
+
+	if !stopped {
+		s.sendTelegramCommandResponse(ctx, "Automatic control requested, but the battery stop is not yet confirmed. The service will keep retrying.")
+		return
+	}
+	s.sendTelegramCommandResponse(ctx, "Manual discharge stopped. Automatic trading and solar control are active again.")
+}
+
+func (s *Service) sendTelegramCommandResponse(ctx context.Context, message string) {
+	if err := s.telegram.SendMessage(ctx, message); err != nil {
+		slog.Warn("failed to send Telegram command response", "error", err)
 	}
 }
 
@@ -1579,7 +1755,12 @@ func (s *Service) GetCurrentStatus(ctx context.Context) CurrentStatus {
 	}
 
 	// Determine next action
-	if s.currentPlan != nil && s.currentPlan.IsProfitable {
+	if s.state == StateManualDischarging {
+		status.NextAction = fmt.Sprintf(
+			"manual override until %s; /auto to resume",
+			s.manualOverrideUntil.In(s.loc).Format("15:04"),
+		)
+	} else if s.currentPlan != nil && s.currentPlan.IsProfitable {
 		if s.currentPlan.IsInChargeWindow(now) {
 			status.NextAction = "in charge window"
 		} else if s.currentPlan.IsInDischargeWindow(now) {

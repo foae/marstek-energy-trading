@@ -5,6 +5,7 @@ import (
 
 	"github.com/foae/marstek-energy-trading/clients/marstek"
 	"github.com/foae/marstek-energy-trading/clients/nordpool"
+	"github.com/foae/marstek-energy-trading/clients/telegram"
 )
 
 // PriceProvider fetches energy prices.
@@ -33,12 +34,16 @@ type MeterReader interface {
 	GetActivePowerW() (float64, error)
 }
 
-// Notifier sends notifications.
+// Notifier sends notifications and receives commands.
 type Notifier interface {
 	Enabled() bool
+	SendMessage(ctx context.Context, text string) error
 	SendStartup(ctx context.Context, serviceName string) error
 	SendTradeStart(ctx context.Context, action string, price float64, soc int) error
-	SendTradeEnd(ctx context.Context, action string, energyKWh float64, avgPrice float64) error
+	SendTradeEnd(ctx context.Context, action string, energyKWh float64, avgPrice float64, endSOC int) error
 	SendError(ctx context.Context, msg string) error
+	SendStatus(ctx context.Context, data telegram.StatusData) error
+	SendTradingPlan(ctx context.Context, data telegram.TradingPlanData) error
+	SendDailySummaryFull(ctx context.Context, data telegram.DailySummaryData) error
 	PollCommands(ctx context.Context) ([]string, error)
 }

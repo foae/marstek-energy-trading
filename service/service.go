@@ -69,9 +69,13 @@ const (
 	// A dead RS485 link fails the stop command instantly, so the normal 5s retry
 	// would spin. Writes are provably dropped, so nothing is running to stop.
 	batteryLinkDownStopRetryInterval = 5 * time.Minute
-	statusBatteryTimeout             = 5 * time.Second
-	solarStatusFailureThreshold      = 10
-	solarStatusFallbackTimeout       = 3 * time.Second
+	// A wedged RS485 link only recovers with an ESP32 reboot; don't reboot in a loop.
+	bridgeRestartMinInterval    = 10 * time.Minute
+	bridgeRebootGrace           = time.Minute // ESP32 is unreachable for ~30 s after a restart
+	linkDownNotifyInterval      = 15 * time.Minute
+	statusBatteryTimeout        = 5 * time.Second
+	solarStatusFailureThreshold = 10
+	solarStatusFallbackTimeout  = 3 * time.Second
 )
 
 const manualOverrideMaxDuration = 2 * time.Hour
@@ -109,6 +113,9 @@ type Service struct {
 	batteryStopRetryDelay       time.Duration // test override for failed-stop retry delay
 	lastStopAttempt             time.Time     // throttle retries when a stop command fails
 	lastStopLinkDown            bool          // last stop failure was a dead RS485 link; back off harder
+	linkDownSince               time.Time     // first detection of a frozen RS485 link during an active session
+	lastLinkDownNotify          time.Time     // rate limit link-down notifications (own limiter)
+	lastBridgeRestart           time.Time     // rate limit ESPHome bridge restarts
 
 	// Solar charging state
 	solarSurplusCount             int       // consecutive surplus readings above threshold
@@ -386,6 +393,16 @@ func (s *Service) tick(ctx context.Context) {
 		slog.Error("failed to get battery status", "error", err)
 		s.notifyError(ctx, "Battery unreachable: "+err.Error())
 		return
+	}
+
+	// Telemetry can look healthy while the RS485 link is frozen: check staleness
+	// during active sessions, unlocked (network I/O).
+	s.mu.RLock()
+	activeSession := s.state == StateCharging || s.state == StateDischarging ||
+		s.state == StateManualDischarging || s.state == StateSolarCharging
+	s.mu.RUnlock()
+	if activeSession {
+		s.checkLinkDuringSession(ctx)
 	}
 
 	// Now lock for state access and updates
@@ -954,8 +971,14 @@ func (s *Service) startChargingLocked(ctx context.Context, price decimal.Decimal
 		l.Error("failed to start charging", "error", err, "link_down", errors.Is(err, marstek.ErrLinkDown))
 		s.batteryCooldownUntil = s.now().Add(batteryFailureCooldown(err))
 		errMsg := batteryFailureMessage("Failed to start charging", err)
+		linkDown := errors.Is(err, marstek.ErrLinkDown)
 		s.mu.Unlock()
-		s.notifyError(ctx, errMsg)
+		if linkDown {
+			s.notifyLinkDown(ctx, errMsg)
+			s.tryRestartBridge(ctx)
+		} else {
+			s.notifyError(ctx, errMsg)
+		}
 		s.mu.Lock()
 		return
 	}
@@ -1071,8 +1094,14 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 		l.Error("failed to start discharging", "error", err, "link_down", errors.Is(err, marstek.ErrLinkDown))
 		s.batteryCooldownUntil = s.now().Add(batteryFailureCooldown(err))
 		errMsg := batteryFailureMessage("Failed to start discharging", err)
+		linkDown := errors.Is(err, marstek.ErrLinkDown)
 		s.mu.Unlock()
-		s.notifyError(ctx, errMsg)
+		if linkDown {
+			s.notifyLinkDown(ctx, errMsg)
+			s.tryRestartBridge(ctx)
+		} else {
+			s.notifyError(ctx, errMsg)
+		}
 		s.mu.Lock()
 		return
 	}
@@ -1186,7 +1215,13 @@ func (s *Service) transitionToIdleLocked(ctx context.Context, soc int) bool {
 		s.lastStopLinkDown = linkDown
 		slog.Error("failed to set idle mode; retaining active state for retry", "state", s.state, "error", err, "link_down", linkDown)
 		s.mu.Unlock()
-		s.notifyError(ctx, batteryFailureMessage("Battery stop failed; forced operation may still be active", err))
+		stopMsg := batteryFailureMessage("Battery stop failed; forced operation may still be active", err)
+		if linkDown {
+			s.notifyLinkDown(ctx, stopMsg)
+			s.tryRestartBridge(ctx)
+		} else {
+			s.notifyError(ctx, stopMsg)
+		}
 		s.mu.Lock()
 		return false
 	}
@@ -1204,6 +1239,11 @@ func (s *Service) stopRetryDelay() time.Duration {
 		return s.batteryStopRetryDelay
 	}
 	if s.lastStopLinkDown {
+		// Right after a bridge reboot the link is expected back within a minute,
+		// and the same tick's failed stop must not re-arm the long backoff.
+		if !s.lastBridgeRestart.IsZero() && s.now().Sub(s.lastBridgeRestart) < bridgeRestartMinInterval {
+			return batteryStopRetryInterval
+		}
 		return batteryLinkDownStopRetryInterval
 	}
 	return batteryStopRetryInterval
@@ -1264,9 +1304,15 @@ func (s *Service) refreshPassiveModeLocked(ctx context.Context, power int) bool 
 
 	slog.Debug("refreshing passive mode", "power", power)
 
-	// Release lock during network I/O
+	// Release lock during network I/O. With ESPHome the refresh is a read-back that
+	// only re-writes when the battery reports another mode or power.
 	s.mu.Unlock()
-	err := s.battery.SetPassiveModeContext(ctx, power, s.cfg.PassiveModeTimeoutS)
+	var err error
+	if r, ok := s.battery.(PassiveModeRefresher); ok {
+		err = r.RefreshPassiveModeContext(ctx, power, s.cfg.PassiveModeTimeoutS)
+	} else {
+		err = s.battery.SetPassiveModeContext(ctx, power, s.cfg.PassiveModeTimeoutS)
+	}
 	s.mu.Lock()
 
 	if err != nil {
@@ -1524,9 +1570,136 @@ func batteryFailureCooldown(err error) time.Duration {
 // batteryFailureMessage leads with the actionable cause when the link is down.
 func batteryFailureMessage(prefix string, err error) string {
 	if errors.Is(err, marstek.ErrLinkDown) {
-		return "Battery RS485 link is down — telemetry is frozen and control writes are dropped. Power-cycle the ESPHome dongle. (" + prefix + ": " + err.Error() + ")"
+		return "Battery RS485 link is down — telemetry is frozen and control writes are dropped. Power-cycle the ESPHome dongle (or configure ESPHOME_RESTART_BUTTON so this happens automatically). (" + prefix + ": " + err.Error() + ")"
 	}
 	return prefix + ": " + err.Error()
+}
+
+// checkLinkDuringSession detects a frozen RS485 link while the battery is running.
+// The battery keeps executing the last accepted command, so a dropped stop drains it
+// silently. Must be called WITHOUT s.mu held: it performs network I/O.
+func (s *Service) checkLinkDuringSession(ctx context.Context) {
+	lc, ok := s.battery.(LinkChecker)
+	if !ok {
+		return
+	}
+
+	err := lc.CheckLink(ctx)
+	switch {
+	case err == nil:
+		// Live telemetry proves the link is back (bridge rebooted, by us or by
+		// hand), so a pending stop may retry at the normal cadence again.
+		s.mu.Lock()
+		s.linkDownSince = time.Time{}
+		s.lastStopLinkDown = false
+		s.mu.Unlock()
+		return
+	case !errors.Is(err, marstek.ErrLinkDown):
+		slog.Debug("link check failed", "error", err)
+		return
+	}
+
+	s.mu.Lock()
+	if s.linkDownSince.IsZero() {
+		s.linkDownSince = s.now()
+	}
+	downSince := s.linkDownSince
+	state := s.state
+	powerW := s.currentTradePowerW
+	verb := "running"
+	switch state {
+	case StateCharging:
+		verb = "charging"
+		if powerW == 0 {
+			powerW = s.cfg.ChargePowerW
+		}
+	case StateDischarging:
+		verb = "discharging"
+	case StateManualDischarging:
+		verb = "manual discharging"
+	case StateSolarCharging:
+		verb = "solar charging"
+		powerW = s.solarChargePower
+	}
+	s.mu.Unlock()
+
+	logLinkFrozen := slog.Warn
+	if downSince.Equal(s.now()) {
+		logLinkFrozen = slog.Error
+	}
+	logLinkFrozen("battery RS485 link frozen during active session",
+		"state", state, "power_w", powerW, "down_since", downSince, "error", err)
+
+	msg := fmt.Sprintf(
+		"Battery RS485 link is down: telemetry frozen while %s at %d W (%s). "+
+			"The battery keeps running and cannot be stopped until the link is back — "+
+			"power-cycle the ESPHome dongle now.", verb, powerW, err.Error())
+	s.notifyLinkDown(ctx, msg)
+
+	// Rebooting hardware needs one extra minute of confirmation: only restart from
+	// the second consecutive tick that still reports the link down.
+	if s.now().Sub(downSince) >= time.Minute {
+		s.tryRestartBridge(ctx)
+	}
+}
+
+// notifyLinkDown sends a link-down alert with its own rate limiter, so it is never
+// swallowed by an unrelated recent error notification.
+func (s *Service) notifyLinkDown(ctx context.Context, msg string) {
+	if !s.telegramEnabled() {
+		return
+	}
+	if s.now().Sub(s.lastLinkDownNotify) < linkDownNotifyInterval {
+		slog.Debug("link down notification rate limited", "msg", msg)
+		return
+	}
+	s.lastLinkDownNotify = s.now()
+
+	if err := s.telegram.SendError(ctx, msg); err != nil {
+		slog.Warn("failed to send link down notification", "error", err)
+	}
+}
+
+// tryRestartBridge reboots the ESPHome bridge to recover a wedged RS485 link.
+// Must be called WITHOUT s.mu held.
+func (s *Service) tryRestartBridge(ctx context.Context) {
+	r, ok := s.battery.(DeviceRestarter)
+	if !ok || !r.RestartAvailable() {
+		return
+	}
+
+	s.mu.Lock()
+	if !s.lastBridgeRestart.IsZero() && s.now().Sub(s.lastBridgeRestart) < bridgeRestartMinInterval {
+		s.mu.Unlock()
+		slog.Debug("bridge restart rate limited", "last_restart", s.lastBridgeRestart)
+		return
+	}
+	s.mu.Unlock()
+
+	if err := r.RestartDevice(ctx); err != nil {
+		// A failed POST rebooted nothing, so it must not consume the 10 minute
+		// limiter: the next tick should be free to try again.
+		slog.Error("failed to restart ESPHome bridge", "error", err)
+		return
+	}
+	slog.Warn("restarted ESPHome bridge to recover RS485 link")
+
+	// A pending stop should retry at the normal cadence once the bridge is back,
+	// and the 30 minute link-down cooldown a failed start armed must not outlive
+	// the recovery that just fixed its cause. The bridge needs ~30 s to reboot,
+	// so hold starts for one tick instead of retrying into the outage.
+	s.mu.Lock()
+	s.lastBridgeRestart = s.now()
+	s.lastStopLinkDown = false
+	s.lastStopAttempt = time.Time{}
+	s.batteryCooldownUntil = s.now().Add(bridgeRebootGrace)
+	s.mu.Unlock()
+
+	if s.telegramEnabled() {
+		if err := s.telegram.SendMessage(ctx, "Restarting the ESPHome bridge to recover the frozen RS485 link; the pending battery command will be retried automatically."); err != nil {
+			slog.Warn("failed to send bridge restart notification", "error", err)
+		}
+	}
 }
 
 // notifyError sends an error notification with rate limiting (max 1 per 15 minutes).

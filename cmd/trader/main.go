@@ -72,7 +72,8 @@ func main() {
 	minSOC := int(cfg.BatteryMinSOC * 100)
 	esphomeClient := esphome.New(cfg.ESPHomeURL, minSOC)
 	defer esphomeClient.Close()
-	slog.Info("using ESPHome battery backend", "url", cfg.ESPHomeURL, "min_soc", minSOC)
+	esphomeClient.SetRestartButton(cfg.ESPHomeRestartButton)
+	slog.Info("using ESPHome battery backend", "url", cfg.ESPHomeURL, "min_soc", minSOC, "bridge_restart", esphomeClient.RestartAvailable())
 	p1URL := cfg.HomeWizardP1URL
 	if p1URL == "" {
 		if discovered, err := homewizard.Discover(context.Background()); err != nil {

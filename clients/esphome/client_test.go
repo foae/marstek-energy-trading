@@ -358,7 +358,10 @@ func TestChargeRetriesUnconfirmedSelectWrite(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := New(server.URL, 11).ChargeContext(ctx, 500, 300); err != nil {
+	client := New(server.URL, 11)
+	// Production spaces retries 5 s apart; keep the test fast without weakening it.
+	client.writeRetryDelay = 20 * time.Millisecond
+	if err := client.ChargeContext(ctx, 500, 300); err != nil {
 		t.Fatalf("ChargeContext() error = %v", err)
 	}
 	if rs485Writes != 2 {
@@ -699,10 +702,12 @@ func newFrozenLinkServer(t *testing.T, sensors map[string]float64, postCount *in
 
 func frozenSensors() map[string]float64 {
 	return map[string]float64{
-		"/sensor/AC Voltage":              232.5,
-		"/sensor/Battery Power":           -10,
-		"/sensor/Internal Temperature":    32.9,
-		"/sensor/Battery State Of Charge": 50,
+		"/sensor/AC Voltage":                232.5,
+		"/sensor/Battery Power":             -10,
+		"/sensor/Internal Temperature":      32.9,
+		"/sensor/Battery State Of Charge":   50,
+		"/sensor/Battery Voltage (Average)": 51.2,
+		"/sensor/Battery Current (Average)": -0.2,
 	}
 }
 
@@ -822,5 +827,412 @@ func TestLinkDownVerdictFailsFastAndClearsOnTelemetryChange(t *testing.T) {
 	mu.Unlock()
 	if postsAfter == 0 {
 		t.Fatal("no control writes attempted after link recovered")
+	}
+}
+
+func TestControlWriteRetryDelayFitsConfirmationWindow(t *testing.T) {
+	if got := New("http://example.invalid", 11).writeRetryDelay; got != controlWriteRetryDelay {
+		t.Fatalf("New() writeRetryDelay = %s, want %s", got, controlWriteRetryDelay)
+	}
+	if controlWriteRetryDelay != 4*time.Second {
+		t.Fatalf("controlWriteRetryDelay = %s, want 4s", controlWriteRetryDelay)
+	}
+	// Retries land at 4 s and 12 s: both must fit inside the confirmation window.
+	if controlWriteRetryDelay*3 >= controlConfirmationTimeout {
+		t.Fatalf(
+			"retry cadence %s does not fit confirmation timeout %s",
+			controlWriteRetryDelay*3,
+			controlConfirmationTimeout,
+		)
+	}
+	// The last retry must leave ESPHome enough time to poll the value back.
+	lastRetryAt := controlWriteRetryDelay + 2*controlWriteRetryDelay
+	if controlConfirmationTimeout-lastRetryAt < 5*time.Second {
+		t.Fatalf(
+			"last retry at %s leaves only %s of the %s confirmation window, want >= 5s",
+			lastRetryAt,
+			controlConfirmationTimeout-lastRetryAt,
+			controlConfirmationTimeout,
+		)
+	}
+}
+
+func TestCheckLink_TelemetryMovingIsHealthy(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	posts := 0
+	sensors := frozenSensors()
+	server := newFrozenLinkServer(t, sensors, &posts, &mu)
+	defer server.Close()
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	client := New(server.URL, 11)
+	client.now = func() time.Time { return now }
+
+	if err := client.CheckLink(context.Background()); err != nil {
+		t.Fatalf("CheckLink() first call error = %v, want nil", err)
+	}
+
+	// Telemetry moves while the clock advances past the staleness threshold.
+	now = now.Add(5 * time.Minute)
+	mu.Lock()
+	sensors["/sensor/Battery Power"] = -1200
+	mu.Unlock()
+
+	if err := client.CheckLink(context.Background()); err != nil {
+		t.Fatalf("CheckLink() error = %v, want nil", err)
+	}
+}
+
+func TestCheckLink_FrozenTelemetryReportsLinkDown(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	posts := 0
+	server := newFrozenLinkServer(t, frozenSensors(), &posts, &mu)
+	defer server.Close()
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	client := New(server.URL, 11)
+	client.now = func() time.Time { return now }
+
+	// Seed the baseline, then let the clock run past the threshold with no change.
+	if err := client.CheckLink(context.Background()); err != nil {
+		t.Fatalf("CheckLink() seed error = %v, want nil", err)
+	}
+	now = now.Add(linkStaleThreshold)
+
+	err := client.CheckLink(context.Background())
+	if !errors.Is(err, marstek.ErrLinkDown) {
+		t.Fatalf("CheckLink() error = %v, want ErrLinkDown", err)
+	}
+
+	// The verdict must be recorded, so control writes fail fast.
+	mu.Lock()
+	posts = 0
+	mu.Unlock()
+	if err := client.ensureRS485ControlMode(context.Background()); !errors.Is(err, marstek.ErrLinkDown) {
+		t.Fatalf("ensureRS485ControlMode() error = %v, want ErrLinkDown", err)
+	}
+	mu.Lock()
+	postsAfter := posts
+	mu.Unlock()
+	if postsAfter != 0 {
+		t.Fatalf("control writes while link down = %d, want 0", postsAfter)
+	}
+}
+
+func TestCheckLink_ReadFailureIsNotLinkDown(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	err := New(server.URL, 11).CheckLink(context.Background())
+	if err == nil {
+		t.Fatal("CheckLink() error = nil, want read error")
+	}
+	if errors.Is(err, marstek.ErrLinkDown) {
+		t.Fatalf("CheckLink() error = %v, want plain read error", err)
+	}
+}
+
+func TestCheckLink_NoHistoryIsHealthy(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	posts := 0
+	server := newFrozenLinkServer(t, frozenSensors(), &posts, &mu)
+	defer server.Close()
+
+	if err := New(server.URL, 11).CheckLink(context.Background()); err != nil {
+		t.Fatalf("CheckLink() error = %v, want nil", err)
+	}
+}
+
+// newRefreshTestServer serves the control entities from the given values and
+// records every POST so tests can assert that no Modbus write was issued.
+func newRefreshTestServer(t *testing.T, values map[string]string) (*httptest.Server, *[]string) {
+	t.Helper()
+	posts := make([]string, 0)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			posts = append(posts, r.URL.String())
+			entityPath := strings.TrimSuffix(r.URL.Path, "/set")
+			if option := r.URL.Query().Get("option"); option != "" {
+				values[entityPath] = option
+			}
+			if value := r.URL.Query().Get("value"); value != "" {
+				values[entityPath] = value
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"value": values[r.URL.Path], "state": values[r.URL.Path]})
+	}))
+	return server, &posts
+}
+
+func TestRefreshPassiveModeContext(t *testing.T) {
+	tests := []struct {
+		name     string
+		values   map[string]string
+		power    int
+		wantPost bool
+	}{
+		{
+			name: "battery still reports discharge at the same power",
+			values: map[string]string{
+				"/select/RS485 Control Mode":        "enable",
+				"/select/Forcible Charge⁄Discharge": "discharge",
+				"/number/Forcible Discharge Power":  "2200",
+				"/number/Forcible Charge Power":     "0",
+			},
+			power:    2200,
+			wantPost: false,
+		},
+		{
+			name: "battery dropped back to stop",
+			values: map[string]string{
+				"/select/RS485 Control Mode":        "enable",
+				"/select/Forcible Charge⁄Discharge": "stop",
+				"/number/Forcible Discharge Power":  "2200",
+				"/number/Forcible Charge Power":     "0",
+			},
+			power:    2200,
+			wantPost: true,
+		},
+		{
+			name: "idle already stopped",
+			values: map[string]string{
+				"/select/RS485 Control Mode":        "enable",
+				"/select/Forcible Charge⁄Discharge": "stop",
+				"/number/Forcible Discharge Power":  "0",
+				"/number/Forcible Charge Power":     "0",
+			},
+			power:    0,
+			wantPost: false,
+		},
+		{
+			name: "mode matches but power drifted",
+			values: map[string]string{
+				"/select/RS485 Control Mode":        "enable",
+				"/select/Forcible Charge⁄Discharge": "discharge",
+				"/number/Forcible Discharge Power":  "800",
+				"/number/Forcible Charge Power":     "0",
+			},
+			power:    2200,
+			wantPost: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server, posts := newRefreshTestServer(t, tt.values)
+			defer server.Close()
+
+			client := New(server.URL, 11)
+			client.writeRetryDelay = 20 * time.Millisecond
+			if err := client.RefreshPassiveModeContext(context.Background(), tt.power, 300); err != nil {
+				t.Fatalf("RefreshPassiveModeContext() error = %v", err)
+			}
+			if tt.wantPost && len(*posts) == 0 {
+				t.Fatal("no control writes issued, want re-assert")
+			}
+			if !tt.wantPost && len(*posts) != 0 {
+				t.Fatalf("control writes = %v, want none", *posts)
+			}
+			if !tt.wantPost {
+				return
+			}
+			var sawSelect, sawNumber bool
+			for _, post := range *posts {
+				if strings.Contains(post, "Forcible%20Charge%E2%81%84Discharge") {
+					sawSelect = true
+				}
+				if strings.Contains(post, "Forcible%20Discharge%20Power") {
+					sawNumber = true
+				}
+			}
+			if !sawSelect || !sawNumber {
+				t.Fatalf("posts = %v, want both discharge power and force-mode writes", *posts)
+			}
+		})
+	}
+}
+
+func TestRestartDevice(t *testing.T) {
+	t.Run("not configured", func(t *testing.T) {
+		client := New("http://example.invalid", 11)
+		if client.RestartAvailable() {
+			t.Fatal("RestartAvailable() = true, want false")
+		}
+		if err := client.RestartDevice(context.Background()); err == nil {
+			t.Fatal("RestartDevice() error = nil, want error")
+		}
+	})
+
+	t.Run("presses the button", func(t *testing.T) {
+		var got string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got = r.Method + " " + r.URL.Path
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		client := New(server.URL, 11)
+		client.SetRestartButton("restart")
+		if !client.RestartAvailable() {
+			t.Fatal("RestartAvailable() = false, want true")
+		}
+		if err := client.RestartDevice(context.Background()); err != nil {
+			t.Fatalf("RestartDevice() error = %v", err)
+		}
+		if want := "POST /button/restart/press"; got != want {
+			t.Fatalf("request = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("non-2xx is an error", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "nope", http.StatusInternalServerError)
+		}))
+		defer server.Close()
+
+		client := New(server.URL, 11)
+		client.SetRestartButton("restart")
+		if err := client.RestartDevice(context.Background()); err == nil {
+			t.Fatal("RestartDevice() error = nil, want error")
+		}
+	})
+}
+
+func TestCheckLink_SamplesFastMovingSensors(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	seen := make(map[string]int)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen[r.URL.Path]++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"value": 1.0})
+	}))
+	defer server.Close()
+
+	if err := New(server.URL, 11).CheckLink(context.Background()); err != nil {
+		t.Fatalf("CheckLink() error = %v, want nil", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{
+		"/sensor/AC Voltage",
+		"/sensor/Battery Power",
+		"/sensor/Battery Voltage (Average)",
+		"/sensor/Battery Current (Average)",
+	}
+	for _, path := range want {
+		if seen[path] != 1 {
+			t.Errorf("reads of %q = %d, want 1 (seen: %v)", path, seen[path], seen)
+		}
+	}
+	if len(seen) != len(want) {
+		t.Errorf("sampled paths = %v, want exactly %v", seen, want)
+	}
+}
+
+func TestRestartDevice_ReseedsLinkBaseline(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	posts := 0
+	server := newFrozenLinkServer(t, frozenSensors(), &posts, &mu)
+	defer server.Close()
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	client := New(server.URL, 11)
+	client.now = func() time.Time { return now }
+	client.SetRestartButton("restart")
+
+	if err := client.CheckLink(context.Background()); err != nil {
+		t.Fatalf("CheckLink() seed error = %v, want nil", err)
+	}
+	now = now.Add(linkStaleThreshold)
+	if err := client.CheckLink(context.Background()); !errors.Is(err, marstek.ErrLinkDown) {
+		t.Fatalf("CheckLink() error = %v, want ErrLinkDown", err)
+	}
+
+	if err := client.RestartDevice(context.Background()); err != nil {
+		t.Fatalf("RestartDevice() error = %v", err)
+	}
+
+	// Post-reboot telemetry is a fresh baseline and the verdict is dropped.
+	if err := client.CheckLink(context.Background()); err != nil {
+		t.Fatalf("CheckLink() after restart error = %v, want nil", err)
+	}
+	if err := client.ensureRS485ControlMode(context.Background()); err != nil {
+		t.Fatalf("ensureRS485ControlMode() after restart error = %v, want nil", err)
+	}
+}
+
+func TestRefreshPassiveModeContext_LinkDownFailsFast(t *testing.T) {
+	t.Parallel()
+	var requests int
+	var mu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := New(server.URL, 11)
+	client.markLinkDown()
+
+	err := client.RefreshPassiveModeContext(context.Background(), -2500, 300)
+	if !errors.Is(err, marstek.ErrLinkDown) {
+		t.Fatalf("RefreshPassiveModeContext() error = %v, want ErrLinkDown", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 0 {
+		t.Fatalf("HTTP requests while link down = %d, want 0", requests)
+	}
+}
+
+func TestRefreshPassiveModeContext_LostControlModeReasserts(t *testing.T) {
+	t.Parallel()
+	// Forcible mode still matches, but the battery dropped RS485 control mode:
+	// everything must be re-asserted.
+	values := map[string]string{
+		"/select/RS485 Control Mode":        "disable",
+		"/select/Forcible Charge⁄Discharge": "discharge",
+		"/number/Forcible Discharge Power":  "2200",
+		"/number/Forcible Charge Power":     "0",
+	}
+	server, posts := newRefreshTestServer(t, values)
+	defer server.Close()
+
+	client := New(server.URL, 11)
+	client.writeRetryDelay = 20 * time.Millisecond
+	if err := client.RefreshPassiveModeContext(context.Background(), 2200, 300); err != nil {
+		t.Fatalf("RefreshPassiveModeContext() error = %v", err)
+	}
+
+	var sawControlMode, sawSelect, sawNumber bool
+	for _, post := range *posts {
+		if strings.Contains(post, "RS485%20Control%20Mode") {
+			sawControlMode = true
+		}
+		if strings.Contains(post, "Forcible%20Charge%E2%81%84Discharge") {
+			sawSelect = true
+		}
+		if strings.Contains(post, "Forcible%20Discharge%20Power") {
+			sawNumber = true
+		}
+	}
+	if !sawControlMode || !sawSelect || !sawNumber {
+		t.Fatalf("posts = %v, want control mode, discharge power and force-mode writes", *posts)
 	}
 }

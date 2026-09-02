@@ -47,3 +47,19 @@ type Notifier interface {
 	SendDailySummaryFull(ctx context.Context, data telegram.DailySummaryData) error
 	PollCommands(ctx context.Context) ([]string, error)
 }
+
+// LinkChecker is implemented by backends that can tell a frozen telemetry link from a live one.
+type LinkChecker interface {
+	CheckLink(ctx context.Context) error
+}
+
+// PassiveModeRefresher re-asserts a running mode only when the battery no longer reports it.
+type PassiveModeRefresher interface {
+	RefreshPassiveModeContext(ctx context.Context, power int, cdTime int) error
+}
+
+// DeviceRestarter reboots the control bridge (ESPHome) to recover a wedged RS485 link.
+type DeviceRestarter interface {
+	RestartAvailable() bool
+	RestartDevice(ctx context.Context) error
+}

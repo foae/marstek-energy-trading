@@ -66,6 +66,15 @@ type MockBattery struct {
 	StatusCalls  int
 	ESCalls      int
 	PowerCalls   int
+
+	// Optional interfaces (LinkChecker, PassiveModeRefresher, DeviceRestarter)
+	checkLinkErr     error
+	checkLinkCalls   int
+	passiveCalls     int
+	refreshCalls     []int
+	restartAvailable bool
+	restartCalls     int
+	restartErr       error
 }
 
 type ChargeCall struct {
@@ -167,12 +176,49 @@ func (m *MockBattery) DischargeContext(_ context.Context, powerW int, timeoutS i
 func (m *MockBattery) SetPassiveModeContext(_ context.Context, power int, cdTime int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.passiveCalls++
+	return m.applyPassiveLocked(power)
+}
+
+// RefreshPassiveModeContext implements PassiveModeRefresher; it records the power
+// separately but applies the same state changes as SetPassiveModeContext.
+func (m *MockBattery) RefreshPassiveModeContext(_ context.Context, power int, cdTime int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.refreshCalls = append(m.refreshCalls, power)
+	return m.applyPassiveLocked(power)
+}
+
+func (m *MockBattery) applyPassiveLocked(power int) error {
 	if m.PassiveErr != nil {
 		return m.PassiveErr
 	}
 	m.CurrentMode = "Passive"
 	m.CurrentPower = -power
 	return nil
+}
+
+// CheckLink implements LinkChecker.
+func (m *MockBattery) CheckLink(_ context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.checkLinkCalls++
+	return m.checkLinkErr
+}
+
+// RestartAvailable implements DeviceRestarter; disabled unless a test opts in.
+func (m *MockBattery) RestartAvailable() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.restartAvailable
+}
+
+// RestartDevice implements DeviceRestarter.
+func (m *MockBattery) RestartDevice(_ context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.restartCalls++
+	return m.restartErr
 }
 
 func (m *MockBattery) IdleContext(ctx context.Context) error {
@@ -2432,5 +2478,264 @@ func TestTelegramManualDischargeStopsPreviousOperationBeforeStarting(t *testing.
 	}
 	if battery.StatusCalls != 2 {
 		t.Fatalf("expected fresh status after stopping previous operation, got %d reads", battery.StatusCalls)
+	}
+}
+
+// --- RS485 link freeze detection ---
+
+func linkDownErr() error {
+	return fmt.Errorf("telemetry frozen for 3m0s: %w", marstek.ErrLinkDown)
+}
+
+func newLinkDownDischargeService(t *testing.T, battery *MockBattery, notifier *MockNotifier, now *time.Time) *Service {
+	t.Helper()
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime, 0.05, 0.06, 0.20, 0.22)
+	*now = baseTime.Add(3 * 15 * time.Minute) // in discharge window
+
+	svc := newTestService(testConfigSmallBattery(), battery, prices, *now)
+	svc.nowFunc = func() time.Time { return *now }
+	svc.telegram = notifier
+	svc.state = StateDischarging
+	svc.currentTradeStart = baseTime
+	svc.currentTradePrice = decimal.NewFromFloat(0.20)
+	svc.currentTradeSOC = 80
+	svc.currentTradePowerW = 2200
+	svc.lastPassiveRefresh = *now
+	return svc
+}
+
+func TestTick_LinkDownDuringDischargeNotifiesOnce(t *testing.T) {
+	battery := NewMockBattery(64)
+	battery.checkLinkErr = linkDownErr()
+	notifier := &MockNotifier{}
+	var now time.Time
+	svc := newLinkDownDischargeService(t, battery, notifier, &now)
+
+	ctx := context.Background()
+	svc.tick(ctx)
+
+	if len(notifier.ErrorCalls) != 1 {
+		t.Fatalf("expected exactly one link down notification, got %d: %v", len(notifier.ErrorCalls), notifier.ErrorCalls)
+	}
+	msg := notifier.ErrorCalls[0]
+	if !strings.Contains(msg, "link is down") || !strings.Contains(msg, "power-cycle") {
+		t.Errorf("unexpected link down message: %q", msg)
+	}
+
+	// A second tick a minute later must be swallowed by the 15 minute limiter.
+	now = now.Add(time.Minute)
+	svc.tick(ctx)
+	if len(notifier.ErrorCalls) != 1 {
+		t.Fatalf("expected link down notification to be rate limited, got %v", notifier.ErrorCalls)
+	}
+
+	// The link down limiter must not consume notifyError's limiter.
+	svc.notifyError(ctx, "unrelated failure")
+	if len(notifier.ErrorCalls) != 2 || notifier.ErrorCalls[1] != "unrelated failure" {
+		t.Fatalf("expected unrelated error notification to be sent, got %v", notifier.ErrorCalls)
+	}
+}
+
+func TestTick_LinkDownRestartsBridgeAndRetriesPendingStop(t *testing.T) {
+	battery := NewMockBattery(64)
+	battery.checkLinkErr = linkDownErr()
+	battery.restartAvailable = true
+	notifier := &MockNotifier{}
+	var now time.Time
+	svc := newLinkDownDischargeService(t, battery, notifier, &now)
+	// A stop already failed with a dead link one minute ago: without a bridge
+	// restart the retry would wait the 5 minute link-down interval.
+	svc.state = StateDischarging
+	svc.lastStopLinkDown = true
+	svc.lastStopAttempt = now.Add(-time.Minute)
+	battery.SOC = 5 // below min SOC, so this tick tries to stop again
+
+	ctx := context.Background()
+	// The first link-down tick only confirms and notifies; hardware is not rebooted
+	// until a second consecutive tick still reports the link down.
+	svc.tick(ctx)
+	if battery.restartCalls != 0 {
+		t.Fatalf("expected no bridge restart on the first link-down tick, got %d", battery.restartCalls)
+	}
+
+	now = now.Add(time.Minute)
+	svc.tick(ctx)
+
+	if battery.restartCalls != 1 {
+		t.Fatalf("expected one bridge restart, got %d", battery.restartCalls)
+	}
+	if svc.state != StateIdle {
+		t.Fatalf("expected pending stop to be retried immediately after restart, got state %s", svc.state)
+	}
+	if battery.IdleCalls != 1 {
+		t.Errorf("expected one idle command, got %d", battery.IdleCalls)
+	}
+
+	// A second link down within 10 minutes must not restart the bridge again.
+	svc.state = StateDischarging
+	svc.currentTradeStart = now.Add(-time.Hour)
+	svc.currentTradeSOC = 80
+	battery.SOC = 64
+	now = now.Add(time.Minute)
+	svc.tick(ctx)
+	if battery.restartCalls != 1 {
+		t.Fatalf("expected bridge restart to be rate limited, got %d calls", battery.restartCalls)
+	}
+}
+
+func TestTick_LinkNotCheckedWhenIdle(t *testing.T) {
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime, 0.10, 0.11, 0.12, 0.11) // not profitable, stays idle
+	battery := NewMockBattery(50)
+	battery.checkLinkErr = linkDownErr()
+	svc := newTestService(testConfig(), battery, prices, baseTime)
+
+	svc.tick(context.Background())
+
+	if svc.state != StateIdle {
+		t.Fatalf("expected idle state, got %s", svc.state)
+	}
+	if battery.checkLinkCalls != 0 {
+		t.Errorf("expected no link checks while idle, got %d", battery.checkLinkCalls)
+	}
+}
+
+func TestRefreshPassiveModeUsesRefresher(t *testing.T) {
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime, 0.05, 0.06, 0.20, 0.22)
+	cfg := testConfigSmallBattery()
+	battery := NewMockBattery(50)
+	now := baseTime
+	svc := newTestService(cfg, battery, prices, now)
+	svc.nowFunc = func() time.Time { return now }
+	svc.state = StateCharging
+	svc.currentTradeStart = baseTime
+	svc.currentTradeSOC = 50
+	svc.lastPassiveRefresh = now
+
+	ctx := context.Background()
+	// Before 80% of the passive mode timeout, nothing is refreshed.
+	now = now.Add(time.Duration(float64(cfg.PassiveModeTimeoutS)*0.5) * time.Second)
+	svc.tick(ctx)
+	if len(battery.refreshCalls) != 0 {
+		t.Fatalf("expected no refresh before the 80%% threshold, got %v", battery.refreshCalls)
+	}
+
+	// Past the threshold, the refresher is used instead of a blind passive write.
+	now = now.Add(time.Duration(float64(cfg.PassiveModeTimeoutS)*0.4) * time.Second)
+	svc.tick(ctx)
+	if len(battery.refreshCalls) != 1 || battery.refreshCalls[0] != -cfg.ChargePowerW {
+		t.Fatalf("expected one refresh at %d W, got %v", -cfg.ChargePowerW, battery.refreshCalls)
+	}
+	if battery.passiveCalls != 0 {
+		t.Errorf("expected SetPassiveModeContext not to be called, got %d calls", battery.passiveCalls)
+	}
+}
+
+func TestCheckLinkDuringSession_RestartsOnSecondTick(t *testing.T) {
+	battery := NewMockBattery(64)
+	battery.checkLinkErr = linkDownErr()
+	battery.restartAvailable = true
+	notifier := &MockNotifier{}
+	var now time.Time
+	svc := newLinkDownDischargeService(t, battery, notifier, &now)
+
+	ctx := context.Background()
+	svc.checkLinkDuringSession(ctx)
+	if battery.restartCalls != 0 {
+		t.Fatalf("expected no restart on the first link-down tick, got %d", battery.restartCalls)
+	}
+	if len(notifier.ErrorCalls) != 1 {
+		t.Fatalf("expected the first tick to notify, got %v", notifier.ErrorCalls)
+	}
+
+	now = now.Add(time.Minute)
+	svc.checkLinkDuringSession(ctx)
+	if battery.restartCalls != 1 {
+		t.Fatalf("expected one restart on the second link-down tick, got %d", battery.restartCalls)
+	}
+}
+
+func TestTryRestartBridge_FailedRestartDoesNotConsumeLimiter(t *testing.T) {
+	battery := NewMockBattery(64)
+	battery.checkLinkErr = linkDownErr()
+	battery.restartAvailable = true
+	battery.restartErr = fmt.Errorf("boom")
+	notifier := &MockNotifier{}
+	var now time.Time
+	svc := newLinkDownDischargeService(t, battery, notifier, &now)
+
+	ctx := context.Background()
+	svc.checkLinkDuringSession(ctx) // first tick: confirm only
+	now = now.Add(time.Minute)
+	svc.checkLinkDuringSession(ctx)
+
+	if battery.restartCalls != 1 {
+		t.Fatalf("expected one restart attempt, got %d", battery.restartCalls)
+	}
+	if !svc.lastBridgeRestart.IsZero() {
+		t.Fatalf("failed restart consumed the limiter: lastBridgeRestart = %v", svc.lastBridgeRestart)
+	}
+
+	// The next tick must try again instead of waiting out the 10 minute interval.
+	now = now.Add(time.Minute)
+	svc.checkLinkDuringSession(ctx)
+	if battery.restartCalls != 2 {
+		t.Fatalf("expected a second restart attempt, got %d", battery.restartCalls)
+	}
+}
+
+func TestStopRetryDelay_NormalCadenceRightAfterBridgeRestart(t *testing.T) {
+	battery := NewMockBattery(64)
+	battery.restartAvailable = true
+	notifier := &MockNotifier{}
+	var now time.Time
+	svc := newLinkDownDischargeService(t, battery, notifier, &now)
+	svc.lastStopLinkDown = true
+
+	if got := svc.stopRetryDelay(); got != batteryLinkDownStopRetryInterval {
+		t.Fatalf("stopRetryDelay() before restart = %s, want %s", got, batteryLinkDownStopRetryInterval)
+	}
+
+	svc.tryRestartBridge(context.Background())
+	if battery.restartCalls != 1 {
+		t.Fatalf("expected one bridge restart, got %d", battery.restartCalls)
+	}
+
+	// tryRestartBridge clears lastStopLinkDown; a stop failing again on the same
+	// tick must still retry at the normal cadence, not re-arm the long backoff.
+	svc.lastStopLinkDown = true
+	if got := svc.stopRetryDelay(); got != batteryStopRetryInterval {
+		t.Fatalf("stopRetryDelay() after restart = %s, want %s", got, batteryStopRetryInterval)
+	}
+}
+
+func TestTryRestartBridge_ClearsLinkDownStartCooldown(t *testing.T) {
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime, 0.05, 0.06, 0.20, 0.22) // slot 0 is a charge window
+	battery := NewMockBattery(50)
+	battery.ChargeErr = fmt.Errorf("set charge mode: %w", marstek.ErrLinkDown)
+	now := baseTime
+	svc := newTestService(testConfigSmallBattery(), battery, prices, now)
+	svc.nowFunc = func() time.Time { return now }
+
+	ctx := context.Background()
+	svc.tick(ctx)
+
+	if svc.batteryCooldownUntil.IsZero() {
+		t.Fatal("expected a link-down start failure to arm the battery cooldown")
+	}
+	if want := now.Add(batteryLinkDownCooldown); !svc.batteryCooldownUntil.Equal(want) {
+		t.Fatalf("batteryCooldownUntil = %v, want %v", svc.batteryCooldownUntil, want)
+	}
+
+	battery.restartAvailable = true
+	svc.tryRestartBridge(ctx)
+	if battery.restartCalls != 1 {
+		t.Fatalf("expected one bridge restart, got %d", battery.restartCalls)
+	}
+	if want := now.Add(bridgeRebootGrace); !svc.batteryCooldownUntil.Equal(want) {
+		t.Fatalf("expected the restart to shrink the cooldown to the reboot grace %v, got %v", want, svc.batteryCooldownUntil)
 	}
 }

@@ -22,10 +22,13 @@ const (
 
 	// ESPHome can acknowledge a REST select write even when the underlying
 	// Modbus command is dropped. Retry idempotent select writes with backoff
-	// while waiting for the next published value.
+	// while waiting for the next published value. Retries start only after
+	// ESPHome had a chance to poll the register back from the battery —
+	// re-writing sooner just piles duplicate Modbus frames onto the hub.
 	espHomeControlPublicationInterval = 15 * time.Second
 	controlConfirmationTimeout        = espHomeControlPublicationInterval + 5*time.Second
 	controlConfirmationInterval       = 500 * time.Millisecond
+	controlWriteRetryDelay            = 4 * time.Second
 	controlWriteMaxAttempts           = 3
 
 	// The RS485 link is declared down only after telemetry stays bit-identical for
@@ -35,18 +38,27 @@ const (
 	linkProbeInterval  = 5 * time.Second
 	linkDownVerdictTTL = 10 * time.Minute
 
+	// Pack voltage (0.01 V resolution) and current (0.01 A resolution) flicker
+	// continuously, even at a 75 W solar trickle, and AC voltage follows the grid.
+	// Two full minutes bit-identical across all four sampled sensors is a frozen
+	// link, not a quiet one.
+	linkStaleThreshold = 2 * time.Minute
+
 	// ESPHome sensor/entity paths (URL-encoded where needed)
-	sensorSOC              = "/sensor/Battery%20State%20Of%20Charge"
-	sensorTemperature      = "/sensor/Internal%20Temperature"
-	sensorRemainingCap     = "/sensor/Battery%20Remaining%20Capacity"
-	sensorTotalEnergy      = "/sensor/Battery%20Total%20Energy"
-	sensorBatteryPower     = "/sensor/Battery%20Power"
-	sensorACVoltage        = "/sensor/AC%20Voltage"
-	textSensorDeviceName   = "/text_sensor/Device%20Name"
-	textSensorEspIP        = "/text_sensor/Esp%20ip"
-	numberChargepower      = "/number/Forcible%20Charge%20Power"
-	numberDischargePower   = "/number/Forcible%20Discharge%20Power"
-	selectRS485ControlMode = "/select/RS485%20Control%20Mode"
+	sensorSOC          = "/sensor/Battery%20State%20Of%20Charge"
+	sensorTemperature  = "/sensor/Internal%20Temperature"
+	sensorRemainingCap = "/sensor/Battery%20Remaining%20Capacity"
+	sensorTotalEnergy  = "/sensor/Battery%20Total%20Energy"
+	sensorBatteryPower = "/sensor/Battery%20Power"
+	sensorACVoltage    = "/sensor/AC%20Voltage"
+	// Pack voltage/current averages are the fastest-moving battery-sourced values.
+	sensorBatteryVoltageAvg = "/sensor/Battery%20Voltage%20%28Average%29"
+	sensorBatteryCurrentAvg = "/sensor/Battery%20Current%20%28Average%29"
+	textSensorDeviceName    = "/text_sensor/Device%20Name"
+	textSensorEspIP         = "/text_sensor/Esp%20ip"
+	numberChargepower       = "/number/Forcible%20Charge%20Power"
+	numberDischargePower    = "/number/Forcible%20Discharge%20Power"
+	selectRS485ControlMode  = "/select/RS485%20Control%20Mode"
 	// Note: Unicode division slash (U+2044) in "Charge⁄Discharge"
 	selectForceMode = "/select/Forcible%20Charge%E2%81%84Discharge"
 )
@@ -58,8 +70,12 @@ type Client struct {
 	httpClient *http.Client
 	minSOC     int // Minimum SOC percentage for discharge flag
 
+	restartButton   string        // ESPHome restart button object id; empty disables bridge restarts
+	writeRetryDelay time.Duration // test override
+
 	mu            sync.Mutex
 	lastValues    map[string]float64 // battery-sourced telemetry, keyed by entity path
+	lastChangeAt  time.Time          // when a battery-sourced value last moved
 	linkDownAt    time.Time          // zero when the link is believed healthy
 	now           func() time.Time   // clock, overridable in tests
 	probeWindow   time.Duration      // test override
@@ -80,10 +96,11 @@ func New(baseURL string, minSOC int) *Client {
 		httpClient: &http.Client{
 			Timeout: defaultTimeout,
 		},
-		lastValues:    make(map[string]float64),
-		now:           time.Now,
-		probeWindow:   linkProbeWindow,
-		probeInterval: linkProbeInterval,
+		lastValues:      make(map[string]float64),
+		writeRetryDelay: controlWriteRetryDelay,
+		now:             time.Now,
+		probeWindow:     linkProbeWindow,
+		probeInterval:   linkProbeInterval,
 	}
 }
 
@@ -329,9 +346,140 @@ func (c *Client) recordTelemetry(path string, value float64) {
 	defer c.mu.Unlock()
 	prev, seen := c.lastValues[path]
 	c.lastValues[path] = value
+	if !seen || prev != value {
+		c.lastChangeAt = c.now()
+	}
 	if seen && prev != value {
 		c.linkDownAt = time.Time{}
 	}
+}
+
+// CheckLink samples fast-moving telemetry and reports marstek.ErrLinkDown when no
+// battery-sourced value has changed for linkStaleThreshold. Cheap enough to run every tick.
+func (c *Client) CheckLink(ctx context.Context) error {
+	for _, path := range []string{sensorACVoltage, sensorBatteryPower, sensorBatteryVoltageAvg, sensorBatteryCurrentAvg} {
+		if _, err := c.getSensorFloatContext(ctx, path); err != nil {
+			return fmt.Errorf("check link: %w", err)
+		}
+	}
+
+	// Decide and record the verdict under one lock: releasing between the
+	// staleness read and the write lets a concurrent telemetry change be
+	// overwritten by a stale down verdict.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lastChangeAt.IsZero() {
+		return nil
+	}
+	now := c.now()
+	staleFor := now.Sub(c.lastChangeAt)
+	if staleFor < linkStaleThreshold {
+		return nil
+	}
+	// Keep an earlier still-valid timestamp so the reported age keeps growing.
+	if c.linkDownAt.IsZero() || now.Sub(c.linkDownAt) > linkDownVerdictTTL {
+		c.linkDownAt = now
+	}
+	return fmt.Errorf("%w: telemetry frozen for %s", marstek.ErrLinkDown, staleFor.Round(time.Second))
+}
+
+// RefreshPassiveModeContext re-asserts a running mode only when the battery no longer
+// reports it. ESPHome polls the forcible-mode register from the battery, so a matching
+// select value means the command is still in effect and re-writing it would only add
+// Modbus traffic to an already saturated hub.
+//
+// The power number read-back is ESPHome's optimistic cache, so it only catches a
+// service-side change of the commanded power, never a dropped Modbus frame; the
+// selects are polled from the battery and are the real signal.
+func (c *Client) RefreshPassiveModeContext(ctx context.Context, power int, cdTime int) error {
+	if since, down := c.linkDown(); down {
+		return fmt.Errorf("%w for %s", marstek.ErrLinkDown, c.now().Sub(since).Round(time.Second))
+	}
+
+	expected := "stop"
+	numberPath := ""
+	switch {
+	case power < 0:
+		expected = "charge"
+		numberPath = numberChargepower
+	case power > 0:
+		expected = "discharge"
+		numberPath = numberDischargePower
+	}
+
+	// RS485 control mode is polled from the battery: if it is no longer enabled the
+	// battery dropped the control session, so everything must be re-asserted.
+	controlMode, err := c.getControlValue(ctx, selectRS485ControlMode)
+	if err != nil {
+		return fmt.Errorf("read RS485 control mode: %w", err)
+	}
+	if controlMode != "enable" {
+		return c.SetPassiveModeContext(ctx, power, cdTime)
+	}
+
+	mode, err := c.getControlValue(ctx, selectForceMode)
+	if err != nil {
+		return fmt.Errorf("read forcible mode: %w", err)
+	}
+
+	if mode == expected {
+		if numberPath == "" {
+			return nil
+		}
+		actual, err := c.getControlValue(ctx, numberPath)
+		if err != nil {
+			return fmt.Errorf("read forcible power: %w", err)
+		}
+		actualNumber, parseErr := strconv.ParseFloat(actual, 64)
+		if parseErr == nil && math.Abs(actualNumber-math.Abs(float64(power))) <= 0.5 {
+			return nil
+		}
+	}
+
+	return c.SetPassiveModeContext(ctx, power, cdTime)
+}
+
+// SetRestartButton names the ESPHome restart button object id (e.g. "restart"). Empty disables bridge restarts.
+func (c *Client) SetRestartButton(objectID string) {
+	c.restartButton = objectID
+}
+
+// RestartAvailable reports whether a restart button is configured.
+func (c *Client) RestartAvailable() bool {
+	return c.restartButton != ""
+}
+
+// RestartDevice presses the ESPHome restart button to reboot the bridge, which is the
+// only known way to recover a frozen RS485 link.
+func (c *Client) RestartDevice(ctx context.Context) error {
+	if c.restartButton == "" {
+		return fmt.Errorf("restart button not configured")
+	}
+	endpoint := fmt.Sprintf("%s/button/%s/press", c.baseURL, url.PathEscape(c.restartButton))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, http.NoBody)
+	if err != nil {
+		return fmt.Errorf("create POST restart request: %w", err)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST restart: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("POST restart: status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// The bridge is rebooting: every value collected before it is meaningless as a
+	// staleness baseline, and the link-down verdict it produced must not survive
+	// the recovery it triggered. Post-reboot telemetry becomes a fresh baseline.
+	c.mu.Lock()
+	c.lastValues = make(map[string]float64)
+	c.lastChangeAt = time.Time{}
+	c.linkDownAt = time.Time{}
+	c.mu.Unlock()
+	return nil
 }
 
 // linkDown reports whether a recent probe concluded the RS485 link is down.
@@ -545,7 +693,7 @@ func (c *Client) waitForControlValue(ctx context.Context, path string, expected 
 
 	pollTicker := time.NewTicker(controlConfirmationInterval)
 	defer pollTicker.Stop()
-	retryDelay := controlConfirmationInterval
+	retryDelay := c.writeRetryDelay
 	retryTimer := time.NewTimer(retryDelay)
 	defer retryTimer.Stop()
 

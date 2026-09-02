@@ -69,6 +69,7 @@ func TestLoad_Defaults(t *testing.T) {
 		"MIN_PRICE_SPREAD", "BATTERY_EFFICIENCY", "BATTERY_CAPACITY_KWH",
 		"BATTERY_MIN_SOC", "MAX_CYCLES_PER_DAY",
 		"ESPHOME_URL", "CHARGE_POWER_W", "DISCHARGE_POWER_W", "PASSIVE_MODE_TIMEOUT_S",
+		"ESPHOME_RESTART_BUTTON",
 		"HOMEWIZARD_P1_URL", "SOLAR_MIN_SURPLUS_W",
 		"TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
 		"BATTERY_UDP_ADDR",
@@ -102,6 +103,9 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 	if !cfg.SupplierFeeEURPerKWh.Equal(decimal.RequireFromString("0.02")) {
 		t.Errorf("SupplierFeeEURPerKWh = %s, want 0.02", cfg.SupplierFeeEURPerKWh)
+	}
+	if cfg.ESPHomeRestartButton != "" {
+		t.Errorf("ESPHomeRestartButton = %q, want empty (default)", cfg.ESPHomeRestartButton)
 	}
 }
 
@@ -258,6 +262,7 @@ func TestValidateDischargePower(t *testing.T) {
 func TestLoad_CustomValues(t *testing.T) {
 	t.Setenv("HOMEWIZARD_P1_URL", "http://192.168.1.100")
 	t.Setenv("SOLAR_MIN_SURPLUS_W", "200")
+	t.Setenv("ESPHOME_RESTART_BUTTON", "restart")
 
 	cfg, err := Load()
 	if err != nil {
@@ -269,6 +274,9 @@ func TestLoad_CustomValues(t *testing.T) {
 	}
 	if cfg.SolarMinSurplusW != 200 {
 		t.Errorf("SolarMinSurplusW = %d, want 200", cfg.SolarMinSurplusW)
+	}
+	if cfg.ESPHomeRestartButton != "restart" {
+		t.Errorf("ESPHomeRestartButton = %q, want %q", cfg.ESPHomeRestartButton, "restart")
 	}
 }
 

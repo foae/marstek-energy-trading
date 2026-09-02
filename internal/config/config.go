@@ -42,7 +42,7 @@ type Config struct {
 	ChargePowerW         int    `env:"CHARGE_POWER_W" envDefault:"2500"`
 	DischargePowerW      int    `env:"DISCHARGE_POWER_W" envDefault:"2500"`
 	PassiveModeTimeoutS  int    `env:"PASSIVE_MODE_TIMEOUT_S" envDefault:"300"`
-	ESPHomeRestartButton string `env:"ESPHOME_RESTART_BUTTON"` // ESPHome restart button object id, e.g. "restart"; empty = manual power-cycle only
+	ESPHomeRestartButton string `env:"ESPHOME_RESTART_BUTTON"` // ESPHome restart button name as exposed in its web URLs, e.g. "Restart"; empty = manual power-cycle only
 
 	// HomeWizard P1 meter (optional)
 	HomeWizardP1URL  string `env:"HOMEWIZARD_P1_URL"`                    // Empty = disabled

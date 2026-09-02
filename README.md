@@ -41,12 +41,12 @@ The service handles this by:
 - detecting frozen telemetry within ~2 minutes while a session is active, and on any control failure
 - alerting via Telegram immediately, on a dedicated rate limiter so the alert is never swallowed by an unrelated error
 - refreshing running commands by read-back only (no Modbus write unless the battery reports another mode/power)
-- rebooting the bridge automatically when the ESPHome config exposes a restart button (`ESPHOME_RESTART_BUTTON`, at most once per 10 minutes)
+- rebooting the bridge automatically when the ESPHome config exposes a restart button (`ESPHOME_RESTART_BUTTON`, at most once per 10 minutes). This device's web server keys entities by display name (`/button/Restart/press`), not by snake_case object id; the client tries both spellings, so either value works.
 
 ```yaml
 button:
   - platform: restart
-    name: "Restart"   # object id "restart" -> ESPHOME_RESTART_BUTTON=restart
+    name: "Restart"   # -> ESPHOME_RESTART_BUTTON=Restart
 ```
 
 To capture the bridge's own debug log around the next freeze (the ESPHome web server streams it on `/events`), run `scripts/esp32-logtail.sh` on a machine that stays up, e.g. `nohup scripts/esp32-logtail.sh http://192.168.1.50 ~/esp32-events.log >/dev/null 2>&1 &`. It timestamps every log line in the trader's timezone, drops the routine Modbus chatter, and reconnects when the device reboots.
@@ -91,7 +91,7 @@ Copy `.env.example` to `.env`. Key settings:
 | `MIN_PRICE_SPREAD` | `0.05` | Minimum EUR/kWh spread to trigger trading |
 | `BATTERY_EFFICIENCY` | `0.90` | Round-trip efficiency (0.0-1.0) |
 | `ESPHOME_URL` | `http://192.168.1.50` | ESPHome device URL |
-| `ESPHOME_RESTART_BUTTON` | - | Optional: ESPHome restart button object id (e.g. `restart`) used to auto-recover a frozen RS485 link |
+| `ESPHOME_RESTART_BUTTON` | - | Optional: ESPHome restart button name as used in the device web URLs (e.g. `Restart`), used to auto-recover a frozen RS485 link |
 | `CHARGE_POWER_W` | `2500` | Charge power in watts |
 | `DISCHARGE_POWER_W` | `2500` | Discharge power in watts |
 | `TELEGRAM_BOT_TOKEN` | - | Optional: Telegram notifications |

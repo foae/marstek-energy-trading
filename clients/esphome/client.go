@@ -70,7 +70,7 @@ type Client struct {
 	httpClient *http.Client
 	minSOC     int // Minimum SOC percentage for discharge flag
 
-	restartButton   string        // ESPHome restart button object id; empty disables bridge restarts
+	restartButton   string        // ESPHome restart button name as used in its URLs; empty disables bridge restarts
 	writeRetryDelay time.Duration // test override
 
 	mu            sync.Mutex
@@ -439,14 +439,44 @@ func (c *Client) RefreshPassiveModeContext(ctx context.Context, power int, cdTim
 	return c.SetPassiveModeContext(ctx, power, cdTime)
 }
 
-// SetRestartButton names the ESPHome restart button object id (e.g. "restart"). Empty disables bridge restarts.
-func (c *Client) SetRestartButton(objectID string) {
-	c.restartButton = objectID
+// SetRestartButton names the ESPHome restart button as it appears in the device's web
+// server URLs (e.g. "Restart" for `name: "Restart"`). Empty disables bridge restarts.
+func (c *Client) SetRestartButton(name string) {
+	c.restartButton = name
 }
 
 // RestartAvailable reports whether a restart button is configured.
 func (c *Client) RestartAvailable() bool {
 	return c.restartButton != ""
+}
+
+// restartButtonCandidates lists the URL spellings to try for the restart button.
+// Depending on the ESPHome build and config, the web server keys entities by the
+// display name ("Restart", what the Marstek bridge does — see the other entity paths
+// above) or by the snake_case object id ("restart"). A 404 costs nothing, so try the
+// configured value first and the other convention after it.
+func restartButtonCandidates(configured string) []string {
+	slug := strings.ToLower(strings.Join(strings.Fields(configured), "_"))
+	title := slug
+	if title != "" {
+		words := strings.Split(slug, "_")
+		for i, w := range words {
+			if w != "" {
+				words[i] = strings.ToUpper(w[:1]) + w[1:]
+			}
+		}
+		title = strings.Join(words, " ")
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, cand := range []string{configured, title, slug} {
+		if cand == "" || seen[cand] {
+			continue
+		}
+		seen[cand] = true
+		out = append(out, cand)
+	}
+	return out
 }
 
 // RestartDevice presses the ESPHome restart button to reboot the bridge, which is the
@@ -455,20 +485,24 @@ func (c *Client) RestartDevice(ctx context.Context) error {
 	if c.restartButton == "" {
 		return fmt.Errorf("restart button not configured")
 	}
-	endpoint := fmt.Sprintf("%s/button/%s/press", c.baseURL, url.PathEscape(c.restartButton))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, http.NoBody)
-	if err != nil {
-		return fmt.Errorf("create POST restart request: %w", err)
+	var lastErr error
+	for _, name := range restartButtonCandidates(c.restartButton) {
+		status, err := c.pressButton(ctx, name)
+		if err != nil {
+			return err
+		}
+		if status == http.StatusNotFound {
+			lastErr = fmt.Errorf("POST /button/%s/press: status 404", name)
+			continue
+		}
+		if status < 200 || status > 299 {
+			return fmt.Errorf("POST /button/%s/press: status %d", name, status)
+		}
+		lastErr = nil
+		break
 	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("POST restart: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("POST restart: status %d: %s", resp.StatusCode, string(body))
+	if lastErr != nil {
+		return fmt.Errorf("restart button %q not found on the device: %w", c.restartButton, lastErr)
 	}
 
 	// The bridge is rebooting: every value collected before it is meaningless as a
@@ -480,6 +514,23 @@ func (c *Client) RestartDevice(ctx context.Context) error {
 	c.linkDownAt = time.Time{}
 	c.mu.Unlock()
 	return nil
+}
+
+// pressButton POSTs an ESPHome button press and returns the HTTP status; transport
+// failures are returned as errors.
+func (c *Client) pressButton(ctx context.Context, name string) (int, error) {
+	endpoint := fmt.Sprintf("%s/button/%s/press", c.baseURL, url.PathEscape(name))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, http.NoBody)
+	if err != nil {
+		return 0, fmt.Errorf("create POST restart request: %w", err)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("POST restart: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, nil
 }
 
 // linkDown reports whether a recent probe concluded the RS485 link is down.

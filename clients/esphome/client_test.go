@@ -1093,6 +1093,48 @@ func TestRestartDevice(t *testing.T) {
 		}
 	})
 
+	t.Run("falls back to the display-name spelling on 404", func(t *testing.T) {
+		var got []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got = append(got, r.URL.Path)
+			// The Marstek bridge keys entities by display name, so the slug 404s.
+			if r.URL.Path == "/button/Restart/press" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+
+		client := New(server.URL, 11)
+		client.SetRestartButton("restart")
+		if err := client.RestartDevice(context.Background()); err != nil {
+			t.Fatalf("RestartDevice() error = %v", err)
+		}
+		if want := []string{"/button/restart/press", "/button/Restart/press"}; strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("requests = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("unknown button under every spelling is an error", func(t *testing.T) {
+		var posts int
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			posts++
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+
+		client := New(server.URL, 11)
+		client.SetRestartButton("Reboot Bridge")
+		err := client.RestartDevice(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "not found") {
+			t.Fatalf("RestartDevice() error = %v, want not-found error", err)
+		}
+		if posts != 2 { // "Reboot Bridge" and "reboot_bridge"; the title form equals the configured one
+			t.Fatalf("posts = %d, want 2", posts)
+		}
+	})
+
 	t.Run("non-2xx is an error", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "nope", http.StatusInternalServerError)

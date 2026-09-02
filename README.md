@@ -49,6 +49,8 @@ button:
     name: "Restart"   # -> ESPHOME_RESTART_BUTTON=Restart
 ```
 
+Verified 2026-09-03 against the live device: `GET /button/Restart` answers `{"id":"button/Restart"}`, and a press reboots the bridge in about 8 seconds. Two pitfalls when testing by hand: the device's web server answers a bare `curl -X POST .../press` with `411 Length Required` (send `-H "Content-Length: 0"`; the Go client does this automatically), and a press reboots the node, so only test while the battery is idle. The same button is exposed in Home Assistant as `button.example_restart`.
+
 To capture the bridge's own debug log around the next freeze (the ESPHome web server streams it on `/events`), run `scripts/esp32-logtail.sh` on a machine that stays up, e.g. `nohup scripts/esp32-logtail.sh http://192.168.1.50 ~/esp32-events.log >/dev/null 2>&1 &`. It timestamps every log line in the trader's timezone, drops the routine Modbus chatter, and reconnects when the device reboots.
 
 ### Legacy UDP API (Optional)

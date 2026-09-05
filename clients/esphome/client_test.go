@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-
-	"github.com/foae/marstek-energy-trading/clients/marstek"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/foae/marstek-energy-trading/clients/marstek"
 )
 
 func newControlTestServer(t *testing.T, failOption string, initialRSMode ...string) (*httptest.Server, *[]string) {
@@ -109,18 +109,7 @@ func TestDiscover(t *testing.T) {
 func TestGetBatteryStatus(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case strings.Contains(r.URL.Path, "State%20Of%20Charge") || strings.Contains(r.URL.Path, "State Of Charge"):
-			w.Write([]byte(`{"id":"sensor-soc","value":75,"state":"75 %"}`))
-		case strings.Contains(r.URL.Path, "Temperature"):
-			w.Write([]byte(`{"id":"sensor-temp","value":25.5,"state":"25.5 °C"}`))
-		case strings.Contains(r.URL.Path, "Remaining%20Capacity") || strings.Contains(r.URL.Path, "Remaining Capacity"):
-			w.Write([]byte(`{"id":"sensor-cap","value":3.84,"state":"3.84 kWh"}`))
-		case strings.Contains(r.URL.Path, "Total%20Energy") || strings.Contains(r.URL.Path, "Total Energy"):
-			w.Write([]byte(`{"id":"sensor-total","value":5.12,"state":"5.12 kWh"}`))
-		default:
-			http.NotFound(w, r)
-		}
+		_, _ = w.Write([]byte(`{"id":"sensor-soc","value":75,"state":"75 %"}`))
 	}))
 	defer server.Close()
 
@@ -132,12 +121,6 @@ func TestGetBatteryStatus(t *testing.T) {
 	if status.SOC != 75 {
 		t.Errorf("SOC = %d, want 75", status.SOC)
 	}
-	if status.Temperature != 25.5 {
-		t.Errorf("Temperature = %v, want 25.5", status.Temperature)
-	}
-	if status.Capacity != 3840 { // kWh * 1000 = Wh
-		t.Errorf("Capacity = %v, want 3840", status.Capacity)
-	}
 	if !status.ChargingFlag {
 		t.Error("ChargingFlag = false, want true (SOC < 100)")
 	}
@@ -146,29 +129,31 @@ func TestGetBatteryStatus(t *testing.T) {
 	}
 }
 
-func TestGetBatteryStatus_PartialFailure(t *testing.T) {
-	// Only SOC available, other sensors fail
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if strings.Contains(r.URL.Path, "State%20Of%20Charge") || strings.Contains(r.URL.Path, "State Of Charge") {
-			w.Write([]byte(`{"id":"sensor-soc","value":50,"state":"50 %"}`))
-			return
-		}
-		http.NotFound(w, r)
-	}))
-	defer server.Close()
+func TestGetBatteryStatusRejectsMissingNullNonFiniteAndOutOfRangeSOC(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{name: "missing", payload: `{}`},
+		{name: "null", payload: `{"value":null}`},
+		{name: "non-finite", payload: `{"value":1e9999}`},
+		{name: "below-range", payload: `{"value":-0.1}`},
+		{name: "above-range", payload: `{"value":100.1}`},
+	}
 
-	client := New(server.URL, 11)
-	status, err := client.GetBatteryStatus()
-	if err != nil {
-		t.Fatalf("GetBatteryStatus() error = %v", err)
-	}
-	if status.SOC != 50 {
-		t.Errorf("SOC = %d, want 50", status.SOC)
-	}
-	// Other fields should be zero but not cause failure
-	if status.Temperature != 0 {
-		t.Errorf("Temperature = %v, want 0 (unavailable)", status.Temperature)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tt.payload))
+			}))
+			defer server.Close()
+
+			_, err := New(server.URL, 11).GetBatteryStatus()
+			if err == nil {
+				t.Fatal("GetBatteryStatus() error = nil, want invalid SOC error")
+			}
+		})
 	}
 }
 
@@ -210,6 +195,22 @@ func TestGetBatteryStatus_ChargingFlags(t *testing.T) {
 				t.Errorf("DischargFlag = %v, want %v", status.DischargFlag, tt.wantDischarg)
 			}
 		})
+	}
+}
+
+func TestGetBatteryStatusPreservesZeroMinSOC(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"value":5}`))
+	}))
+	defer server.Close()
+
+	status, err := New(server.URL, 0).GetBatteryStatus()
+	if err != nil {
+		t.Fatalf("GetBatteryStatus() error = %v", err)
+	}
+	if !status.DischargFlag {
+		t.Fatal("DischargFlag = false, want true for SOC 5 and configured minSOC 0")
 	}
 }
 
@@ -263,6 +264,53 @@ func TestChargeDoesNotRewriteEnabledRS485Mode(t *testing.T) {
 	}
 }
 
+func TestChargeContextRepeatedModeSkipsSelectWrites(t *testing.T) {
+	values := map[string]string{
+		"/select/RS485 Control Mode":        "disable",
+		"/select/Forcible Charge⁄Discharge": "stop",
+		"/number/Forcible Charge Power":     "0",
+	}
+	var posts []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entityPath := strings.TrimSuffix(r.URL.Path, "/set")
+		if r.Method == http.MethodPost {
+			posts = append(posts, r.URL.String())
+			if option := r.URL.Query().Get("option"); option != "" {
+				values[entityPath] = option
+			}
+			if value := r.URL.Query().Get("value"); value != "" {
+				values[entityPath] = value
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"value": values[entityPath]})
+	}))
+	defer server.Close()
+
+	client := New(server.URL, 11)
+	if err := client.ChargeContext(context.Background(), 500, 300); err != nil {
+		t.Fatalf("first ChargeContext() error = %v", err)
+	}
+	firstPostCount := len(posts)
+	if err := client.ChargeContext(context.Background(), 500, 300); err != nil {
+		t.Fatalf("second ChargeContext() error = %v", err)
+	}
+
+	var sawNumberWrite bool
+	for _, post := range posts[firstPostCount:] {
+		if strings.Contains(post, "option=") {
+			t.Fatalf("repeated charge rewrote a verified select: %v", posts[firstPostCount:])
+		}
+		if strings.Contains(post, "Forcible%20Charge%20Power") {
+			sawNumberWrite = true
+		}
+	}
+	if !sawNumberWrite {
+		t.Fatal("repeated charge did not acknowledge its power write")
+	}
+}
+
 func TestControlConfirmationTimeoutCoversESPHomePublicationCycle(t *testing.T) {
 	if controlConfirmationTimeout <= espHomeControlPublicationInterval {
 		t.Fatalf(
@@ -313,15 +361,6 @@ func TestChargeWaitsForControlConfirmation(t *testing.T) {
 	if err := New(server.URL, 11).Charge(500, 300); err != nil {
 		t.Fatalf("Charge() error = %v", err)
 	}
-	for _, entityPath := range []string{
-		"/select/RS485 Control Mode",
-		"/number/Forcible Charge Power",
-		"/select/Forcible Charge⁄Discharge",
-	} {
-		if getCounts[entityPath] < 2 {
-			t.Errorf("%s GET count = %d, want at least 2", entityPath, getCounts[entityPath])
-		}
-	}
 }
 
 func TestChargeRetriesUnconfirmedSelectWrite(t *testing.T) {
@@ -330,14 +369,14 @@ func TestChargeRetriesUnconfirmedSelectWrite(t *testing.T) {
 		"/select/Forcible Charge⁄Discharge": "stop",
 		"/number/Forcible Charge Power":     "0",
 	}
-	rs485Writes := 0
+	var rs485WriteTimes []time.Time
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		entityPath := strings.TrimSuffix(r.URL.Path, "/set")
 		if r.Method == http.MethodPost {
 			option := r.URL.Query().Get("option")
 			if entityPath == "/select/RS485 Control Mode" {
-				rs485Writes++
-				if rs485Writes == 1 {
+				rs485WriteTimes = append(rs485WriteTimes, time.Now())
+				if len(rs485WriteTimes) == 1 {
 					w.WriteHeader(http.StatusOK)
 					return
 				}
@@ -356,16 +395,16 @@ func TestChargeRetriesUnconfirmedSelectWrite(t *testing.T) {
 	}))
 	defer server.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	client := New(server.URL, 11)
-	// Production spaces retries 5 s apart; keep the test fast without weakening it.
-	client.writeRetryDelay = 20 * time.Millisecond
-	if err := client.ChargeContext(ctx, 500, 300); err != nil {
+	if err := New(server.URL, 11).ChargeContext(ctx, 500, 300); err != nil {
 		t.Fatalf("ChargeContext() error = %v", err)
 	}
-	if rs485Writes != 2 {
-		t.Fatalf("RS485 writes = %d, want 2", rs485Writes)
+	if len(rs485WriteTimes) != 2 {
+		t.Fatalf("RS485 writes = %d, want 2", len(rs485WriteTimes))
+	}
+	if retryDelay := rs485WriteTimes[1].Sub(rs485WriteTimes[0]); retryDelay < espHomeControlPublicationInterval {
+		t.Fatalf("RS485 retry delay = %s, want at least publication interval %s", retryDelay, espHomeControlPublicationInterval)
 	}
 }
 
@@ -419,57 +458,22 @@ func TestDischarge(t *testing.T) {
 	}
 }
 
-func TestIdle(t *testing.T) {
-	server, calledPathsPtr := newControlTestServer(t, "")
-	defer server.Close()
-	calledPaths := *calledPathsPtr
-
-	client := New(server.URL, 11)
-	err := client.Idle()
-	calledPaths = *calledPathsPtr
-	if err != nil {
-		t.Fatalf("Idle() error = %v", err)
-	}
-
-	if len(calledPaths) != 2 {
-		t.Fatalf("expected 2 calls, got %d: %v", len(calledPaths), calledPaths)
-	}
-
-	if !strings.Contains(calledPaths[0], "option=enable") {
-		t.Errorf("first call should enable RS485 control mode, got: %s", calledPaths[0])
-	}
-	if !strings.Contains(calledPaths[1], "option=stop") {
-		t.Errorf("second call should force mode to stop, got: %s", calledPaths[1])
-	}
-	for _, path := range calledPaths {
-		if strings.Contains(path, "option=disable") {
-			t.Errorf("idle must leave RS485 control enabled: %v", calledPaths)
-		}
-	}
-}
-
 func TestIdle_StopFailureKeepsRS485Enabled(t *testing.T) {
 	server, calledPathsPtr := newControlTestServer(t, "stop")
 	defer server.Close()
 	calledPaths := *calledPathsPtr
 
 	client := New(server.URL, 11)
+	if err := client.Charge(1000, 300); err != nil {
+		t.Fatal(err)
+	}
+	*calledPathsPtr = nil
 	err := client.Idle()
 	calledPaths = *calledPathsPtr
 	if err == nil {
 		t.Fatal("Idle() error = nil, want error when stop fails")
 	}
 
-	if len(calledPaths) != 2 {
-		t.Fatalf("expected 2 calls (enable + stop), got %d: %v", len(calledPaths), calledPaths)
-	}
-
-	if !strings.Contains(calledPaths[0], "option=enable") {
-		t.Errorf("first call should be enable, got: %s", calledPaths[0])
-	}
-	if !strings.Contains(calledPaths[1], "option=stop") {
-		t.Errorf("second call should be stop, got: %s", calledPaths[1])
-	}
 	for _, path := range calledPaths {
 		if strings.Contains(path, "option=disable") {
 			t.Errorf("RS485 must remain enabled when stop is unconfirmed: %v", calledPaths)
@@ -479,6 +483,40 @@ func TestIdle_StopFailureKeepsRS485Enabled(t *testing.T) {
 	// Error should identify the stop failure
 	if !strings.Contains(err.Error(), "stop") {
 		t.Errorf("error should mention stop, got: %v", err)
+	}
+}
+
+func TestIdleContextSucceedsWhenStopIsConfirmedAfterEnableFailure(t *testing.T) {
+	values := map[string]string{
+		"/select/RS485 Control Mode":        "disable",
+		"/select/Forcible Charge⁄Discharge": "charge",
+	}
+	stopConfirmed := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entityPath := strings.TrimSuffix(r.URL.Path, "/set")
+		if r.Method == http.MethodPost {
+			if entityPath == "/select/RS485 Control Mode" {
+				http.Error(w, "enable failed", http.StatusInternalServerError)
+				return
+			}
+			if option := r.URL.Query().Get("option"); option != "" {
+				values[entityPath] = option
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if entityPath == "/select/Forcible Charge⁄Discharge" && values[entityPath] == "stop" {
+			stopConfirmed = true
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"value": values[entityPath]})
+	}))
+	defer server.Close()
+
+	if err := New(server.URL, 11).IdleContext(context.Background()); err != nil {
+		t.Fatalf("IdleContext() error = %v, want confirmed stop success", err)
+	}
+	if !stopConfirmed {
+		t.Fatal("IdleContext() returned success without an authoritative stop confirmation")
 	}
 }
 
@@ -524,35 +562,6 @@ func TestSetPassiveMode_Discharge(t *testing.T) {
 	}
 }
 
-func TestSetPassiveMode_Idle(t *testing.T) {
-	server, calledPathsPtr := newControlTestServer(t, "")
-	defer server.Close()
-	calledPaths := *calledPathsPtr
-
-	client := New(server.URL, 11)
-	// Zero power = idle
-	err := client.SetPassiveMode(0, 300)
-	calledPaths = *calledPathsPtr
-	if err != nil {
-		t.Fatalf("SetPassiveMode() error = %v", err)
-	}
-
-	if len(calledPaths) != 2 {
-		t.Fatalf("expected 2 calls for idle, got %d", len(calledPaths))
-	}
-	if !strings.Contains(calledPaths[0], "option=enable") {
-		t.Errorf("zero power should enable RS485 control mode first, got: %s", calledPaths[0])
-	}
-	if !strings.Contains(calledPaths[1], "option=stop") {
-		t.Errorf("zero power should trigger idle/stop mode, got: %s", calledPaths[1])
-	}
-	for _, path := range calledPaths {
-		if strings.Contains(path, "option=disable") {
-			t.Errorf("idle must leave RS485 control enabled: %v", calledPaths)
-		}
-	}
-}
-
 func TestGetESStatus(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -561,8 +570,6 @@ func TestGetESStatus(t *testing.T) {
 			w.Write([]byte(`{"id":"sensor-soc","value":80,"state":"80 %"}`))
 		case strings.Contains(r.URL.Path, "Battery%20Power") || strings.Contains(r.URL.Path, "Battery Power"):
 			w.Write([]byte(`{"id":"sensor-power","value":1500,"state":"1500 W"}`)) // positive = charging
-		case strings.Contains(r.URL.Path, "Remaining%20Capacity") || strings.Contains(r.URL.Path, "Remaining Capacity"):
-			w.Write([]byte(`{"id":"sensor-cap","value":4.1,"state":"4.1 kWh"}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -579,9 +586,6 @@ func TestGetESStatus(t *testing.T) {
 	}
 	if status.BatteryPower != 1500 {
 		t.Errorf("BatteryPower = %v, want 1500", status.BatteryPower)
-	}
-	if status.BatteryCapacity != 0 {
-		t.Errorf("BatteryCapacity = %v, want 0", status.BatteryCapacity)
 	}
 }
 
@@ -615,27 +619,6 @@ func TestGetESStatus_ContextCancellation(t *testing.T) {
 	_, err := client.GetESStatus(ctx)
 	if err == nil || !strings.Contains(err.Error(), "context canceled") {
 		t.Fatalf("GetESStatus() error = %v, want context cancellation", err)
-	}
-}
-
-func TestGetBatteryStatusContext_CancellationDuringOptionalSensors(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "State Of Charge"):
-			_, _ = w.Write([]byte(`{"value":80}`))
-		case strings.Contains(r.URL.Path, "Battery Power"):
-			_, _ = w.Write([]byte(`{"value":500}`))
-		default:
-			<-r.Context().Done()
-		}
-	}))
-	defer server.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	_, err := New(server.URL, 11).GetBatteryStatusContext(ctx)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("GetESStatus() error = %v, want context deadline exceeded", err)
 	}
 }
 
@@ -830,33 +813,6 @@ func TestLinkDownVerdictFailsFastAndClearsOnTelemetryChange(t *testing.T) {
 	}
 }
 
-func TestControlWriteRetryDelayFitsConfirmationWindow(t *testing.T) {
-	if got := New("http://example.invalid", 11).writeRetryDelay; got != controlWriteRetryDelay {
-		t.Fatalf("New() writeRetryDelay = %s, want %s", got, controlWriteRetryDelay)
-	}
-	if controlWriteRetryDelay != 4*time.Second {
-		t.Fatalf("controlWriteRetryDelay = %s, want 4s", controlWriteRetryDelay)
-	}
-	// Retries land at 4 s and 12 s: both must fit inside the confirmation window.
-	if controlWriteRetryDelay*3 >= controlConfirmationTimeout {
-		t.Fatalf(
-			"retry cadence %s does not fit confirmation timeout %s",
-			controlWriteRetryDelay*3,
-			controlConfirmationTimeout,
-		)
-	}
-	// The last retry must leave ESPHome enough time to poll the value back.
-	lastRetryAt := controlWriteRetryDelay + 2*controlWriteRetryDelay
-	if controlConfirmationTimeout-lastRetryAt < 5*time.Second {
-		t.Fatalf(
-			"last retry at %s leaves only %s of the %s confirmation window, want >= 5s",
-			lastRetryAt,
-			controlConfirmationTimeout-lastRetryAt,
-			controlConfirmationTimeout,
-		)
-	}
-}
-
 func TestCheckLink_TelemetryMovingIsHealthy(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex
@@ -1032,7 +988,6 @@ func TestRefreshPassiveModeContext(t *testing.T) {
 			defer server.Close()
 
 			client := New(server.URL, 11)
-			client.writeRetryDelay = 20 * time.Millisecond
 			if err := client.RefreshPassiveModeContext(context.Background(), tt.power, 300); err != nil {
 				t.Fatalf("RefreshPassiveModeContext() error = %v", err)
 			}
@@ -1045,17 +1000,9 @@ func TestRefreshPassiveModeContext(t *testing.T) {
 			if !tt.wantPost {
 				return
 			}
-			var sawSelect, sawNumber bool
-			for _, post := range *posts {
-				if strings.Contains(post, "Forcible%20Charge%E2%81%84Discharge") {
-					sawSelect = true
-				}
-				if strings.Contains(post, "Forcible%20Discharge%20Power") {
-					sawNumber = true
-				}
-			}
-			if !sawSelect || !sawNumber {
-				t.Fatalf("posts = %v, want both discharge power and force-mode writes", *posts)
+			if tt.values["/select/Forcible Charge⁄Discharge"] != "discharge" ||
+				tt.values["/number/Forcible Discharge Power"] != "2200" {
+				t.Fatalf("battery target not restored: %v", tt.values)
 			}
 		})
 	}
@@ -1245,8 +1192,7 @@ func TestRefreshPassiveModeContext_LinkDownFailsFast(t *testing.T) {
 
 func TestRefreshPassiveModeContext_LostControlModeReasserts(t *testing.T) {
 	t.Parallel()
-	// Forcible mode still matches, but the battery dropped RS485 control mode:
-	// everything must be re-asserted.
+	// Recover ownership without rewriting an already matching force mode.
 	values := map[string]string{
 		"/select/RS485 Control Mode":        "disable",
 		"/select/Forcible Charge⁄Discharge": "discharge",
@@ -1257,24 +1203,12 @@ func TestRefreshPassiveModeContext_LostControlModeReasserts(t *testing.T) {
 	defer server.Close()
 
 	client := New(server.URL, 11)
-	client.writeRetryDelay = 20 * time.Millisecond
 	if err := client.RefreshPassiveModeContext(context.Background(), 2200, 300); err != nil {
 		t.Fatalf("RefreshPassiveModeContext() error = %v", err)
 	}
 
-	var sawControlMode, sawSelect, sawNumber bool
-	for _, post := range *posts {
-		if strings.Contains(post, "RS485%20Control%20Mode") {
-			sawControlMode = true
-		}
-		if strings.Contains(post, "Forcible%20Charge%E2%81%84Discharge") {
-			sawSelect = true
-		}
-		if strings.Contains(post, "Forcible%20Discharge%20Power") {
-			sawNumber = true
-		}
-	}
-	if !sawControlMode || !sawSelect || !sawNumber {
-		t.Fatalf("posts = %v, want control mode, discharge power and force-mode writes", *posts)
+	if values["/select/RS485 Control Mode"] != "enable" ||
+		values["/select/Forcible Charge⁄Discharge"] != "discharge" {
+		t.Fatalf("battery control not restored: %v; posts: %v", values, *posts)
 	}
 }

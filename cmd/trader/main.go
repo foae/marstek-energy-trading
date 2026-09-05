@@ -69,7 +69,7 @@ func main() {
 			SupplierFeeEURPerKWh: cfg.SupplierFeeEURPerKWh,
 		},
 	)
-	minSOC := int(cfg.BatteryMinSOC * 100)
+	minSOC := cfg.MinSOCPercent()
 	esphomeClient := esphome.New(cfg.ESPHomeURL, minSOC)
 	defer esphomeClient.Close()
 	esphomeClient.SetRestartButton(cfg.ESPHomeRestartButton)
@@ -136,6 +136,9 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
+	// Create context for graceful shutdown
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 	// WaitGroup for graceful shutdown
 	var wg sync.WaitGroup
 
@@ -146,13 +149,9 @@ func main() {
 		slog.Info("HTTP server listening", "addr", cfg.HTTPListenAddr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("HTTP server error", "error", err)
-			os.Exit(1)
+			stop()
 		}
 	}()
-
-	// Create context for graceful shutdown
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	// Start trading loop in background
 	wg.Add(1)

@@ -25,18 +25,6 @@ func makePrices(baseTime time.Time, values ...float64) []nordpool.Price {
 	return prices
 }
 
-// Helper to create priceSlots for internal function tests.
-func makePriceSlots(baseTime time.Time, values ...float64) []priceSlot {
-	slots := make([]priceSlot, len(values))
-	for i, v := range values {
-		slots[i] = priceSlot{
-			Time:  baseTime.Add(time.Duration(i) * 15 * time.Minute),
-			Value: decimal.NewFromFloat(v),
-		}
-	}
-	return slots
-}
-
 // Default test config: 5.12 kWh battery, 2500W charge/discharge, 90% efficiency, 11% min SOC
 func defaultTestConfig() AnalyzerConfig {
 	return AnalyzerConfig{
@@ -371,6 +359,56 @@ func TestAnalyzePrices_SmallWindow(t *testing.T) {
 	}
 }
 
+func TestAnalyzePrices_MaximizesTotalProfitAcrossCycles(t *testing.T) {
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	cfg := AnalyzerConfig{
+		Efficiency:         1,
+		MinPriceSpread:     0.01,
+		BatteryCapacityKWh: 0.5,
+		ChargePowerW:       2000,
+		DischargePowerW:    2000,
+		MaxCyclesPerDay:    2,
+	}
+
+	plan := AnalyzePrices(makePrices(baseTime, 0.10, 0.30, 0.15, 0.40), cfg)
+	if len(plan.Cycles) != 2 {
+		t.Fatalf("expected two cycles, got %d", len(plan.Cycles))
+	}
+
+	totalProfit := decimal.Zero
+	for _, cycle := range plan.Cycles {
+		totalProfit = totalProfit.Add(cycle.Profit)
+	}
+	if !decimalEqual(totalProfit, 0.45) {
+		t.Errorf("expected total profit 0.45, got %s", totalProfit)
+	}
+	if !plan.Cycles[0].ChargeWindow.Start.Equal(baseTime) ||
+		!plan.Cycles[0].DischargeWindow.Start.Equal(baseTime.Add(15*time.Minute)) ||
+		!plan.Cycles[1].ChargeWindow.Start.Equal(baseTime.Add(30*time.Minute)) ||
+		!plan.Cycles[1].DischargeWindow.Start.Equal(baseTime.Add(45*time.Minute)) {
+		t.Errorf("expected sequential low/high pairs, got %+v", plan.Cycles)
+	}
+}
+
+func TestAnalyzePrices_RejectsWindowsAcrossPriceGaps(t *testing.T) {
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	cfg := AnalyzerConfig{
+		Efficiency:         1,
+		MinPriceSpread:     0.01,
+		BatteryCapacityKWh: 1,
+		ChargePowerW:       2000,
+		DischargePowerW:    2000,
+		MaxCyclesPerDay:    2,
+	}
+	prices := makePrices(baseTime, 0.10, 0.10, 0.40, 0.40)
+	prices[3].Time = baseTime.Add(75 * time.Minute)
+
+	plan := AnalyzePrices(prices, cfg)
+	if len(plan.Cycles) != 0 {
+		t.Errorf("expected no cycles using a gap-spanning discharge window, got %d", len(plan.Cycles))
+	}
+}
+
 func TestCalculateWindowSize(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -412,52 +450,6 @@ func TestCalculateWindowSize(t *testing.T) {
 					tt.capacityKWh, tt.powerW, got, tt.wantSlots)
 			}
 		})
-	}
-}
-
-func TestFindBestWindow(t *testing.T) {
-	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
-	// Prices: 0.10, 0.08, 0.05, 0.06, 0.15, 0.20, 0.18, 0.12
-	// Indices:  0     1     2     3     4     5     6     7
-	slots := makePriceSlots(baseTime, 0.10, 0.08, 0.05, 0.06, 0.15, 0.20, 0.18, 0.12)
-
-	// Find lowest 2-slot window
-	startIdx, avg, found := findBestWindow(slots, 0, 2, true)
-	if !found {
-		t.Fatal("expected to find a window")
-	}
-	if startIdx != 2 { // slots 2-3 have 0.05 and 0.06, avg = 0.055
-		t.Errorf("expected startIdx=2, got %d", startIdx)
-	}
-	if !decimalEqual(avg, 0.055) {
-		t.Errorf("expected avg=0.055, got %s", avg)
-	}
-
-	// Find highest 2-slot window
-	// Slot pairs: (0,1)=0.09, (1,2)=0.065, (2,3)=0.055, (3,4)=0.105, (4,5)=0.175, (5,6)=0.19, (6,7)=0.15
-	// Highest is (5,6) = 0.19
-	startIdx, avg, found = findBestWindow(slots, 0, 2, false)
-	if !found {
-		t.Fatal("expected to find a window")
-	}
-	if startIdx != 5 { // slots 5-6 have 0.20 and 0.18, avg = 0.19
-		t.Errorf("expected startIdx=5, got %d", startIdx)
-	}
-	if !decimalEqual(avg, 0.19) {
-		t.Errorf("expected avg=0.19, got %s", avg)
-	}
-
-	// Find highest after index 5 (only (5,6) and (6,7) are valid)
-	// (5,6)=0.19, (6,7)=0.15
-	startIdx, avg, found = findBestWindow(slots, 5, 2, false)
-	if !found {
-		t.Fatal("expected to find a window")
-	}
-	if startIdx != 5 { // slots 5-6 have 0.20 and 0.18, avg = 0.19
-		t.Errorf("expected startIdx=5, got %d", startIdx)
-	}
-	if !decimalEqual(avg, 0.19) {
-		t.Errorf("expected avg=0.19, got %s", avg)
 	}
 }
 

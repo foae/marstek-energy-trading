@@ -4,15 +4,13 @@ A Go service that performs energy price arbitrage using a Marstek Venus E batter
 
 ## Trading Strategy
 
-The service analyzes NordPool 15-minute resolution prices to find:
-- **Charge windows**: Time slots in the bottom 25% of the daily price range
-- **Discharge windows**: Time slots in the top 25% of the daily price range
+The analyzer evaluates contiguous charge and later discharge windows sized for usable battery capacity and configured power. Dynamic programming selects up to `MAX_CYCLES_PER_DAY` chronological, non-overlapping pairs that maximize total expected cycle profit; it does not use daily price quartiles or greedily commit one pair at a time.
 
-A trade is only executed when:
-1. Price spread exceeds the configured minimum (`MIN_PRICE_SPREAD`)
-2. Discharge price > charge price / efficiency (accounts for 10% energy loss)
+A pair is eligible only when:
+1. The discharge-window average exceeds the charge-window average divided by `BATTERY_EFFICIENCY`.
+2. The raw average-price spread meets `MIN_PRICE_SPREAD`.
 
-Typical daily pattern: overnight cheap (charge) → morning peak (discharge) → afternoon dip (charge) → evening peak (discharge).
+For the next charge deadline, the service reserves the cheapest available 15-minute slices from the known today and tomorrow tariffs needed to bring the current SOC to 100%. It uses no solar forecast: solar captured before or during planning raises measured SOC and therefore reduces the grid requirement. After a grid charge has run for 30 seconds, the reservation uses any lower observed charging power as a taper limit; if even every eligible slice cannot fill the requirement, it reserves them all and charges best-effort. For a feasible reservation, solar starts only when its current symmetric export opportunity cost is no greater than the marginal reserved grid price; it otherwise exports solar now and buys cheaper grid energy later. No charge deadline or an infeasible reservation retains solar capture.
 
 ## Components
 
@@ -33,6 +31,11 @@ The service uses an ESPHome device as a bridge to control the battery via HTTP R
 
 - **Default endpoint**: `http://192.168.1.50`
 - **Protocol**: HTTP REST with JSON responses
+
+### Control confirmation and stopping
+Before changing an ESPHome select, the client reads its current value and writes only when it differs. It polls the battery-backed select value for up to 35 seconds, with at most one retry after the 15-second ESPHome publication interval; an HTTP success alone is not accepted as control success. The service separately verifies signed measured battery power before declaring a charge or discharge session started.
+
+Stop is sticky intent: a session is neither marked idle nor recorded until the stop select is confirmed. Failed stops retain the active state and retry with throttling; while stopping is pending, no new forced action is issued. Scheduled-session telemetry failures request the same fail-safe stop, and repeated solar P1 or battery-telemetry failures do likewise.
 
 #### RS485 link freeze recovery
 The bridge's Modbus/RS485 link to the battery can freeze mid-session: telemetry keeps returning the last values, control writes are silently dropped, and the battery keeps charging or discharging on the last accepted command.
@@ -59,19 +62,17 @@ Direct UDP control is available but not enabled by default. See [docs/marstek-ap
 ### NordPool API
 - **Endpoint**: `https://dataportal-api.nordpoolgroup.com/api/DayAheadPriceIndices`
 - **Resolution**: 15-minute intervals
-- **Prices**: EUR/MWh, converted internally to all-in EUR/kWh using `(NordPool + energy tax) × (1 + VAT) + supplier fee`
+- **Prices**: EUR/MWh, converted internally to all-in EUR/kWh using `(NordPool + energy tax) × (1 + VAT) + supplier fee`. The same configured all-in rate is used for imported grid energy, discharge/export valuation, and solar export opportunity cost; there is no separate feed-in tariff.
 
 ### HomeWizard P1 Energy Meter
 The P1 meter enables solar self-consumption charging. Battery draw is compensated using measured battery power, and an EMA smooths the power target.
 
-- Start after 30 consecutive surplus readings (normally about 30 seconds).
+- Start after 30 seconds of sustained surplus; a telemetry gap longer than two seconds restarts qualification. EMA smoothing and telemetry-failure protection use elapsed time, not poll counts.
 - When smoothed surplus falls below the useful charging threshold (at least 75 W), request 75 W for up to 60 seconds before stopping. Recovery clears the grace timer. The normal five-second battery settling interval still applies.
-- Surplus-loss sessions under 10 minutes receive a five-minute restart cooldown; three consecutive marginal sessions increase it to 15 minutes. Longer sessions and battery-full/scheduled-window stops reset the streak and use a one-minute cooldown.
-- Battery-full protection and scheduled windows override the grace even when the P1 meter is unavailable. Repeated P1 or battery telemetry failures stop charging through the existing fault path. A failed power adjustment immediately requests a confirmed stop; unsuccessful stops retain the session and use throttled retries.
+- Surplus-loss sessions under 10 minutes receive a five-minute restart cooldown; three consecutive marginal sessions increase it to 15 minutes. Longer sessions and battery-full/reservation/discharge-window stops reset the streak and use a one-minute cooldown.
+- Battery-full protection, an active reservation, and a discharge window override the grace even when the P1 meter is unavailable. A feasible reservation also suppresses a new solar session when the current tariff is above its marginal reserved price; an unavailable current tariff does not justify solar in that case. A failed power adjustment requests a confirmed stop; failed stops retain the session and use throttled retries.
 
-Bridging a dip can import grid energy: a 75 W floor for 60 seconds is 1.25 Wh with no solar surplus. This is not a bound on whole-house import or on energy used while the EMA settles. Fewer start/stop events do not imply a quantified battery lifespan improvement.
-
-Solar-session history separates estimated grid input (`grid_energy_kwh`) and its priced cost (`grid_cost_eur`) from solar energy. Grid attribution is capped at measured battery draw and net household import; it is not revenue-grade metering. Missing-price energy is reported as `grid_unpriced_kwh`, so P&L is incomplete until those costs are known. Older solar records retain their original all-solar interpretation. Daily totals include `grid_charged_kwh` and `unpriced_grid_kwh`.
+Solar sessions record energy integrated from measured battery power, not scheduled energy. Estimated grid input is capped at measured battery draw and net household import; its known-price cost is separate from solar energy. Solar energy receives the same rate as forgone export as per-trade `opportunity_cost_eur` (aggregated as `solar_opportunity_cost_eur`), so it is not treated as free trading profit. Reported P&L is cash flow—priced discharge revenue less priced grid cost—not inventory-matched profit and does not deduct that opportunity cost. Energy with no retained price slot is explicitly recorded as unpriced (`unpriced_kwh` or `grid_unpriced_kwh`); P&L is incomplete for it. These estimates are not revenue-grade metering, and older solar records retain their original all-solar interpretation.
 
 ## Quick Start
 

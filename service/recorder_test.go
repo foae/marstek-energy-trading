@@ -321,11 +321,40 @@ func TestLoadTrades_FileNotFound(t *testing.T) {
 func TestLoadTrades_CorruptedJSON(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "trades.json")
-	os.WriteFile(path, []byte("{invalid json"), 0o644)
+	corruptData := []byte("{invalid json")
+	if err := os.WriteFile(path, corruptData, 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	r := NewRecorder(dir, 0.90, time.UTC)
 	if err := r.LoadTrades(); err == nil {
-		t.Error("LoadTrades() error = nil, want error for corrupted JSON")
+		t.Fatal("LoadTrades() error = nil, want error for corrupted JSON")
+	}
+
+	trade := Trade{Timestamp: time.Now(), Action: ActionCharge}
+	if err := r.RecordTrade(trade); err == nil {
+		t.Error("RecordTrade() error = nil after failed LoadTrades()")
+	}
+	if history := r.GetHistory(); len(history.Days) != 0 {
+		t.Errorf("RecordTrade() mutated history after failed LoadTrades(): %+v", history)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(corruptData) {
+		t.Errorf("trades.json was overwritten after failed LoadTrades(): got %q, want %q", got, corruptData)
+	}
+
+	if err := os.WriteFile(path, []byte("[]"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.LoadTrades(); err != nil {
+		t.Fatalf("LoadTrades() error = %v after repairing file", err)
+	}
+	if err := r.RecordTrade(trade); err != nil {
+		t.Errorf("RecordTrade() error = %v after successful LoadTrades()", err)
 	}
 }
 
@@ -383,12 +412,15 @@ func TestGetHistory_SolarGridAccountingPersists(t *testing.T) {
 		t.Fatalf("RecordTrade(grid charge) error = %v", err)
 	}
 	if err := r.RecordTrade(Trade{
-		Timestamp:       ts.Add(time.Hour),
-		Action:          ActionSolarCharge,
-		EnergyKWh:       decimal.NewFromFloat(2),
-		GridEnergyKWh:   decimal.NewFromFloat(1),
-		GridCostEUR:     decimal.NewFromFloat(-0.10),
-		GridUnpricedKWh: decimal.NewFromFloat(0.5),
+		Timestamp:          ts.Add(time.Hour),
+		Action:             ActionSolarCharge,
+		EnergyKWh:          decimal.NewFromFloat(2),
+		GridEnergyKWh:      decimal.NewFromFloat(1),
+		GridCostEUR:        decimal.NewFromFloat(-0.10),
+		GridUnpricedKWh:    decimal.NewFromFloat(0.5),
+		UnpricedKWh:        decimal.NewFromFloat(0.25),
+		OpportunityCostEUR: decimal.NewFromFloat(0.15),
+		EnergyBasis:        "measured_battery_power",
 	}); err != nil {
 		t.Fatalf("RecordTrade(mixed solar charge) error = %v", err)
 	}
@@ -423,6 +455,12 @@ func TestGetHistory_SolarGridAccountingPersists(t *testing.T) {
 	if !day.UnpricedGridKWh.Equal(decimal.NewFromFloat(0.5)) {
 		t.Errorf("UnpricedGridKWh = %s, want 0.5", day.UnpricedGridKWh)
 	}
+	if !day.UnpricedKWh.Equal(decimal.NewFromFloat(0.75)) {
+		t.Errorf("UnpricedKWh = %s, want 0.75", day.UnpricedKWh)
+	}
+	if !day.SolarOpportunityCostEUR.Equal(decimal.NewFromFloat(0.15)) {
+		t.Errorf("SolarOpportunityCostEUR = %s, want 0.15", day.SolarOpportunityCostEUR)
+	}
 	expectedAvgPrice := decimal.NewFromFloat(0.10).Div(decimal.NewFromFloat(1.5))
 	if !day.AvgChargePrice.Equal(expectedAvgPrice) {
 		t.Errorf("AvgChargePrice = %s, want %s", day.AvgChargePrice, expectedAvgPrice)
@@ -444,8 +482,11 @@ func TestGetHistory_SolarGridAccountingPersists(t *testing.T) {
 	solarTrade := day.Trades[1]
 	if !solarTrade.GridEnergyKWh.Equal(decimal.NewFromFloat(1)) ||
 		!solarTrade.GridCostEUR.Equal(decimal.NewFromFloat(-0.10)) ||
-		!solarTrade.GridUnpricedKWh.Equal(decimal.NewFromFloat(0.5)) {
-		t.Errorf("persisted solar grid accounting = %+v", solarTrade)
+		!solarTrade.GridUnpricedKWh.Equal(decimal.NewFromFloat(0.5)) ||
+		!solarTrade.UnpricedKWh.Equal(decimal.NewFromFloat(0.25)) ||
+		!solarTrade.OpportunityCostEUR.Equal(decimal.NewFromFloat(0.15)) ||
+		solarTrade.EnergyBasis != "measured_battery_power" {
+		t.Errorf("persisted solar accounting = %+v", solarTrade)
 	}
 }
 
@@ -484,5 +525,121 @@ func TestLoadTrades_HistoricalSolarChargeRemainsAllSolar(t *testing.T) {
 	}
 	if !day.UnpricedGridKWh.IsZero() {
 		t.Errorf("UnpricedGridKWh = %s, want 0", day.UnpricedGridKWh)
+	}
+	if !day.UnpricedKWh.IsZero() {
+		t.Errorf("UnpricedKWh = %s, want 0", day.UnpricedKWh)
+	}
+	if !day.SolarOpportunityCostEUR.IsZero() {
+		t.Errorf("SolarOpportunityCostEUR = %s, want 0", day.SolarOpportunityCostEUR)
+	}
+	if trade := day.Trades[0]; !trade.UnpricedKWh.IsZero() || !trade.OpportunityCostEUR.IsZero() || trade.EnergyBasis != "" {
+		t.Errorf("legacy trade additions = %+v, want zero values", trade)
+	}
+}
+
+func TestGetHistory_ExcludesUnpricedEnergyFromCashFlow(t *testing.T) {
+	r := NewRecorder("", 0.90, time.UTC)
+	ts := time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC)
+
+	for _, trade := range []Trade{
+		{
+			Timestamp:   ts,
+			Action:      ActionCharge,
+			PriceEUR:    decimal.NewFromFloat(0.10),
+			EnergyKWh:   decimal.NewFromFloat(2),
+			UnpricedKWh: decimal.NewFromFloat(0.5),
+			EnergyBasis: "measured_battery_power",
+		},
+		{
+			Timestamp:          ts.Add(time.Hour),
+			Action:             ActionSolarCharge,
+			EnergyKWh:          decimal.NewFromFloat(1.5),
+			GridEnergyKWh:      decimal.NewFromFloat(0.5),
+			GridCostEUR:        decimal.NewFromFloat(0.08),
+			GridUnpricedKWh:    decimal.NewFromFloat(0.1),
+			UnpricedKWh:        decimal.NewFromFloat(0.5),
+			OpportunityCostEUR: decimal.NewFromFloat(0.18),
+			EnergyBasis:        "measured_battery_power",
+		},
+		{
+			Timestamp:   ts.Add(2 * time.Hour),
+			Action:      ActionDischarge,
+			PriceEUR:    decimal.NewFromFloat(0.20),
+			EnergyKWh:   decimal.NewFromFloat(3),
+			UnpricedKWh: decimal.NewFromFloat(1),
+			EnergyBasis: "measured_battery_power",
+		},
+	} {
+		if err := r.RecordTrade(trade); err != nil {
+			t.Fatalf("RecordTrade() error = %v", err)
+		}
+	}
+
+	day := r.GetHistory().Days[0]
+	if !day.UnpricedKWh.Equal(decimal.NewFromFloat(2.1)) {
+		t.Errorf("UnpricedKWh = %s, want 2.1", day.UnpricedKWh)
+	}
+	if !day.SolarOpportunityCostEUR.Equal(decimal.NewFromFloat(0.18)) {
+		t.Errorf("SolarOpportunityCostEUR = %s, want 0.18", day.SolarOpportunityCostEUR)
+	}
+
+	// Cash flow excludes unknown scheduled energy and solar opportunity cost.
+	expectedCashFlow := decimal.NewFromFloat(0.17)
+	if !day.PnLEUR.Equal(expectedCashFlow) {
+		t.Errorf("PnLEUR = %s, want %s", day.PnLEUR, expectedCashFlow)
+	}
+	if !r.GetTotalPnL().Equal(expectedCashFlow) {
+		t.Errorf("GetTotalPnL() = %s, want %s", r.GetTotalPnL(), expectedCashFlow)
+	}
+}
+
+func TestGetHistory_SplitsCrossMidnightTradeByLocalDay(t *testing.T) {
+	loc, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewRecorder("", 0.90, loc)
+	if err := r.RecordTrade(Trade{
+		Timestamp:   time.Date(2024, 1, 15, 23, 30, 0, 0, loc),
+		Action:      ActionCharge,
+		PriceEUR:    decimal.NewFromFloat(0.10),
+		DurationS:   3600,
+		EnergyKWh:   decimal.NewFromFloat(2),
+		UnpricedKWh: decimal.NewFromFloat(0.5),
+		EnergyBasis: "measured_battery_power",
+	}); err != nil {
+		t.Fatalf("RecordTrade() error = %v", err)
+	}
+
+	history := r.GetHistory()
+	if len(history.Days) != 2 {
+		t.Fatalf("len(Days) = %d, want 2", len(history.Days))
+	}
+	if history.Days[0].Date != "2024-01-16" || history.Days[1].Date != "2024-01-15" {
+		t.Fatalf("Dates = [%s %s], want [2024-01-16 2024-01-15]", history.Days[0].Date, history.Days[1].Date)
+	}
+
+	for _, day := range history.Days {
+		if !day.ChargedKWh.Equal(decimal.NewFromFloat(1)) {
+			t.Errorf("%s ChargedKWh = %s, want 1", day.Date, day.ChargedKWh)
+		}
+		if !day.UnpricedKWh.Equal(decimal.NewFromFloat(0.25)) {
+			t.Errorf("%s UnpricedKWh = %s, want 0.25", day.Date, day.UnpricedKWh)
+		}
+		if !day.PnLEUR.Equal(decimal.NewFromFloat(-0.075)) {
+			t.Errorf("%s PnLEUR = %s, want -0.075", day.Date, day.PnLEUR)
+		}
+		if len(day.Trades) != 1 || day.Trades[0].DurationS != 1800 {
+			t.Errorf("%s trade duration = %+v, want one 1800-second fragment", day.Date, day.Trades)
+		}
+	}
+	if history.Days[0].ChargeCycles+history.Days[1].ChargeCycles != 1 {
+		t.Errorf("charge cycles = %d, want 1", history.Days[0].ChargeCycles+history.Days[1].ChargeCycles)
+	}
+	if !history.TotalPnL.Equal(decimal.NewFromFloat(-0.15)) {
+		t.Errorf("TotalPnL = %s, want -0.15", history.TotalPnL)
+	}
+	if !r.GetTotalPnL().Equal(decimal.NewFromFloat(-0.15)) {
+		t.Errorf("GetTotalPnL() = %s, want -0.15", r.GetTotalPnL())
 	}
 }

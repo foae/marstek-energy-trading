@@ -18,18 +18,17 @@ import (
 )
 
 const (
-	defaultTimeout = 10 * time.Second
+	defaultTimeout          = 10 * time.Second
+	controlOperationTimeout = 45 * time.Second
 
-	// ESPHome can acknowledge a REST select write even when the underlying
-	// Modbus command is dropped. Retry idempotent select writes with backoff
-	// while waiting for the next published value. Retries start only after
-	// ESPHome had a chance to poll the register back from the battery —
-	// re-writing sooner just piles duplicate Modbus frames onto the hub.
+	// ESPHome publishes select values every 15 seconds. Verify the current
+	// battery-backed value first; when it differs, permit one retry only after
+	// a full publication interval so duplicate Modbus frames do not pile up.
 	espHomeControlPublicationInterval = 15 * time.Second
-	controlConfirmationTimeout        = espHomeControlPublicationInterval + 5*time.Second
+	controlConfirmationTimeout        = 35 * time.Second
 	controlConfirmationInterval       = 500 * time.Millisecond
-	controlWriteRetryDelay            = 4 * time.Second
-	controlWriteMaxAttempts           = 3
+	controlWriteRetryDelay            = espHomeControlPublicationInterval
+	controlWriteMaxAttempts           = 2
 
 	// The RS485 link is declared down only after telemetry stays bit-identical for
 	// longer than two ESPHome publication cycles, so a slow-publishing but healthy
@@ -47,8 +46,6 @@ const (
 	// ESPHome sensor/entity paths (URL-encoded where needed)
 	sensorSOC          = "/sensor/Battery%20State%20Of%20Charge"
 	sensorTemperature  = "/sensor/Internal%20Temperature"
-	sensorRemainingCap = "/sensor/Battery%20Remaining%20Capacity"
-	sensorTotalEnergy  = "/sensor/Battery%20Total%20Energy"
 	sensorBatteryPower = "/sensor/Battery%20Power"
 	sensorACVoltage    = "/sensor/AC%20Voltage"
 	// Pack voltage/current averages are the fastest-moving battery-sourced values.
@@ -68,10 +65,9 @@ const (
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
-	minSOC     int // Minimum SOC percentage for discharge flag
+	minSOC     int // Minimum SOC threshold for the service discharge flag
 
-	restartButton   string        // ESPHome restart button name as used in its URLs; empty disables bridge restarts
-	writeRetryDelay time.Duration // test override
+	restartButton string // ESPHome restart button name as used in its URLs; empty disables bridge restarts
 
 	mu            sync.Mutex
 	lastValues    map[string]float64 // battery-sourced telemetry, keyed by entity path
@@ -87,7 +83,7 @@ type Client struct {
 func New(baseURL string, minSOC int) *Client {
 	// Remove trailing slash if present
 	baseURL = strings.TrimRight(baseURL, "/")
-	if minSOC <= 0 {
+	if minSOC < 0 || minSOC > 100 {
 		minSOC = 11 // Default fallback
 	}
 	return &Client{
@@ -96,11 +92,10 @@ func New(baseURL string, minSOC int) *Client {
 		httpClient: &http.Client{
 			Timeout: defaultTimeout,
 		},
-		lastValues:      make(map[string]float64),
-		writeRetryDelay: controlWriteRetryDelay,
-		now:             time.Now,
-		probeWindow:     linkProbeWindow,
-		probeInterval:   linkProbeInterval,
+		lastValues:    make(map[string]float64),
+		now:           time.Now,
+		probeWindow:   linkProbeWindow,
+		probeInterval: linkProbeInterval,
 	}
 }
 
@@ -149,30 +144,16 @@ func (c *Client) GetBatteryStatusContext(ctx context.Context) (*marstek.BatteryS
 	if err != nil {
 		return nil, fmt.Errorf("get SOC: %w", err)
 	}
-
-	// Temperature is optional - don't fail if unavailable
-	temp, _ := c.getSensorFloatContext(ctx, sensorTemperature)
-
-	// Capacity is optional
-	capacity, _ := c.getSensorFloatContext(ctx, sensorRemainingCap)
-
-	// Total energy for rated capacity
-	ratedCapacity, _ := c.getSensorFloatContext(ctx, sensorTotalEnergy)
-	if err := ctx.Err(); err != nil {
+	socInt, err := socAsInt(soc)
+	if err != nil {
 		return nil, err
 	}
 
-	// ESPHome doesn't have direct charging/discharging flags.
-	// Infer from SOC: can charge if SOC < 100, can discharge if SOC > minSOC
-	socInt := int(soc)
-
+	// These are service-side SOC eligibility hints, not BMS interlock states.
 	return &marstek.BatteryStatus{
-		SOC:           socInt,
-		ChargingFlag:  socInt < 100,
-		DischargFlag:  socInt > c.minSOC,
-		Temperature:   temp,
-		Capacity:      capacity * 1000, // kWh to Wh
-		RatedCapacity: ratedCapacity * 1000,
+		SOC:          socInt,
+		ChargingFlag: socInt < 100,
+		DischargFlag: socInt > c.minSOC,
 	}, nil
 }
 
@@ -182,6 +163,10 @@ func (c *Client) GetESStatus(ctx context.Context) (*marstek.ESStatus, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get SOC: %w", err)
 	}
+	socInt, err := socAsInt(soc)
+	if err != nil {
+		return nil, err
+	}
 
 	power, err := c.getSensorFloatContext(ctx, sensorBatteryPower)
 	if err != nil {
@@ -189,7 +174,7 @@ func (c *Client) GetESStatus(ctx context.Context) (*marstek.ESStatus, error) {
 	}
 
 	return &marstek.ESStatus{
-		BatterySOC:   int(soc),
+		BatterySOC:   socInt,
 		BatteryPower: power,
 	}, nil
 }
@@ -207,20 +192,19 @@ func (c *Client) Charge(powerW int, _ int) error {
 
 // ChargeContext starts charging and allows cancellation while ESPHome applies each control write.
 func (c *Client) ChargeContext(ctx context.Context, powerW int, _ int) error {
+	ctx, cancel := context.WithTimeout(ctx, controlOperationTimeout)
+	defer cancel()
+
 	if err := c.ensureRS485ControlMode(ctx); err != nil {
 		return c.classifyControlFailure(ctx, fmt.Errorf("enable RS485 control mode: %w", err))
 	}
 
-	// Then set charge power
-	if err := c.setNumberConfirmed(ctx, numberChargepower, float64(powerW)); err != nil {
+	if err := c.setNumber(ctx, numberChargepower, float64(powerW)); err != nil {
 		return c.classifyControlFailure(ctx, fmt.Errorf("set charge power: %w", err))
 	}
-
-	// Finally activate charge mode
 	if err := c.setSelectConfirmed(ctx, selectForceMode, "charge"); err != nil {
 		return c.classifyControlFailure(ctx, fmt.Errorf("set charge mode: %w", err))
 	}
-
 	return nil
 }
 
@@ -232,20 +216,19 @@ func (c *Client) Discharge(powerW int, _ int) error {
 
 // DischargeContext starts discharging and allows cancellation while ESPHome applies each control write.
 func (c *Client) DischargeContext(ctx context.Context, powerW int, _ int) error {
+	ctx, cancel := context.WithTimeout(ctx, controlOperationTimeout)
+	defer cancel()
+
 	if err := c.ensureRS485ControlMode(ctx); err != nil {
 		return c.classifyControlFailure(ctx, fmt.Errorf("enable RS485 control mode: %w", err))
 	}
 
-	// Then set discharge power
-	if err := c.setNumberConfirmed(ctx, numberDischargePower, float64(powerW)); err != nil {
+	if err := c.setNumber(ctx, numberDischargePower, float64(powerW)); err != nil {
 		return c.classifyControlFailure(ctx, fmt.Errorf("set discharge power: %w", err))
 	}
-
-	// Finally activate discharge mode
 	if err := c.setSelectConfirmed(ctx, selectForceMode, "discharge"); err != nil {
 		return c.classifyControlFailure(ctx, fmt.Errorf("set discharge mode: %w", err))
 	}
-
 	return nil
 }
 
@@ -258,15 +241,15 @@ func (c *Client) SetPassiveMode(power int, cdTime int) error {
 
 // SetPassiveModeContext sets the battery mode and allows cancellation during control confirmation.
 func (c *Client) SetPassiveModeContext(ctx context.Context, power int, cdTime int) error {
+	ctx, cancel := context.WithTimeout(ctx, controlOperationTimeout)
+	defer cancel()
+
 	switch {
 	case power < 0:
-		// Negative = charge
 		return c.ChargeContext(ctx, -power, cdTime)
 	case power > 0:
-		// Positive = discharge
 		return c.DischargeContext(ctx, power, cdTime)
 	default:
-		// Zero = idle
 		return c.IdleContext(ctx)
 	}
 }
@@ -278,16 +261,19 @@ func (c *Client) Idle() error {
 
 // IdleContext stops forced operation and allows cancellation during control confirmation.
 func (c *Client) IdleContext(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, controlOperationTimeout)
+	defer cancel()
+
 	var enableErr error
 	if err := c.ensureRS485ControlMode(ctx); err != nil {
 		enableErr = fmt.Errorf("enable RS485 control mode: %w", err)
 	}
-
 	if err := c.setSelectConfirmed(ctx, selectForceMode, "stop"); err != nil {
 		return c.classifyControlFailure(ctx, errors.Join(enableErr, fmt.Errorf("stop forcible mode: %w", err)))
 	}
-	if enableErr != nil {
-		return c.classifyControlFailure(ctx, enableErr)
+	// A cached select cannot prove a stop while the Modbus link is frozen.
+	if errors.Is(enableErr, marstek.ErrLinkDown) {
+		return enableErr
 	}
 	return nil
 }
@@ -296,9 +282,9 @@ func (c *Client) IdleContext(ctx context.Context) error {
 // Note: ESPHome returns "state" as a formatted string with unit (e.g., "11.0 %"),
 // while "value" is the raw numeric value. We only use "value".
 type sensorResponse struct {
-	ID    string  `json:"id"`
-	State string  `json:"state"` // Formatted string with unit, not used
-	Value float64 `json:"value"` // Raw numeric value
+	ID    string          `json:"id"`
+	State string          `json:"state"` // Formatted string with unit, not used
+	Value json.RawMessage `json:"value"` // Raw numeric value
 }
 
 // textSensorResponse represents ESPHome text sensor JSON response.
@@ -311,6 +297,31 @@ type textSensorResponse struct {
 type controlResponse struct {
 	State string          `json:"state"`
 	Value json.RawMessage `json:"value"`
+}
+
+func sensorFloatValue(raw json.RawMessage) (float64, error) {
+	if len(raw) == 0 {
+		return 0, errors.New("missing numeric value")
+	}
+	if strings.TrimSpace(string(raw)) == "null" {
+		return 0, errors.New("null numeric value")
+	}
+
+	value, err := strconv.ParseFloat(string(raw), 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid numeric value: %w", err)
+	}
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, fmt.Errorf("non-finite numeric value %q", raw)
+	}
+	return value, nil
+}
+
+func socAsInt(soc float64) (int, error) {
+	if soc < 0 || soc > 100 {
+		return 0, fmt.Errorf("SOC %.2f outside [0, 100]", soc)
+	}
+	return int(soc), nil
 }
 
 func (c *Client) getSensorFloatContext(ctx context.Context, path string) (float64, error) {
@@ -333,10 +344,13 @@ func (c *Client) getSensorFloatContext(ctx context.Context, path string) (float6
 	if err := json.NewDecoder(resp.Body).Decode(&sensor); err != nil {
 		return 0, fmt.Errorf("decode sensor response: %w", err)
 	}
+	value, err := sensorFloatValue(sensor.Value)
+	if err != nil {
+		return 0, fmt.Errorf("GET %s: %w", path, err)
+	}
 
-	c.recordTelemetry(path, sensor.Value)
-
-	return sensor.Value, nil
+	c.recordTelemetry(path, value)
+	return value, nil
 }
 
 // recordTelemetry notes a battery-sourced reading. Any change proves the RS485
@@ -392,6 +406,9 @@ func (c *Client) CheckLink(ctx context.Context) error {
 // service-side change of the commanded power, never a dropped Modbus frame; the
 // selects are polled from the battery and are the real signal.
 func (c *Client) RefreshPassiveModeContext(ctx context.Context, power int, cdTime int) error {
+	ctx, cancel := context.WithTimeout(ctx, controlOperationTimeout)
+	defer cancel()
+
 	if since, down := c.linkDown(); down {
 		return fmt.Errorf("%w for %s", marstek.ErrLinkDown, c.now().Sub(since).Round(time.Second))
 	}
@@ -407,8 +424,6 @@ func (c *Client) RefreshPassiveModeContext(ctx context.Context, power int, cdTim
 		numberPath = numberDischargePower
 	}
 
-	// RS485 control mode is polled from the battery: if it is no longer enabled the
-	// battery dropped the control session, so everything must be re-asserted.
 	controlMode, err := c.getControlValue(ctx, selectRS485ControlMode)
 	if err != nil {
 		return fmt.Errorf("read RS485 control mode: %w", err)
@@ -421,7 +436,6 @@ func (c *Client) RefreshPassiveModeContext(ctx context.Context, power int, cdTim
 	if err != nil {
 		return fmt.Errorf("read forcible mode: %w", err)
 	}
-
 	if mode == expected {
 		if numberPath == "" {
 			return nil
@@ -435,7 +449,6 @@ func (c *Client) RefreshPassiveModeContext(ctx context.Context, power int, cdTim
 			return nil
 		}
 	}
-
 	return c.SetPassiveModeContext(ctx, power, cdTime)
 }
 
@@ -482,6 +495,8 @@ func restartButtonCandidates(configured string) []string {
 // RestartDevice presses the ESPHome restart button to reboot the bridge, which is the
 // only known way to recover a frozen RS485 link.
 func (c *Client) RestartDevice(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, controlOperationTimeout)
+	defer cancel()
 	if c.restartButton == "" {
 		return fmt.Errorf("restart button not configured")
 	}
@@ -599,8 +614,8 @@ func (c *Client) probeLinkDown(ctx context.Context) bool {
 }
 
 // classifyControlFailure upgrades a control failure to ErrLinkDown when telemetry
-// proves the RS485 link is dead. ESPHome acknowledges REST writes and echoes
-// number writes optimistically, so a dropped Modbus frame is otherwise invisible.
+// proves the RS485 link is dead. The link probe detects only complete freezes; it
+// cannot confirm or reject an individual optimistic number write.
 func (c *Client) classifyControlFailure(ctx context.Context, err error) error {
 	if err == nil || ctx.Err() != nil {
 		return err
@@ -640,7 +655,9 @@ func (c *Client) getTextSensor(path string) (string, error) {
 	return sensor.State, nil
 }
 
-// setNumber sets a number entity value via POST.
+// setNumber sends a number entity POST and returns when ESPHome acknowledges it.
+// ESPHome echoes number writes optimistically, so the service must monitor measured
+// response to establish physical power; the link probe detects only full freezes.
 func (c *Client) setNumber(ctx context.Context, path string, value float64) error {
 	endpoint := fmt.Sprintf("%s%s/set?value=%v", c.baseURL, path, value)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, http.NoBody)
@@ -686,56 +703,18 @@ func (c *Client) ensureRS485ControlMode(ctx context.Context) error {
 	if since, down := c.linkDown(); down {
 		return fmt.Errorf("%w for %s", marstek.ErrLinkDown, c.now().Sub(since).Round(time.Second))
 	}
-	mode, err := c.getControlValue(ctx, selectRS485ControlMode)
-	if err == nil && mode == "enable" {
-		return nil
-	}
 	return c.setSelectConfirmed(ctx, selectRS485ControlMode, "enable")
 }
 
 func (c *Client) setSelectConfirmed(ctx context.Context, path string, option string) error {
+	actual, err := c.getControlValue(ctx, path)
+	if err == nil && actual == option {
+		return nil
+	}
 	if err := c.setSelect(ctx, path, option); err != nil {
 		return err
 	}
 	return c.waitForControlValue(ctx, path, option)
-}
-
-// setNumberConfirmed writes a number entity and reads it back. NOTE: ESPHome
-// publishes number writes optimistically — the read-back returns the requested
-// value even when the Modbus frame was dropped — so this confirms the ESPHome
-// entity, not the battery. Dropped writes are detected by probeLinkDown instead.
-func (c *Client) setNumberConfirmed(ctx context.Context, path string, value float64) error {
-	if err := c.setNumber(ctx, path, value); err != nil {
-		return err
-	}
-	confirmationCtx, cancel := context.WithTimeout(ctx, controlConfirmationTimeout)
-	defer cancel()
-	var lastValue string
-	var lastErr error
-	for {
-		actual, err := c.getControlValue(confirmationCtx, path)
-		if err == nil {
-			lastValue = actual
-			lastErr = nil
-			actualNumber, parseErr := strconv.ParseFloat(actual, 64)
-			if parseErr == nil && math.Abs(actualNumber-value) <= 0.5 {
-				return nil
-			}
-		} else if confirmationCtx.Err() == nil {
-			lastErr = err
-		}
-		select {
-		case <-confirmationCtx.Done():
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if lastErr != nil {
-				return fmt.Errorf("confirm value %v: %w", value, lastErr)
-			}
-			return fmt.Errorf("confirm value %v: still %q", value, lastValue)
-		case <-time.After(controlConfirmationInterval):
-		}
-	}
 }
 
 func (c *Client) waitForControlValue(ctx context.Context, path string, expected string) error {
@@ -744,8 +723,7 @@ func (c *Client) waitForControlValue(ctx context.Context, path string, expected 
 
 	pollTicker := time.NewTicker(controlConfirmationInterval)
 	defer pollTicker.Stop()
-	retryDelay := c.writeRetryDelay
-	retryTimer := time.NewTimer(retryDelay)
+	retryTimer := time.NewTimer(controlWriteRetryDelay)
 	defer retryTimer.Stop()
 
 	attempts := 1
@@ -777,13 +755,11 @@ func (c *Client) waitForControlValue(ctx context.Context, path string, expected 
 			}
 			return fmt.Errorf("confirm option %q: still %q", expected, lastValue)
 		case <-retryTimer.C:
-			attempts++
-			if err := c.setSelect(confirmationCtx, path, expected); confirmationCtx.Err() == nil {
-				lastWriteErr = err
-			}
 			if attempts < controlWriteMaxAttempts {
-				retryDelay *= 2
-				retryTimer.Reset(retryDelay)
+				attempts++
+				if err := c.setSelect(confirmationCtx, path, expected); confirmationCtx.Err() == nil {
+					lastWriteErr = err
+				}
 			}
 		case <-pollTicker.C:
 		}

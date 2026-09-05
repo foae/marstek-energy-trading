@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -247,12 +248,14 @@ func (m *MockBattery) IdleContext(ctx context.Context) error {
 type MockNotifier struct {
 	mu sync.Mutex
 
-	Messages        []string
-	StartupCalls    int
-	TradeStartCalls []TradeStartCall
-	TradeEndCalls   []TradeEndCall
-	ErrorCalls      []string
-	Commands        []string
+	Messages          []string
+	StartupCalls      int
+	TradeStartCalls   []TradeStartCall
+	TradeEndCalls     []TradeEndCall
+	ErrorCalls        []string
+	DailySummaryCalls []telegram.DailySummaryData
+	DailySummaryErr   error
+	Commands          []string
 }
 
 type TradeStartCall struct {
@@ -314,7 +317,10 @@ func (m *MockNotifier) SendTradingPlan(ctx context.Context, data telegram.Tradin
 }
 
 func (m *MockNotifier) SendDailySummaryFull(ctx context.Context, data telegram.DailySummaryData) error {
-	return nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.DailySummaryCalls = append(m.DailySummaryCalls, data)
+	return m.DailySummaryErr
 }
 
 func (m *MockNotifier) PollCommands(ctx context.Context) ([]string, error) {
@@ -780,7 +786,6 @@ func TestTick_StopChargingWhenWindowEnds(t *testing.T) {
 	svc := newTestService(cfg, mockBattery, prices, clockTime)
 	svc.state = StateCharging // Already charging
 	svc.currentTradeStart = baseTime
-	svc.currentTradePrice = decimal.NewFromFloat(0.05)
 	svc.currentTradeSOC = 50
 
 	ctx := context.Background()
@@ -796,10 +801,6 @@ func TestTick_StopChargingWhenWindowEnds(t *testing.T) {
 	if len(history.Days) != 1 || len(history.Days[0].Trades) != 1 {
 		t.Fatalf("expected one recorded charge trade, got %+v", history.Days)
 	}
-	wantEnergy := decimal.NewFromFloat(1.024) // 20% of 5.12 kWh
-	if !history.Days[0].Trades[0].EnergyKWh.Equal(wantEnergy) {
-		t.Errorf("charge energy = %s, want %s", history.Days[0].Trades[0].EnergyKWh, wantEnergy)
-	}
 }
 
 func TestTick_StopChargingFailureRetainsSessionUntilRetry(t *testing.T) {
@@ -810,7 +811,6 @@ func TestTick_StopChargingFailureRetainsSessionUntilRetry(t *testing.T) {
 	svc := newTestService(testConfig(), mockBattery, prices, baseTime.Add(30*time.Minute))
 	svc.state = StateCharging
 	svc.currentTradeStart = baseTime
-	svc.currentTradePrice = decimal.NewFromFloat(0.05)
 	svc.currentTradeSOC = 50
 
 	svc.tick(context.Background())
@@ -866,7 +866,6 @@ func TestTick_StopChargingWhenBatteryFull(t *testing.T) {
 	svc := newTestService(cfg, mockBattery, prices, clockTime)
 	svc.state = StateCharging
 	svc.currentTradeStart = baseTime.Add(-30 * time.Minute)
-	svc.currentTradePrice = decimal.NewFromFloat(0.05)
 	svc.currentTradeSOC = 80
 
 	ctx := context.Background()
@@ -891,7 +890,6 @@ func TestTick_StopDischargingWhenBatteryLow(t *testing.T) {
 	svc := newTestService(cfg, mockBattery, prices, clockTime)
 	svc.state = StateDischarging
 	svc.currentTradeStart = baseTime.Add(-30 * time.Minute)
-	svc.currentTradePrice = decimal.NewFromFloat(0.20)
 	svc.currentTradeSOC = 50
 
 	ctx := context.Background()
@@ -901,12 +899,8 @@ func TestTick_StopDischargingWhenBatteryLow(t *testing.T) {
 		t.Errorf("expected state=idle after battery low, got %s", svc.state)
 	}
 	history := svc.recorder.GetHistory()
-	if len(history.Days) != 1 || len(history.Days[0].Trades) != 1 {
-		t.Fatalf("expected one recorded discharge trade, got %+v", history.Days)
-	}
-	wantEnergy := decimal.NewFromFloat(1.79712) // 39% of 5.12 kWh at 90% round-trip efficiency
-	if !history.Days[0].Trades[0].EnergyKWh.Equal(wantEnergy) {
-		t.Errorf("discharge energy = %s, want %s", history.Days[0].Trades[0].EnergyKWh, wantEnergy)
+	if len(history.Days) != 2 || len(history.Days[0].Trades) != 1 || len(history.Days[1].Trades) != 1 {
+		t.Fatalf("expected discharge crossing midnight to be split across two days, got %+v", history.Days)
 	}
 }
 
@@ -1043,7 +1037,6 @@ func TestTick_RecordsTrade(t *testing.T) {
 	svc := newTestService(cfg, mockBattery, prices, clockTime)
 	svc.state = StateCharging
 	svc.currentTradeStart = baseTime // Trade started today
-	svc.currentTradePrice = decimal.NewFromFloat(0.05)
 	svc.currentTradeSOC = 50
 
 	ctx := context.Background()
@@ -1141,79 +1134,91 @@ func newTestServiceWithMeter(cfg *config.Config, battery *MockBattery, meter *Mo
 	return svc
 }
 
-func TestSolarTick_StartAfterQualificationCount(t *testing.T) {
-	// Scenario: P1 meter shows -500W (exporting 500W surplus) consistently
-	// Expected: After solarStartQualificationCount consecutive readings, solar charging should start
+func TestSolarTick_StartsAfterSustainedElapsedSurplus(t *testing.T) {
+	now := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	battery := NewMockBattery(50)
+	meter := NewMockMeter(true, -500)
+	svc := newTestServiceWithMeter(testConfigSmallBattery(), battery, meter, nil, now)
+	svc.nowFunc = func() time.Time { return now }
 
-	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
-	// Flat prices = no profitable windows, so no scheduled trading
-	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
-
-	cfg := testConfigSmallBattery()
-	mockBattery := NewMockBattery(50)
-	meter := NewMockMeter(true, -500) // exporting 500W
-
-	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
-
-	ctx := context.Background()
-
-	// Ticks 1..N-1: accumulate confirmations, no charging yet
-	for i := 1; i < solarStartQualificationCount; i++ {
-		svc.solarTick(ctx)
-		if svc.state != StateIdle {
-			t.Errorf("tick %d: expected idle, got %s", i, svc.state)
-		}
+	svc.solarTick(context.Background())
+	for range 29 {
+		now = now.Add(time.Second)
+		svc.solarTick(context.Background())
+	}
+	now = now.Add(time.Second - time.Nanosecond)
+	svc.solarTick(context.Background())
+	if svc.state != StateIdle {
+		t.Fatalf("state before sustained qualification = %s, want idle", svc.state)
 	}
 
-	// Tick N: should start solar charging
-	svc.solarTick(ctx)
+	now = now.Add(time.Nanosecond)
+	svc.solarTick(context.Background())
 	if svc.state != StateSolarCharging {
-		t.Errorf("tick %d: expected solar_charging, got %s", solarStartQualificationCount, svc.state)
+		t.Fatalf("state after sustained qualification = %s, want solar_charging", svc.state)
 	}
-	if len(mockBattery.ChargeCalls) != 1 {
-		t.Fatalf("expected 1 charge call, got %d", len(mockBattery.ChargeCalls))
-	}
-	if mockBattery.ChargeCalls[0].PowerW != 500 {
-		t.Errorf("expected charge power=500, got %d", mockBattery.ChargeCalls[0].PowerW)
+	if len(battery.ChargeCalls) != 1 || battery.ChargeCalls[0].PowerW != 500 {
+		t.Fatalf("expected one 500 W charge command, got %+v", battery.ChargeCalls)
 	}
 }
 
-func TestSolarTick_StopsAfterRepeatedTelemetryFailures(t *testing.T) {
-	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
-	mockBattery := NewMockBattery(50)
-	mockBattery.GetStatusErr = errors.New("power sensor unavailable")
+func TestSolarTick_QualificationGapRequiresNewSustainedSurplus(t *testing.T) {
+	now := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	battery := NewMockBattery(50)
 	meter := NewMockMeter(true, -500)
-	svc := newTestServiceWithMeter(testConfigSmallBattery(), mockBattery, meter, prices, baseTime)
+	svc := newTestServiceWithMeter(testConfigSmallBattery(), battery, meter, nil, now)
+	svc.nowFunc = func() time.Time { return now }
+
+	svc.solarTick(context.Background())
+	now = now.Add(solarTelemetryGapTolerance + time.Nanosecond)
+	svc.solarTick(context.Background())
+	if svc.state != StateIdle {
+		t.Fatalf("state after qualification telemetry gap = %s, want idle", svc.state)
+	}
+
+	for range 30 {
+		now = now.Add(time.Second)
+		svc.solarTick(context.Background())
+	}
+	if svc.state != StateSolarCharging {
+		t.Fatalf("state after replacement sustained surplus = %s, want solar_charging", svc.state)
+	}
+}
+
+func TestSolarTick_StopsAfterSustainedTelemetryFailure(t *testing.T) {
+	now := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	battery := NewMockBattery(50)
+	battery.GetStatusErr = errors.New("power sensor unavailable")
+	meter := NewMockMeter(true, -500)
+	svc := newTestServiceWithMeter(testConfigSmallBattery(), battery, meter, nil, now)
+	svc.nowFunc = func() time.Time { return now }
 	svc.state = StateSolarCharging
-	svc.currentTradeStart = baseTime.Add(-2 * time.Minute)
+	svc.currentTradeStart = now.Add(-2 * time.Minute)
 	svc.currentTradeSOC = 50
 	svc.solarChargePower = 500
 	svc.solarMeasuredChargePowerW = 500
-	svc.solarLastUpdate = baseTime.Add(-time.Second)
+	svc.solarLastUpdate = now.Add(-time.Second)
 
-	for i := 1; i < solarStatusFailureThreshold; i++ {
-		svc.solarTick(context.Background())
-		if svc.state != StateSolarCharging {
-			t.Fatalf("state after %d failures = %s, want solar_charging", i, svc.state)
-		}
-	}
-	if mockBattery.StatusCalls != 0 {
-		t.Fatalf("fallback status calls before threshold = %d, want 0", mockBattery.StatusCalls)
-	}
 	svc.solarTick(context.Background())
+	now = now.Add(solarTelemetryFailureThreshold - time.Nanosecond)
+	svc.solarTick(context.Background())
+	if svc.state != StateSolarCharging {
+		t.Fatalf("state before telemetry failure duration = %s, want solar_charging", svc.state)
+	}
 
+	now = now.Add(time.Nanosecond)
+	svc.solarTick(context.Background())
 	if svc.state != StateIdle {
-		t.Errorf("state = %s, want idle after telemetry failure threshold", svc.state)
+		t.Errorf("state = %s, want idle after telemetry failure duration", svc.state)
 	}
-	if mockBattery.IdleCalls != 1 {
-		t.Errorf("idle calls = %d, want 1", mockBattery.IdleCalls)
+	if battery.IdleCalls != 1 {
+		t.Errorf("idle calls = %d, want 1", battery.IdleCalls)
 	}
-	if mockBattery.StatusCalls != 1 {
-		t.Errorf("fallback status calls = %d, want 1 at threshold", mockBattery.StatusCalls)
+	if battery.StatusCalls != 1 {
+		t.Errorf("fallback status calls = %d, want 1 after sustained failure", battery.StatusCalls)
 	}
-	if !svc.solarCooldownUntil.Equal(baseTime.Add(batteryControlFailureCooldown)) {
-		t.Errorf("solar cooldown = %s, want %s", svc.solarCooldownUntil, baseTime.Add(batteryControlFailureCooldown))
+	if !svc.solarCooldownUntil.Equal(now.Add(batteryControlFailureCooldown)) {
+		t.Errorf("solar cooldown = %s, want %s", svc.solarCooldownUntil, now.Add(batteryControlFailureCooldown))
 	}
 }
 
@@ -1349,7 +1354,8 @@ func TestSolarTick_YieldsScheduledWindowBeforeReadingP1(t *testing.T) {
 	battery.CurrentPower = 500
 	meter := NewMockMeter(true, -500)
 	meter.ActivePowerErr = errors.New("P1 unavailable")
-	svc := newTestServiceWithMeter(testConfigSmallBattery(), battery, meter, prices, baseTime)
+	cfg := testConfigSmallBattery()
+	svc := newTestServiceWithMeter(cfg, battery, meter, prices, baseTime)
 	svc.state = StateSolarCharging
 	svc.currentTradeStart = baseTime.Add(-5 * time.Minute)
 	svc.currentTradeSOC = 45
@@ -1362,37 +1368,30 @@ func TestSolarTick_YieldsScheduledWindowBeforeReadingP1(t *testing.T) {
 	if meter.ActivePowerCalls != 0 {
 		t.Errorf("P1 calls = %d, want 0 while yielding scheduled window", meter.ActivePowerCalls)
 	}
-	if svc.state != StateIdle || battery.CurrentPower != 0 {
-		t.Errorf("scheduled-window stop: state=%s power=%d, want idle and 0W", svc.state, battery.CurrentPower)
+	if svc.state != StateCharging || battery.CurrentPower != cfg.ChargePowerW {
+		t.Errorf("scheduled-window yield: state=%s power=%d, want charging at %dW", svc.state, battery.CurrentPower, cfg.ChargePowerW)
 	}
 }
 
 func TestSolarTick_ClampToMaxPower(t *testing.T) {
-	// Scenario: Surplus is 5000W but max charge power is 2000W
-	// Expected: Should clamp to max charge power
+	now := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	cfg := testConfigSmallBattery()
+	battery := NewMockBattery(50)
+	meter := NewMockMeter(true, -5000)
+	svc := newTestServiceWithMeter(cfg, battery, meter, nil, now)
+	svc.nowFunc = func() time.Time { return now }
 
-	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
-
-	cfg := testConfigSmallBattery() // ChargePowerW = 2000
-	mockBattery := NewMockBattery(50)
-	meter := NewMockMeter(true, -5000) // 5000W surplus
-
-	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
-
-	ctx := context.Background()
-	for range solarStartQualificationCount {
-		svc.solarTick(ctx)
+	svc.solarTick(context.Background())
+	for range 30 {
+		now = now.Add(time.Second)
+		svc.solarTick(context.Background())
 	}
 
 	if svc.state != StateSolarCharging {
 		t.Fatalf("expected solar_charging, got %s", svc.state)
 	}
-	if len(mockBattery.ChargeCalls) != 1 {
-		t.Fatalf("expected 1 charge call, got %d", len(mockBattery.ChargeCalls))
-	}
-	if mockBattery.ChargeCalls[0].PowerW != cfg.ChargePowerW {
-		t.Errorf("expected charge power clamped to %d, got %d", cfg.ChargePowerW, mockBattery.ChargeCalls[0].PowerW)
+	if len(battery.ChargeCalls) != 1 || battery.ChargeCalls[0].PowerW != cfg.ChargePowerW {
+		t.Fatalf("expected one %d W charge command, got %+v", cfg.ChargePowerW, battery.ChargeCalls)
 	}
 }
 
@@ -1511,27 +1510,21 @@ func TestSolarTick_IgnoresStateDischarging(t *testing.T) {
 }
 
 func TestSolarTick_NoStartAtUpperSOC(t *testing.T) {
-	// Integer SOC telemetry stays at 99% near full. Solar capture must not start
-	// there, or exported surplus repeatedly creates shallow charge sessions.
-	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
-
-	cfg := testConfigSmallBattery()
-	mockBattery := NewMockBattery(solarChargeUpperSOC)
+	now := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	battery := NewMockBattery(solarChargeUpperSOC)
 	meter := NewMockMeter(true, -500)
+	svc := newTestServiceWithMeter(testConfigSmallBattery(), battery, meter, nil, now)
+	svc.nowFunc = func() time.Time { return now }
 
-	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
-
-	ctx := context.Background()
-	for range solarStartQualificationCount {
-		svc.solarTick(ctx)
-	}
+	svc.solarTick(context.Background())
+	now = now.Add(solarStartQualification)
+	svc.solarTick(context.Background())
 
 	if svc.state != StateIdle {
 		t.Errorf("expected idle at solar upper SOC limit, got %s", svc.state)
 	}
-	if len(mockBattery.ChargeCalls) != 0 {
-		t.Errorf("expected no charge calls at solar upper SOC limit, got %d", len(mockBattery.ChargeCalls))
+	if len(battery.ChargeCalls) != 0 {
+		t.Errorf("expected no charge calls at solar upper SOC limit, got %d", len(battery.ChargeCalls))
 	}
 }
 
@@ -1587,125 +1580,88 @@ func TestSolarTick_StopsAtUpperSOCBeforeReadingP1(t *testing.T) {
 }
 
 func TestSolarTick_UpperSOCHoldRejectsTelemetryFlicker(t *testing.T) {
-	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
-	clockTime := baseTime
-	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
-	mockBattery := NewMockBattery(solarChargeUpperSOC)
-	mockBattery.CurrentPower = 500
+	now := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	battery := NewMockBattery(solarChargeUpperSOC)
+	battery.CurrentPower = 500
 	meter := NewMockMeter(true, -500)
-	svc := newTestServiceWithMeter(testConfigSmallBattery(), mockBattery, meter, prices, clockTime)
-	svc.nowFunc = func() time.Time { return clockTime }
+	svc := newTestServiceWithMeter(testConfigSmallBattery(), battery, meter, nil, now)
+	svc.nowFunc = func() time.Time { return now }
 	svc.state = StateSolarCharging
-	svc.currentTradeStart = baseTime.Add(-10 * time.Minute)
+	svc.currentTradeStart = now.Add(-10 * time.Minute)
 	svc.currentTradeSOC = 95
 	svc.solarChargePower = 500
 	svc.solarMeasuredChargePowerW = 500
-	svc.solarLastUpdate = baseTime.Add(-time.Second)
+	svc.solarLastUpdate = now.Add(-time.Second)
 
-	ctx := context.Background()
-	svc.solarTick(ctx)
+	svc.solarTick(context.Background())
 	if svc.state != StateIdle {
 		t.Fatalf("state after upper-SOC stop = %s, want idle", svc.state)
 	}
 
-	clockTime = clockTime.Add(solarRestartCooldown + time.Second)
-	mockBattery.SOC = solarChargeUpperSOC - 1
-	for range solarStartQualificationCount + 1 {
-		svc.solarTick(ctx)
-	}
-	if svc.state != StateIdle {
-		t.Fatalf("state while SOC flickers to %d = %s, want idle", mockBattery.SOC, svc.state)
-	}
-	if len(mockBattery.ChargeCalls) != 0 {
-		t.Fatalf("charge calls while upper-SOC hold is active = %d, want 0", len(mockBattery.ChargeCalls))
+	now = now.Add(solarRestartCooldown + time.Second)
+	battery.SOC = solarChargeUpperSOC - 1
+	svc.solarTick(context.Background())
+	if svc.state != StateIdle || len(battery.ChargeCalls) != 0 {
+		t.Fatalf("upper-SOC hold should reject flicker, state=%s calls=%+v", svc.state, battery.ChargeCalls)
 	}
 
-	mockBattery.SOC = solarChargeResumeSOC
-	for range solarStartQualificationCount {
-		svc.solarTick(ctx)
+	battery.SOC = solarChargeResumeSOC
+	svc.solarTick(context.Background())
+	for range 30 {
+		now = now.Add(time.Second)
+		svc.solarTick(context.Background())
 	}
 	if svc.state != StateSolarCharging {
 		t.Fatalf("state after SOC falls to resume threshold = %s, want solar_charging", svc.state)
 	}
-	if len(mockBattery.ChargeCalls) != 1 {
-		t.Fatalf("charge calls after SOC falls to resume threshold = %d, want 1", len(mockBattery.ChargeCalls))
-	}
 }
 
-func TestSolarTick_MeterFailureResetsIdleQualification(t *testing.T) {
+func TestSolarTick_MeterFailureRequiresNewSustainedQualification(t *testing.T) {
 	now := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
 	battery := NewMockBattery(50)
 	meter := NewMockMeter(true, -500)
 	svc := newTestServiceWithMeter(testConfigSmallBattery(), battery, meter, nil, now)
-	ctx := context.Background()
+	svc.nowFunc = func() time.Time { return now }
 
-	for range solarStartQualificationCount - 1 {
-		svc.solarTick(ctx)
-	}
-	if svc.solarSurplusCount != solarStartQualificationCount-1 {
-		t.Fatalf("qualification before meter failure = %d, want %d", svc.solarSurplusCount, solarStartQualificationCount-1)
-	}
-
+	svc.solarTick(context.Background())
+	now = now.Add(solarStartQualification / 2)
 	meter.ActivePowerErr = errors.New("P1 unavailable")
-	svc.solarTick(ctx)
-	if svc.solarSurplusCount != 0 {
-		t.Fatalf("qualification after meter failure = %d, want 0", svc.solarSurplusCount)
-	}
+	svc.solarTick(context.Background())
 
 	meter.ActivePowerErr = nil
-	for range solarStartQualificationCount - 1 {
-		svc.solarTick(ctx)
-	}
+	svc.solarTick(context.Background())
 	if svc.state != StateIdle {
-		t.Fatalf("state after %d replacement samples = %s, want idle", solarStartQualificationCount-1, svc.state)
+		t.Fatalf("state immediately after meter recovery = %s, want idle", svc.state)
 	}
-	svc.solarTick(ctx)
+	for range 30 {
+		now = now.Add(time.Second)
+		svc.solarTick(context.Background())
+	}
 	if svc.state != StateSolarCharging {
-		t.Errorf("state after full replacement qualification = %s, want solar_charging", svc.state)
+		t.Fatalf("state after replacement sustained surplus = %s, want solar_charging", svc.state)
 	}
 }
 
-func TestSolarTick_SurplusCountResets(t *testing.T) {
-	// Scenario: Surplus readings interrupted by a below-threshold reading
-	// Expected: Counter resets and needs solarStartQualificationCount new readings to start
-
-	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
-
-	cfg := testConfigSmallBattery()
-	mockBattery := NewMockBattery(50)
+func TestSolarTick_BelowThresholdRequiresNewSustainedQualification(t *testing.T) {
+	now := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	battery := NewMockBattery(50)
 	meter := NewMockMeter(true, -500)
+	svc := newTestServiceWithMeter(testConfigSmallBattery(), battery, meter, nil, now)
+	svc.nowFunc = func() time.Time { return now }
 
-	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
+	svc.solarTick(context.Background())
+	now = now.Add(solarStartQualification / 2)
+	meter.SetActivePowerW(-50)
+	svc.solarTick(context.Background())
 
-	ctx := context.Background()
-
-	// Accumulate partial confirmations (one short of triggering)
-	for range solarStartQualificationCount - 1 {
-		svc.solarTick(ctx)
-	}
-	if svc.solarSurplusCount != solarStartQualificationCount-1 {
-		t.Fatalf("expected count=%d, got %d", solarStartQualificationCount-1, svc.solarSurplusCount)
-	}
-
-	// Surplus drops below threshold (raw surplus used for start, not EMA)
-	meter.SetActivePowerW(-50) // 50W surplus < 100W threshold
-	svc.solarTick(ctx)
-	if svc.solarSurplusCount != 0 {
-		t.Errorf("expected count reset to 0, got %d", svc.solarSurplusCount)
-	}
-
-	// Need solarStartQualificationCount more readings to start
 	meter.SetActivePowerW(-500)
-	for range solarStartQualificationCount - 1 {
-		svc.solarTick(ctx)
+	svc.solarTick(context.Background())
+	for range 30 {
+		now = now.Add(time.Second)
+		svc.solarTick(context.Background())
 	}
-	if svc.state != StateIdle {
-		t.Errorf("should still be idle after only %d new readings", solarStartQualificationCount-1)
-	}
-	svc.solarTick(ctx)
 	if svc.state != StateSolarCharging {
-		t.Errorf("expected solar_charging after %d new readings, got %s", solarStartQualificationCount, svc.state)
+		t.Fatalf("state after replacement sustained surplus = %s, want solar_charging", svc.state)
 	}
 }
 
@@ -2059,42 +2015,26 @@ func TestSolarTick_AdaptiveCooldown(t *testing.T) {
 }
 
 func TestSolarTick_RestartCooldown(t *testing.T) {
-	// After a solar session stops, a new one should not start until solarCooldownUntil.
-
-	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
-
-	cfg := testConfigSmallBattery()
-	mockBattery := NewMockBattery(50)
+	now := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	battery := NewMockBattery(50)
 	meter := NewMockMeter(true, -500)
+	svc := newTestServiceWithMeter(testConfigSmallBattery(), battery, meter, nil, now)
+	svc.nowFunc = func() time.Time { return now }
+	svc.solarCooldownUntil = now.Add(50 * time.Second)
 
-	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
-	// Simulate that a session just stopped with 50s of cooldown remaining
-	svc.solarCooldownUntil = baseTime.Add(50 * time.Second)
-
-	ctx := context.Background()
-
-	// Even with strong surplus, should not start during cooldown
-	for range solarStartQualificationCount + 5 {
-		svc.solarTick(ctx)
-	}
-	if svc.state != StateIdle {
-		t.Errorf("expected idle during restart cooldown, got %s", svc.state)
-	}
-	if svc.solarSurplusCount != 0 {
-		t.Errorf("expected surplus count=0 during cooldown, got %d", svc.solarSurplusCount)
+	svc.solarTick(context.Background())
+	if svc.state != StateIdle || !svc.solarSurplusSince.IsZero() {
+		t.Fatalf("restart cooldown must not accumulate qualification, state=%s since=%s", svc.state, svc.solarSurplusSince)
 	}
 
-	// Advance past cooldown
-	clockTime := baseTime.Add(51 * time.Second)
-	svc.SetClock(func() time.Time { return clockTime })
-
-	// Now solarStartQualificationCount readings should start it
-	for range solarStartQualificationCount {
-		svc.solarTick(ctx)
+	now = now.Add(51 * time.Second)
+	svc.solarTick(context.Background())
+	for range 30 {
+		now = now.Add(time.Second)
+		svc.solarTick(context.Background())
 	}
 	if svc.state != StateSolarCharging {
-		t.Errorf("expected solar_charging after cooldown expired, got %s", svc.state)
+		t.Errorf("expected solar_charging after cooldown and sustained surplus, got %s", svc.state)
 	}
 }
 
@@ -2105,15 +2045,17 @@ func TestSolarTick_MeterFailureStopsWithoutLosingTrade(t *testing.T) {
 	meter := NewMockMeter(true, 75)
 	meter.ActivePowerErr = errors.New("meter offline")
 	svc := newTestServiceWithMeter(testConfigSmallBattery(), battery, meter, nil, now)
+	svc.nowFunc = func() time.Time { return now }
 	svc.state = StateSolarCharging
 	svc.currentTradeStart = now.Add(-time.Minute)
 	svc.currentTradeSOC = 50
 	svc.solarChargePower = 75
 	svc.solarMeasuredChargePowerW = 75
 	svc.solarLastUpdate = now.Add(-time.Minute)
-	for range solarStatusFailureThreshold {
-		svc.solarTick(context.Background())
-	}
+
+	svc.solarTick(context.Background())
+	now = now.Add(solarTelemetryFailureThreshold)
+	svc.solarTick(context.Background())
 	if svc.state != StateIdle || battery.CurrentPower != 0 {
 		t.Fatalf("meter outage: state=%s power=%d, want idle", svc.state, battery.CurrentPower)
 	}
@@ -2151,6 +2093,7 @@ func TestSolarTick_BridgesBriefDipsAtMinimumPower(t *testing.T) {
 		t.Fatal("stopped before the 60-second grace expired")
 	}
 	// Real recovery clears the grace; a later dip gets its own full interval.
+	now = now.Add(time.Second)
 	meter.SetActivePowerW(-2000)
 	svc.solarTick(context.Background())
 	now = now.Add(time.Second)
@@ -2168,45 +2111,28 @@ func TestSolarTick_BridgesBriefDipsAtMinimumPower(t *testing.T) {
 	}
 }
 
-func TestSolarTick_EMASmoothing(t *testing.T) {
-	// A single spike in surplus should not cause an immediate large power change
-	// when the EMA is at a different level.
-
-	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
-
-	cfg := testConfigSmallBattery()
-	mockBattery := NewMockBattery(50)
-	meter := NewMockMeter(true, -500) // 500W surplus
-
-	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
+func TestSolarTick_EMAUsesElapsedSampleInterval(t *testing.T) {
+	now := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	battery := NewMockBattery(50)
+	battery.CurrentPower = 500
+	meter := NewMockMeter(true, -2000)
+	svc := newTestServiceWithMeter(testConfigSmallBattery(), battery, meter, nil, now)
+	svc.nowFunc = func() time.Time { return now }
 	svc.state = StateSolarCharging
-	svc.currentTradeStart = baseTime.Add(-5 * time.Minute)
+	svc.currentTradeStart = now.Add(-5 * time.Minute)
 	svc.currentTradeSOC = 45
 	svc.solarChargePower = 500
-	svc.solarSurplusEMA = 500                                // EMA tracking at 500W effective
-	svc.lastPassiveRefresh = baseTime.Add(-10 * time.Second) // expired cooldown
+	svc.solarSurplusEMA = 500
+	svc.solarEMALastSampleAt = now
+	svc.lastPassiveRefresh = now
 
-	ctx := context.Background()
+	now = now.Add(10 * time.Second)
+	svc.solarTick(context.Background())
 
-	// Single spike: meter reads -2000 (surplus=2000, effective=2000+500=2500)
-	meter.SetActivePowerW(-2000)
-	svc.solarTick(ctx)
-
-	// EMA should move toward 2500 but not jump to it.
-	// At alpha=0.05: EMA = 0.05*2500 + 0.95*500 = 125 + 475 = 600
-	expectedEMA := solarEMAAlpha*2500 + (1-solarEMAAlpha)*500
-	// Allow ±20% tolerance around the computed expected value
-	lower := expectedEMA * 0.8
-	upper := expectedEMA * 1.2
-	if svc.solarSurplusEMA < lower || svc.solarSurplusEMA > upper {
-		t.Errorf("EMA should be ~%.0f after single spike, got %.0f", expectedEMA, svc.solarSurplusEMA)
-	}
-
-	// Power should track EMA, not raw reading — must stay well below the 2500 spike
-	if float64(svc.solarChargePower) > expectedEMA*1.5 {
-		t.Errorf("power should track EMA (~%.0f), not raw spike (2500), got %d",
-			expectedEMA, svc.solarChargePower)
+	alpha := 1 - math.Pow(1-solarEMAAlpha, 10)
+	expectedEMA := 500 + alpha*(2500-500)
+	if math.Abs(svc.solarSurplusEMA-expectedEMA) > 0.001 {
+		t.Errorf("EMA after 10 s = %.6f, want %.6f", svc.solarSurplusEMA, expectedEMA)
 	}
 }
 
@@ -2240,9 +2166,8 @@ func TestSolarTick_YieldsDirectlyToDischargeWindow(t *testing.T) {
 	ctx := context.Background()
 	svc.solarTick(ctx) // solarTick should yield directly
 
-	// Should be idle (solarTick stops solar, tick() needed to start discharge)
-	if svc.state != StateIdle {
-		t.Errorf("expected idle after solarTick yield, got %s", svc.state)
+	if svc.state != StateDischarging || mockBattery.CurrentPower != -cfg.DischargePowerW {
+		t.Errorf("expected direct discharge after solar yield: state=%s power=%d", svc.state, mockBattery.CurrentPower)
 	}
 }
 
@@ -2517,7 +2442,6 @@ func TestTelegramManualDischargeStopsPreviousOperationBeforeStarting(t *testing.
 	svc.state = StateCharging
 	svc.currentTradeStart = currentTime.Add(-time.Minute)
 	svc.currentTradeSOC = 79
-	svc.currentTradePrice = decimal.RequireFromString("0.15")
 	svc.currentTradePowerW = 2000
 	svc.telegram = notifier
 
@@ -2551,7 +2475,6 @@ func newLinkDownDischargeService(t *testing.T, battery *MockBattery, notifier *M
 	svc.telegram = notifier
 	svc.state = StateDischarging
 	svc.currentTradeStart = baseTime
-	svc.currentTradePrice = decimal.NewFromFloat(0.20)
 	svc.currentTradeSOC = 80
 	svc.currentTradePowerW = 2200
 	svc.lastPassiveRefresh = *now
@@ -2790,5 +2713,205 @@ func TestTryRestartBridge_ClearsLinkDownStartCooldown(t *testing.T) {
 	}
 	if want := now.Add(bridgeRebootGrace); !svc.batteryCooldownUntil.Equal(want) {
 		t.Fatalf("expected the restart to shrink the cooldown to the reboot grace %v, got %v", want, svc.batteryCooldownUntil)
+	}
+}
+
+func TestMeasuredChargeSettlementPreservesZeroPrice(t *testing.T) {
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	now := baseTime
+	battery := NewMockBattery(50)
+	svc := newTestService(testConfigSmallBattery(), battery, makePrices(baseTime, 0, 0, 0, 0), now)
+	svc.nowFunc = func() time.Time { return now }
+
+	svc.mu.Lock()
+	svc.startChargingLocked(context.Background(), decimal.Zero, 50)
+	svc.mu.Unlock()
+	now = now.Add(30 * time.Second)
+	svc.mu.Lock()
+	svc.stopChargingLocked(context.Background(), 50)
+	svc.mu.Unlock()
+
+	history := svc.recorder.GetHistory()
+	trade := history.Days[0].Trades[0]
+	if !trade.PriceEUR.IsZero() {
+		t.Fatalf("zero-priced session recorded price %s", trade.PriceEUR)
+	}
+	if !trade.UnpricedKWh.IsZero() {
+		t.Fatalf("zero-priced session recorded unpriced energy %s", trade.UnpricedKWh)
+	}
+	if trade.EnergyKWh.LessThanOrEqual(decimal.Zero) {
+		t.Fatalf("expected measured energy for short session, got %s", trade.EnergyKWh)
+	}
+}
+
+func TestMeasuredChargeSettlementUsesPowerWhenSOCUnchanged(t *testing.T) {
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	now := baseTime
+	battery := NewMockBattery(50)
+	svc := newTestService(testConfigSmallBattery(), battery, makePrices(baseTime, 0.10, 0.10, 0.10, 0.10), now)
+	svc.nowFunc = func() time.Time { return now }
+
+	svc.mu.Lock()
+	svc.startChargingLocked(context.Background(), decimal.RequireFromString("0.10"), 50)
+	svc.mu.Unlock()
+	now = now.Add(30 * time.Second)
+	svc.mu.Lock()
+	svc.stopChargingLocked(context.Background(), 50)
+	svc.mu.Unlock()
+
+	trade := svc.recorder.GetHistory().Days[0].Trades[0]
+	wantEnergy := decimal.NewFromFloat(float64(svc.cfg.ChargePowerW) * 30 / 3_600_000)
+	if !trade.EnergyKWh.Equal(wantEnergy) {
+		t.Fatalf("measured short-session energy = %s, want %s", trade.EnergyKWh, wantEnergy)
+	}
+	if trade.EnergyBasis != measuredBatteryPowerEnergyBasis {
+		t.Fatalf("energy basis = %q, want %q", trade.EnergyBasis, measuredBatteryPowerEnergyBasis)
+	}
+}
+
+func TestSolarStopIntentPersistsAfterSurplusClears(t *testing.T) {
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	now := baseTime
+	battery := NewMockBattery(50)
+	meter := NewMockMeter(true, -500)
+	svc := newTestServiceWithMeter(testConfigSmallBattery(), battery, meter, makePrices(baseTime, 0.10, 0.10, 0.10, 0.10), now)
+	svc.nowFunc = func() time.Time { return now }
+
+	svc.mu.Lock()
+	svc.startSolarChargingLocked(context.Background(), 500, 50)
+	battery.IdleFailures = 1
+	svc.stopSolarChargingLocked(context.Background(), 50, solarStopReasonSurplusGone)
+	stopping := svc.stopPending && svc.state == StateSolarCharging
+	svc.mu.Unlock()
+	if !stopping {
+		t.Fatalf("failed solar stop lost durable intent: state=%s pending=%t", svc.state, svc.stopPending)
+	}
+
+	meter.SetActivePowerW(300) // The surplus trigger clears before the retry.
+	now = now.Add(batteryStopRetryInterval)
+	svc.solarTick(context.Background())
+
+	if svc.state != StateIdle {
+		t.Fatalf("durable solar stop did not settle after trigger cleared: %s", svc.state)
+	}
+	if got := len(svc.recorder.GetHistory().Days[0].Trades); got != 1 {
+		t.Fatalf("recorded solar trades = %d, want 1", got)
+	}
+}
+
+func TestShutdownSettlesActiveMeasuredTradeExactlyOnce(t *testing.T) {
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	now := baseTime
+	battery := NewMockBattery(50)
+	svc := newTestService(testConfigSmallBattery(), battery, makePrices(baseTime, 0.10, 0.10, 0.10, 0.10), now)
+	svc.nowFunc = func() time.Time { return now }
+
+	svc.mu.Lock()
+	svc.startChargingLocked(context.Background(), decimal.RequireFromString("0.10"), 50)
+	svc.mu.Unlock()
+	now = now.Add(30 * time.Second)
+	if err := svc.stopBatteryOnShutdown(); err != nil {
+		t.Fatalf("shutdown stop: %v", err)
+	}
+	if svc.state != StateIdle {
+		t.Fatalf("shutdown state = %s, want idle", svc.state)
+	}
+	if err := svc.stopBatteryOnShutdown(); err != nil {
+		t.Fatalf("second shutdown stop: %v", err)
+	}
+	trades := svc.recorder.GetHistory().Days[0].Trades
+	if len(trades) != 1 {
+		t.Fatalf("recorded trades after repeated shutdown = %d, want 1", len(trades))
+	}
+	if trades[0].EnergyKWh.LessThanOrEqual(decimal.Zero) {
+		t.Fatalf("shutdown trade did not include measured energy: %s", trades[0].EnergyKWh)
+	}
+}
+
+func TestCurrentStatusUsesCachedTelemetryAndExposesReservation(t *testing.T) {
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	battery := NewMockBattery(50)
+	svc := newTestService(
+		testConfigSmallBattery(),
+		battery,
+		makePrices(baseTime, 0.05, 0.10, 0.25, 0.20),
+		baseTime,
+	)
+	svc.mu.Lock()
+	svc.cacheBatteryTelemetryLocked(50, 375)
+	svc.mu.Unlock()
+
+	status := svc.GetCurrentStatus(context.Background())
+	if battery.ESCalls != 0 || battery.StatusCalls != 0 || battery.PowerCalls != 0 {
+		t.Fatalf("status performed battery I/O: ES=%d status=%d power=%d", battery.ESCalls, battery.StatusCalls, battery.PowerCalls)
+	}
+	if !status.BatteryAvailable || status.BatteryObservedAt.IsZero() {
+		t.Fatalf("cached telemetry not exposed: %+v", status)
+	}
+	if status.ChargeReservation == nil {
+		t.Fatal("expected charge reservation from cached SOC")
+	}
+	if !status.CurrentPriceKnown {
+		t.Fatal("expected known current price")
+	}
+}
+
+func TestFetchTomorrowPricesStagesCrossDayPlanDuringActiveCycle(t *testing.T) {
+	now := time.Date(2024, 1, 15, 23, 45, 0, 0, time.UTC)
+	today := makePrices(now, 0.05)
+	tomorrow := makePrices(now.Add(15*time.Minute), 0.25)
+	battery := NewMockBattery(50)
+	svc := newTestService(testConfigSmallBattery(), battery, today, now)
+	svc.state = StateCharging
+	activePlan := svc.currentPlan
+	svc.nordpool = &MockPriceProvider{TomorrowPrices: tomorrow}
+
+	if err := svc.fetchTomorrowPrices(context.Background()); err != nil {
+		t.Fatalf("fetchTomorrowPrices() error = %v", err)
+	}
+	if svc.currentPlan != activePlan {
+		t.Fatal("tomorrow update replaced the active cycle plan")
+	}
+	if svc.pendingPlan == nil ||
+		!svc.pendingPlan.IsInChargeWindow(now) ||
+		!svc.pendingPlan.IsInDischargeWindow(now.Add(15*time.Minute)) {
+		t.Fatalf("staged plan does not retain the cross-day charge/discharge cycle: %+v", svc.pendingPlan)
+	}
+}
+
+func TestDailySummaryRetriesCompletedPriorDayAfterMidnight(t *testing.T) {
+	now := time.Date(2024, 1, 15, 23, 59, 0, 0, time.UTC)
+	svc := newTestService(testConfigSmallBattery(), NewMockBattery(50), nil, now)
+	svc.nowFunc = func() time.Time { return now }
+	notifier := &MockNotifier{DailySummaryErr: errors.New("telegram unavailable")}
+	svc.telegram = notifier
+	if err := svc.recorder.RecordTrade(Trade{
+		Timestamp: now.Add(-12 * time.Hour),
+		Action:    ActionCharge,
+		PriceEUR:  decimal.RequireFromString("0.10"),
+		DurationS: 60,
+		EnergyKWh: decimal.RequireFromString("0.10"),
+	}); err != nil {
+		t.Fatalf("recording completed-day trade: %v", err)
+	}
+
+	svc.checkDailySummary(context.Background())
+	if !svc.lastDailySummary.IsZero() {
+		t.Fatal("failed 23:59 summary was marked delivered")
+	}
+
+	now = now.Add(2 * time.Minute)
+	notifier.DailySummaryErr = nil
+	svc.checkDailySummary(context.Background())
+
+	if len(notifier.DailySummaryCalls) != 2 {
+		t.Fatalf("daily summary attempts = %d, want failed 23:59 attempt plus midnight recovery", len(notifier.DailySummaryCalls))
+	}
+	target := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	if !notifier.DailySummaryCalls[1].Date.Equal(target) {
+		t.Fatalf("recovered summary date = %s, want completed prior day %s", notifier.DailySummaryCalls[1].Date, target)
+	}
+	if !svc.lastDailySummary.Equal(target) {
+		t.Fatalf("lastDailySummary = %s, want recovered day %s", svc.lastDailySummary, target)
 	}
 }

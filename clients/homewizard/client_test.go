@@ -143,6 +143,32 @@ func TestGetActivePowerW_MalformedJSON(t *testing.T) {
 	}
 }
 
+func TestGetActivePowerW_RejectsMissingNullAndNonFiniteValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{name: "missing", payload: `{}`},
+		{name: "null", payload: `{"active_power_w":null}`},
+		{name: "non-finite", payload: `{"active_power_w":1e9999}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tt.payload))
+			}))
+			defer server.Close()
+
+			_, err := New(server.URL).GetActivePowerW()
+			if err == nil {
+				t.Fatal("GetActivePowerW() error = nil, want invalid active power error")
+			}
+		})
+	}
+}
+
 func TestGetDeviceInfo_MalformedJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

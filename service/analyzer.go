@@ -24,6 +24,17 @@ type priceSlot struct {
 	Value decimal.Decimal
 }
 
+type averagedWindow struct {
+	price decimal.Decimal
+	valid bool
+}
+
+type cycleChoice struct {
+	cycle    TradeCycle
+	next     int
+	selected bool
+}
+
 // TimeWindow represents a time window for charging or discharging.
 type TimeWindow struct {
 	Start time.Time
@@ -62,8 +73,7 @@ type AnalyzerConfig struct {
 }
 
 // AnalyzePrices analyzes the day-ahead prices and returns a trading plan.
-// It finds optimal charge/discharge window pairs using a sliding window algorithm.
-// Each discharge window is guaranteed to come AFTER its paired charge window.
+// It selects the globally most profitable chronological charge/discharge cycles.
 func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 	if len(prices) == 0 {
 		return &TradingPlan{}
@@ -116,29 +126,20 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 	efficiency := decimal.NewFromFloat(cfg.Efficiency)
 	minSpread := decimal.NewFromFloat(cfg.MinPriceSpread)
 
-	// Find trade cycles using sliding window algorithm
-	var cycles []TradeCycle
-	searchStartIdx := 0
-
-	// Determine max cycles (default to 2 if not configured)
+	// Determine max cycles (default to 2 if not configured).
 	maxCycles := cfg.MaxCyclesPerDay
 	if maxCycles <= 0 {
 		maxCycles = 2
 	}
 
-	// Try to find profitable cycles
-	for i := 0; i < maxCycles; i++ {
-		cycle, found := findBestCycle(slots, searchStartIdx, chargeWindowSize, dischargeWindowSize, efficiency, minSpread)
-		if !found {
-			break
-		}
-		cycles = append(cycles, cycle)
-		// Next search starts after the discharge window ends
-		searchStartIdx = findSlotIndex(slots, cycle.DischargeWindow.End)
-		if searchStartIdx < 0 || searchStartIdx >= len(slots) {
-			break
-		}
-	}
+	cycles := selectOptimalCycles(
+		slots,
+		chargeWindowSize,
+		dischargeWindowSize,
+		efficiency,
+		minSpread,
+		maxCycles,
+	)
 
 	// Extract charge and discharge windows from cycles for backwards compatibility
 	var chargeWindows, dischargeWindows []TimeWindow
@@ -159,118 +160,121 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 	}
 }
 
-// findBestCycle finds the most profitable charge/discharge pair starting from the given index.
-// It evaluates ALL possible charge windows and picks the pair with maximum profit.
-// Returns the cycle and true if a profitable pair was found.
-func findBestCycle(prices []priceSlot, startIdx, chargeWindowSize, dischargeWindowSize int, efficiency, minSpread decimal.Decimal) (TradeCycle, bool) {
-	var bestCycle TradeCycle
-	var bestProfit decimal.Decimal
-	found := false
+// selectOptimalCycles uses dynamic programming to maximize total profit from up
+// to maxCycles chronological, non-overlapping charge/discharge pairs.
+func selectOptimalCycles(prices []priceSlot, chargeWindowSize, dischargeWindowSize int, efficiency, minSpread decimal.Decimal, maxCycles int) []TradeCycle {
+	maxCycles = min(maxCycles, len(prices)/(chargeWindowSize+dischargeWindowSize))
+	if maxCycles == 0 {
+		return nil
+	}
 
-	// Evaluate every possible charge window position
-	// For each charge window, find the best discharge window after it
-	for chargeStart := startIdx; chargeStart+chargeWindowSize <= len(prices); chargeStart++ {
-		// Calculate average price for this charge window
-		chargeAvg := windowAverage(prices, chargeStart, chargeWindowSize)
+	chargeAverages := precomputeWindowAverages(prices, chargeWindowSize)
+	dischargeAverages := precomputeWindowAverages(prices, dischargeWindowSize)
+	profits := make([][]decimal.Decimal, maxCycles+1)
+	choices := make([][]cycleChoice, maxCycles+1)
+	for cycleCount := range profits {
+		profits[cycleCount] = make([]decimal.Decimal, len(prices)+1)
+		choices[cycleCount] = make([]cycleChoice, len(prices))
+	}
 
-		// Discharge must start after charge ends
-		dischargeSearchStart := chargeStart + chargeWindowSize
-		if dischargeSearchStart+dischargeWindowSize > len(prices) {
-			// No room for discharge window after this charge window
+	for cycleCount := 1; cycleCount <= maxCycles; cycleCount++ {
+		for chargeStart := len(prices) - 1; chargeStart >= 0; chargeStart-- {
+			bestProfit := profits[cycleCount][chargeStart+1]
+			if chargeStart+chargeWindowSize <= len(prices) && chargeAverages[chargeStart].valid {
+				chargeAverage := chargeAverages[chargeStart].price
+				breakEvenPrice := chargeAverage.Div(efficiency)
+				for dischargeStart := chargeStart + chargeWindowSize; dischargeStart+dischargeWindowSize <= len(prices); dischargeStart++ {
+					if !dischargeAverages[dischargeStart].valid {
+						continue
+					}
+
+					dischargeAverage := dischargeAverages[dischargeStart].price
+					if dischargeAverage.LessThanOrEqual(breakEvenPrice) || dischargeAverage.Sub(chargeAverage).LessThan(minSpread) {
+						continue
+					}
+
+					profit := dischargeAverage.Mul(efficiency).Sub(chargeAverage)
+					next := dischargeStart + dischargeWindowSize
+					totalProfit := profit.Add(profits[cycleCount-1][next])
+					if !totalProfit.GreaterThan(bestProfit) {
+						continue
+					}
+
+					bestProfit = totalProfit
+					choices[cycleCount][chargeStart] = cycleChoice{
+						cycle: TradeCycle{
+							ChargeWindow: TimeWindow{
+								Start: prices[chargeStart].Time,
+								End:   prices[chargeStart+chargeWindowSize-1].Time.Add(15 * time.Minute),
+								Price: chargeAverage,
+							},
+							DischargeWindow: TimeWindow{
+								Start: prices[dischargeStart].Time,
+								End:   prices[dischargeStart+dischargeWindowSize-1].Time.Add(15 * time.Minute),
+								Price: dischargeAverage,
+							},
+							Profit: profit,
+						},
+						next:     next,
+						selected: true,
+					}
+				}
+			}
+			profits[cycleCount][chargeStart] = bestProfit
+		}
+	}
+
+	cycles := make([]TradeCycle, 0, maxCycles)
+	for chargeStart, cycleCount := 0, maxCycles; chargeStart < len(prices) && cycleCount > 0; {
+		choice := choices[cycleCount][chargeStart]
+		if !choice.selected {
+			chargeStart++
 			continue
 		}
+		cycles = append(cycles, choice.cycle)
+		chargeStart = choice.next
+		cycleCount--
+	}
+	return cycles
+}
 
-		// Find the best (highest) discharge window after this charge window
-		dischargeStart, dischargeAvg, dischargeFound := findBestWindow(prices, dischargeSearchStart, dischargeWindowSize, false)
-		if !dischargeFound {
-			continue
+// precomputeWindowAverages calculates each contiguous quarter-hour window once.
+// A window is invalid when it spans a missing or duplicate price slot.
+func precomputeWindowAverages(prices []priceSlot, windowSize int) []averagedWindow {
+	averages := make([]averagedWindow, len(prices))
+	if windowSize <= 0 || windowSize > len(prices) {
+		return averages
+	}
+
+	sum := decimal.Zero
+	invalidTransitions := 0
+	for i := range windowSize {
+		sum = sum.Add(prices[i].Value)
+		if i > 0 && !prices[i-1].Time.Add(15*time.Minute).Equal(prices[i].Time) {
+			invalidTransitions++
 		}
-
-		// Check if the trade is profitable
-		// Profitable if: discharge_price > charge_price / efficiency AND spread >= minSpread
-		breakEvenPrice := chargeAvg.Div(efficiency)
-		if dischargeAvg.LessThanOrEqual(breakEvenPrice) || dischargeAvg.Sub(chargeAvg).LessThan(minSpread) {
-			continue
-		}
-
-		// Calculate expected profit per kWh
-		// profit = discharge_price * efficiency - charge_price
-		profit := dischargeAvg.Mul(efficiency).Sub(chargeAvg)
-
-		// Keep the most profitable pair
-		if !found || profit.GreaterThan(bestProfit) {
-			bestProfit = profit
-			found = true
-
-			bestCycle = TradeCycle{
-				ChargeWindow: TimeWindow{
-					Start: prices[chargeStart].Time,
-					End:   prices[chargeStart+chargeWindowSize-1].Time.Add(15 * time.Minute),
-					Price: chargeAvg,
-				},
-				DischargeWindow: TimeWindow{
-					Start: prices[dischargeStart].Time,
-					End:   prices[dischargeStart+dischargeWindowSize-1].Time.Add(15 * time.Minute),
-					Price: dischargeAvg,
-				},
-				Profit: profit,
+	}
+	divisor := decimal.NewFromInt(int64(windowSize))
+	for start := 0; start+windowSize <= len(prices); start++ {
+		if invalidTransitions == 0 {
+			averages[start] = averagedWindow{
+				price: sum.Div(divisor),
+				valid: true,
 			}
 		}
-	}
+		if start+windowSize == len(prices) {
+			break
+		}
 
-	return bestCycle, found
-}
-
-// windowAverage calculates the average price for a window starting at startIdx.
-func windowAverage(prices []priceSlot, startIdx, windowSize int) decimal.Decimal {
-	sum := decimal.Zero
-	for i := startIdx; i < startIdx+windowSize; i++ {
-		sum = sum.Add(prices[i].Value)
-	}
-	return sum.Div(decimal.NewFromInt(int64(windowSize)))
-}
-
-// findBestWindow finds the best contiguous window of the given size starting from startIdx.
-// If findLowest is true, finds the window with the lowest average price.
-// If findLowest is false, finds the window with the highest average price.
-// Returns the start index, average price, and whether a valid window was found.
-func findBestWindow(prices []priceSlot, startIdx, windowSize int, findLowest bool) (int, decimal.Decimal, bool) {
-	if startIdx+windowSize > len(prices) {
-		return 0, decimal.Zero, false
-	}
-
-	bestStart := -1
-	var bestAvg decimal.Decimal
-
-	// Sliding window: compute initial sum
-	windowSum := decimal.Zero
-	for i := startIdx; i < startIdx+windowSize; i++ {
-		windowSum = windowSum.Add(prices[i].Value)
-	}
-	size := decimal.NewFromInt(int64(windowSize))
-
-	// Check first window
-	avg := windowSum.Div(size)
-	bestAvg = avg
-	bestStart = startIdx
-
-	// Slide the window
-	for i := startIdx + 1; i+windowSize <= len(prices); i++ {
-		// Remove element leaving window, add element entering window
-		windowSum = windowSum.Sub(prices[i-1].Value).Add(prices[i+windowSize-1].Value)
-		avg = windowSum.Div(size)
-
-		if (findLowest && avg.LessThan(bestAvg)) || (!findLowest && avg.GreaterThan(bestAvg)) {
-			bestAvg = avg
-			bestStart = i
+		if windowSize > 1 && !prices[start].Time.Add(15*time.Minute).Equal(prices[start+1].Time) {
+			invalidTransitions--
+		}
+		sum = sum.Sub(prices[start].Value).Add(prices[start+windowSize].Value)
+		if windowSize > 1 && !prices[start+windowSize-1].Time.Add(15*time.Minute).Equal(prices[start+windowSize].Time) {
+			invalidTransitions++
 		}
 	}
-
-	if bestStart < 0 {
-		return 0, decimal.Zero, false
-	}
-
-	return bestStart, bestAvg, true
+	return averages
 }
 
 // calculateWindowSize calculates the number of 15-minute slots needed for a full charge/discharge.
@@ -286,17 +290,6 @@ func calculateWindowSize(capacityKWh float64, powerW int) int {
 		return 1
 	}
 	return slots
-}
-
-// findSlotIndex finds the index of the slot that starts at or after the given time.
-// Returns -1 if not found.
-func findSlotIndex(prices []priceSlot, t time.Time) int {
-	for i, p := range prices {
-		if !p.Time.Before(t) {
-			return i
-		}
-	}
-	return -1
 }
 
 // GetCurrentPrice returns the price for the current time slot.

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -60,52 +61,74 @@ func TestLocation_EmptyTimezone(t *testing.T) {
 	}
 }
 
-func TestLoad_Defaults(t *testing.T) {
-	// Clear relevant env vars to test defaults
-	for _, key := range []string{
-		"SERVICE_NAME", "LOG_LEVEL", "HTTP_LISTEN_ADDR", "DATA_DIR", "TZ",
-		"NORDPOOL_AREA", "NORDPOOL_CURRENCY", "ENERGY_TAX_EUR_PER_KWH",
-		"VAT_RATE", "SUPPLIER_FEE_EUR_PER_KWH",
-		"MIN_PRICE_SPREAD", "BATTERY_EFFICIENCY", "BATTERY_CAPACITY_KWH",
-		"BATTERY_MIN_SOC", "MAX_CYCLES_PER_DAY",
-		"ESPHOME_URL", "CHARGE_POWER_W", "DISCHARGE_POWER_W", "PASSIVE_MODE_TIMEOUT_S",
-		"ESPHOME_RESTART_BUTTON",
-		"HOMEWIZARD_P1_URL", "SOLAR_MIN_SURPLUS_W",
-		"TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
-		"BATTERY_UDP_ADDR",
-	} {
-		t.Setenv(key, "")
+func validConfig() Config {
+	return Config{
+		TZ:                  "Europe/Amsterdam",
+		ESPHomeURL:          "http://192.168.1.50",
+		NordPoolCurrency:    "EUR",
+		MinPriceSpread:      0.05,
+		BatteryEfficiency:   0.90,
+		BatteryCapacityKWh:  5.12,
+		BatteryMinSOC:       0.11,
+		MaxCyclesPerDay:     2,
+		ChargePowerW:        2500,
+		DischargePowerW:     2500,
+		PassiveModeTimeoutS: 300,
+		SolarMinSurplusW:    100,
+	}
+}
+
+func TestValidate_RejectsNonFiniteFloatValues(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"NaN battery efficiency", func(cfg *Config) { cfg.BatteryEfficiency = math.NaN() }},
+		{"infinite battery efficiency", func(cfg *Config) { cfg.BatteryEfficiency = math.Inf(1) }},
+		{"NaN battery minimum SOC", func(cfg *Config) { cfg.BatteryMinSOC = math.NaN() }},
+		{"infinite battery minimum SOC", func(cfg *Config) { cfg.BatteryMinSOC = math.Inf(1) }},
+		{"NaN price spread", func(cfg *Config) { cfg.MinPriceSpread = math.NaN() }},
+		{"infinite price spread", func(cfg *Config) { cfg.MinPriceSpread = math.Inf(1) }},
+		{"NaN battery capacity", func(cfg *Config) { cfg.BatteryCapacityKWh = math.NaN() }},
+		{"infinite battery capacity", func(cfg *Config) { cfg.BatteryCapacityKWh = math.Inf(1) }},
 	}
 
-	// All-in pricing is deliberately EUR-only; keep the string field valid
-	// while empty numeric fields exercise envDefault parsing.
-	t.Setenv("NORDPOOL_CURRENCY", "EUR")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.mutate(&cfg)
 
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
+			if err := cfg.validate(); err == nil {
+				t.Fatal("validate() error = nil, want error")
+			}
+		})
+	}
+}
+
+func TestValidate_SafetyBoundaryValues(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"minimum charge power", func(cfg *Config) { cfg.ChargePowerW = 75 }},
+		{"maximum charge power", func(cfg *Config) { cfg.ChargePowerW = 2500 }},
+		{"positive battery capacity", func(cfg *Config) { cfg.BatteryCapacityKWh = 0.01 }},
+		{"minimum passive mode timeout", func(cfg *Config) { cfg.PassiveModeTimeoutS = 1 }},
+		{"maximum passive mode timeout", func(cfg *Config) { cfg.PassiveModeTimeoutS = 86400 }},
+		{"minimum solar surplus", func(cfg *Config) { cfg.SolarMinSurplusW = 1 }},
+		{"minimum maximum cycles", func(cfg *Config) { cfg.MaxCyclesPerDay = 1 }},
+		{"maximum maximum cycles", func(cfg *Config) { cfg.MaxCyclesPerDay = 48 }},
 	}
 
-	if cfg.SolarMinSurplusW != 100 {
-		t.Errorf("SolarMinSurplusW = %d, want 100 (default)", cfg.SolarMinSurplusW)
-	}
-	if cfg.BatteryEfficiency != 0.90 {
-		t.Errorf("BatteryEfficiency = %f, want 0.90", cfg.BatteryEfficiency)
-	}
-	if cfg.ChargePowerW != 2500 {
-		t.Errorf("ChargePowerW = %d, want 2500", cfg.ChargePowerW)
-	}
-	if !cfg.EnergyTaxEURPerKWh.Equal(decimal.RequireFromString("0.09161")) {
-		t.Errorf("EnergyTaxEURPerKWh = %s, want 0.09161 (2026 rate)", cfg.EnergyTaxEURPerKWh)
-	}
-	if !cfg.VATRate.Equal(decimal.RequireFromString("0.21")) {
-		t.Errorf("VATRate = %s, want 0.21", cfg.VATRate)
-	}
-	if !cfg.SupplierFeeEURPerKWh.Equal(decimal.RequireFromString("0.02")) {
-		t.Errorf("SupplierFeeEURPerKWh = %s, want 0.02", cfg.SupplierFeeEURPerKWh)
-	}
-	if cfg.ESPHomeRestartButton != "" {
-		t.Errorf("ESPHomeRestartButton = %q, want empty (default)", cfg.ESPHomeRestartButton)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.mutate(&cfg)
+
+			if err := cfg.validate(); err != nil {
+				t.Fatalf("validate() error = %v", err)
+			}
+		})
 	}
 }
 
@@ -126,7 +149,8 @@ func TestValidate_BatteryEfficiency(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := &Config{NordPoolCurrency: "EUR", BatteryEfficiency: tt.value, BatteryMinSOC: 0.11, DischargePowerW: 2500}
+			cfg := validConfig()
+			cfg.BatteryEfficiency = tt.value
 			err := cfg.validate()
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validate() error = %v, wantErr %v", err, tt.wantErr)
@@ -151,7 +175,8 @@ func TestValidate_BatteryMinSOC(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := &Config{NordPoolCurrency: "EUR", BatteryEfficiency: 0.90, BatteryMinSOC: tt.value, DischargePowerW: 2500}
+			cfg := validConfig()
+			cfg.BatteryMinSOC = tt.value
 			err := cfg.validate()
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validate() error = %v, wantErr %v", err, tt.wantErr)
@@ -161,7 +186,8 @@ func TestValidate_BatteryMinSOC(t *testing.T) {
 }
 
 func TestValidate_MinPriceSpread(t *testing.T) {
-	cfg := &Config{NordPoolCurrency: "EUR", BatteryEfficiency: 0.90, BatteryMinSOC: 0.11, MinPriceSpread: -0.01, DischargePowerW: 2500}
+	cfg := validConfig()
+	cfg.MinPriceSpread = -0.01
 	if err := cfg.validate(); err == nil {
 		t.Error("expected error for negative MinPriceSpread")
 	}
@@ -173,15 +199,10 @@ func TestValidate_MinPriceSpread(t *testing.T) {
 }
 
 func TestValidate_AllInPricing(t *testing.T) {
-	valid := Config{
-		NordPoolCurrency:     "EUR",
-		BatteryEfficiency:    0.90,
-		BatteryMinSOC:        0.11,
-		EnergyTaxEURPerKWh:   decimal.RequireFromString("0.09161"),
-		VATRate:              decimal.RequireFromString("0.21"),
-		SupplierFeeEURPerKWh: decimal.RequireFromString("0.02"),
-		DischargePowerW:      2500,
-	}
+	valid := validConfig()
+	valid.EnergyTaxEURPerKWh = decimal.RequireFromString("0.09161")
+	valid.VATRate = decimal.RequireFromString("0.21")
+	valid.SupplierFeeEURPerKWh = decimal.RequireFromString("0.02")
 
 	tests := []struct {
 		name   string
@@ -235,24 +256,16 @@ func TestValidate_AllInPricing(t *testing.T) {
 
 func TestValidateDischargePower(t *testing.T) {
 	for _, powerW := range []int{MinDischargePowerW, 1500, MaxDischargePowerW} {
-		cfg := Config{
-			NordPoolCurrency:  "EUR",
-			BatteryEfficiency: 0.90,
-			BatteryMinSOC:     0.11,
-			DischargePowerW:   powerW,
-		}
+		cfg := validConfig()
+		cfg.DischargePowerW = powerW
 		if err := cfg.validate(); err != nil {
 			t.Errorf("DischargePowerW %d: unexpected error: %v", powerW, err)
 		}
 	}
 
 	for _, powerW := range []int{MinDischargePowerW - 1, MaxDischargePowerW + 1} {
-		cfg := Config{
-			NordPoolCurrency:  "EUR",
-			BatteryEfficiency: 0.90,
-			BatteryMinSOC:     0.11,
-			DischargePowerW:   powerW,
-		}
+		cfg := validConfig()
+		cfg.DischargePowerW = powerW
 		if err := cfg.validate(); err == nil {
 			t.Errorf("DischargePowerW %d: expected validation error", powerW)
 		}
@@ -298,5 +311,65 @@ func TestLoad_AllInPricing(t *testing.T) {
 	}
 	if got := cfg.SupplierFeeEURPerKWh.String(); got != "0.02" {
 		t.Errorf("SupplierFeeEURPerKWh = %s, want 0.02", got)
+	}
+}
+
+func setValidLoadEnvironment(t *testing.T) {
+	t.Helper()
+
+	for key, value := range map[string]string{
+		"TZ":                       "Europe/Amsterdam",
+		"NORDPOOL_CURRENCY":        "EUR",
+		"MIN_PRICE_SPREAD":         "0.05",
+		"BATTERY_EFFICIENCY":       "0.90",
+		"BATTERY_CAPACITY_KWH":     "5.12",
+		"BATTERY_MIN_SOC":          "0.11",
+		"MAX_CYCLES_PER_DAY":       "2",
+		"CHARGE_POWER_W":           "2500",
+		"DISCHARGE_POWER_W":        "2500",
+		"PASSIVE_MODE_TIMEOUT_S":   "300",
+		"SOLAR_MIN_SURPLUS_W":      "100",
+		"ENERGY_TAX_EUR_PER_KWH":   "0.09161",
+		"VAT_RATE":                 "0.21",
+		"SUPPLIER_FEE_EUR_PER_KWH": "0.02",
+	} {
+		t.Setenv(key, value)
+	}
+}
+
+func TestLoad_RejectsInvalidSafetyValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{"NaN battery efficiency", "BATTERY_EFFICIENCY", "NaN"},
+		{"infinite battery efficiency", "BATTERY_EFFICIENCY", "Inf"},
+		{"NaN battery minimum SOC", "BATTERY_MIN_SOC", "NaN"},
+		{"infinite battery minimum SOC", "BATTERY_MIN_SOC", "Inf"},
+		{"NaN price spread", "MIN_PRICE_SPREAD", "NaN"},
+		{"infinite price spread", "MIN_PRICE_SPREAD", "Inf"},
+		{"NaN battery capacity", "BATTERY_CAPACITY_KWH", "NaN"},
+		{"infinite battery capacity", "BATTERY_CAPACITY_KWH", "Inf"},
+		{"zero battery capacity", "BATTERY_CAPACITY_KWH", "0"},
+		{"charge power below minimum", "CHARGE_POWER_W", "74"},
+		{"charge power above maximum", "CHARGE_POWER_W", "2501"},
+		{"zero passive mode timeout", "PASSIVE_MODE_TIMEOUT_S", "0"},
+		{"excessive passive mode timeout", "PASSIVE_MODE_TIMEOUT_S", "86401"},
+		{"zero solar surplus", "SOLAR_MIN_SURPLUS_W", "0"},
+		{"zero maximum cycles", "MAX_CYCLES_PER_DAY", "0"},
+		{"excessive maximum cycles", "MAX_CYCLES_PER_DAY", "49"},
+		{"invalid timezone", "TZ", "Invalid/Timezone"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setValidLoadEnvironment(t)
+			t.Setenv(tt.key, tt.value)
+
+			if _, err := Load(); err == nil {
+				t.Fatal("Load() error = nil, want error")
+			}
+		})
 	}
 }

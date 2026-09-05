@@ -131,6 +131,9 @@ func (c *Client) FetchDayAheadPrices(ctx context.Context, date time.Time) ([]Pri
 		if err != nil {
 			return nil, fmt.Errorf("parse time %q: %w", entry.DeliveryStart, err)
 		}
+		if c.loc != nil {
+			t = t.In(c.loc)
+		}
 
 		// Get price for our area (in EUR/MWh)
 		pricePerMWh, ok := entry.EntryPerArea[c.area]

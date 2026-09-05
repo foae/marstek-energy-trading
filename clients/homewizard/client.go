@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -22,7 +23,7 @@ type DeviceInfo struct {
 
 // dataResponse represents the /api/v1/data response from a HomeWizard P1 meter.
 type dataResponse struct {
-	ActivePowerW float64 `json:"active_power_w"`
+	ActivePowerW *float64 `json:"active_power_w"`
 }
 
 // Client is a HomeWizard P1 meter HTTP client.
@@ -98,5 +99,11 @@ func (c *Client) GetActivePowerW() (float64, error) {
 		return 0, fmt.Errorf("decode data response: %w", err)
 	}
 
-	return data.ActivePowerW, nil
+	if data.ActivePowerW == nil {
+		return 0, fmt.Errorf("decode data response: missing active_power_w")
+	}
+	if math.IsNaN(*data.ActivePowerW) || math.IsInf(*data.ActivePowerW, 0) {
+		return 0, fmt.Errorf("decode data response: non-finite active_power_w")
+	}
+	return *data.ActivePowerW, nil
 }

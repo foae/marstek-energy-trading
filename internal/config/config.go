@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"math"
+	"net/url"
 	"time"
 
 	"github.com/caarlos0/env/v11"
@@ -70,14 +72,29 @@ func (c *Config) validate() error {
 	if c.NordPoolCurrency != "EUR" {
 		return fmt.Errorf("NORDPOOL_CURRENCY must be EUR when all-in pricing is enabled, got %q", c.NordPoolCurrency)
 	}
-	if c.BatteryEfficiency <= 0 || c.BatteryEfficiency > 1.0 {
-		return fmt.Errorf("BATTERY_EFFICIENCY must be in (0.0, 1.0], got %f", c.BatteryEfficiency)
+	if !isFinite(c.BatteryEfficiency) || c.BatteryEfficiency <= 0 || c.BatteryEfficiency > 1.0 {
+		return fmt.Errorf("BATTERY_EFFICIENCY must be finite and in (0.0, 1.0], got %f", c.BatteryEfficiency)
 	}
-	if c.BatteryMinSOC < 0 || c.BatteryMinSOC >= 1.0 {
-		return fmt.Errorf("BATTERY_MIN_SOC must be in [0.0, 1.0), got %f", c.BatteryMinSOC)
+	if !isFinite(c.BatteryMinSOC) || c.BatteryMinSOC < 0 || c.BatteryMinSOC >= 1.0 {
+		return fmt.Errorf("BATTERY_MIN_SOC must be finite and in [0.0, 1.0), got %f", c.BatteryMinSOC)
 	}
-	if c.MinPriceSpread < 0 {
-		return fmt.Errorf("MIN_PRICE_SPREAD must be >= 0, got %f", c.MinPriceSpread)
+	if !isFinite(c.MinPriceSpread) || c.MinPriceSpread < 0 {
+		return fmt.Errorf("MIN_PRICE_SPREAD must be finite and >= 0, got %f", c.MinPriceSpread)
+	}
+	if !isFinite(c.BatteryCapacityKWh) || c.BatteryCapacityKWh <= 0 {
+		return fmt.Errorf("BATTERY_CAPACITY_KWH must be finite and > 0, got %f", c.BatteryCapacityKWh)
+	}
+	if c.ChargePowerW < 75 || c.ChargePowerW > 2500 {
+		return fmt.Errorf("CHARGE_POWER_W must be between 75 and 2500, got %d", c.ChargePowerW)
+	}
+	if c.PassiveModeTimeoutS <= 0 || c.PassiveModeTimeoutS > 86400 {
+		return fmt.Errorf("PASSIVE_MODE_TIMEOUT_S must be between 1 and 86400, got %d", c.PassiveModeTimeoutS)
+	}
+	if c.SolarMinSurplusW <= 0 {
+		return fmt.Errorf("SOLAR_MIN_SURPLUS_W must be > 0, got %d", c.SolarMinSurplusW)
+	}
+	if c.MaxCyclesPerDay < 1 || c.MaxCyclesPerDay > 48 {
+		return fmt.Errorf("MAX_CYCLES_PER_DAY must be between 1 and 48, got %d", c.MaxCyclesPerDay)
 	}
 	if c.EnergyTaxEURPerKWh.IsNegative() {
 		return fmt.Errorf("ENERGY_TAX_EUR_PER_KWH must be >= 0, got %s", c.EnergyTaxEURPerKWh)
@@ -91,7 +108,30 @@ func (c *Config) validate() error {
 	if c.DischargePowerW < MinDischargePowerW || c.DischargePowerW > MaxDischargePowerW {
 		return fmt.Errorf("DISCHARGE_POWER_W must be between %d and %d, got %d", MinDischargePowerW, MaxDischargePowerW, c.DischargePowerW)
 	}
+	for _, setting := range [...]struct{ name, endpoint string }{
+		{"ESPHOME_URL", c.ESPHomeURL}, {"HOMEWIZARD_P1_URL", c.HomeWizardP1URL},
+	} {
+		if setting.name == "HOMEWIZARD_P1_URL" && setting.endpoint == "" {
+			continue
+		}
+		parsed, err := url.Parse(setting.endpoint)
+		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return fmt.Errorf("%s must be an absolute HTTP(S) URL, got %q", setting.name, setting.endpoint)
+		}
+	}
+	if _, err := time.LoadLocation(c.TZ); err != nil {
+		return fmt.Errorf("invalid TZ %q: %w", c.TZ, err)
+	}
 	return nil
+}
+
+func isFinite(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+// MinSOCPercent rounds protection upward to the battery's integer SOC resolution.
+func (c *Config) MinSOCPercent() int {
+	return int(decimal.NewFromFloat(c.BatteryMinSOC).Mul(decimal.NewFromInt(100)).Ceil().IntPart())
 }
 
 // TelegramEnabled returns true if Telegram notifications are configured.

@@ -6,6 +6,8 @@ A Go service that performs energy price arbitrage using a Marstek Venus E batter
 
 The analyzer evaluates contiguous charge and later discharge windows sized for usable battery capacity and configured power. Dynamic programming selects up to `MAX_CYCLES_PER_DAY` chronological, non-overlapping pairs that maximize total expected cycle profit; it does not use daily price quartiles or greedily commit one pair at a time.
 
+Planning retains the full current-day price calendar, including elapsed charging slots, so refreshes and same-day restarts cannot erase their paired evening discharge. Once a cycle starts, its plan remains committed through the discharge-window end, including idle time after the battery fills and across midnight. Grid reservations still use only remaining slots.
+
 A pair is eligible only when:
 1. The discharge-window average exceeds the charge-window average divided by `BATTERY_EFFICIENCY`.
 2. The raw average-price spread meets `MIN_PRICE_SPREAD`.

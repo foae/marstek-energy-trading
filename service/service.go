@@ -1460,7 +1460,7 @@ func (s *Service) transitionToIdleLocked(ctx context.Context, soc int) bool {
 	s.stopPending = false
 	s.lastStopAttempt = time.Time{}
 	s.lastStopLinkDown = false
-	if s.pendingPlan != nil {
+	if s.pendingPlan != nil && !s.automaticCycleCommittedLocked() {
 		s.currentPlan = s.pendingPlan
 		s.pendingPlan = nil
 	}
@@ -1673,13 +1673,29 @@ func (s *Service) futurePriceHorizonLocked(now time.Time) []nordpool.Price {
 }
 
 func (s *Service) automaticCycleCommittedLocked() bool {
-	return s.state == StateCharging || s.state == StateDischarging
+	if s.state == StateCharging || s.state == StateDischarging {
+		return true
+	}
+	// A charged battery can be idle between the paired windows, including
+	// across midnight. Keep its discharge commitment until that window ends.
+	if s.currentPlan != nil {
+		now := s.now()
+		for _, cycle := range s.currentPlan.Cycles {
+			if !now.Before(cycle.ChargeWindow.Start) && now.Before(cycle.DischargeWindow.End) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
-// refreshCurrentPlanLocked preserves an executing automatic charge/discharge
-// cycle while staging the later horizon for application once it reaches idle.
+// refreshCurrentPlanLocked preserves a started cycle through its discharge end,
+// including idle time between charging and discharging.
 func (s *Service) refreshCurrentPlanLocked(now time.Time) *TradingPlan {
-	plan := AnalyzePrices(s.futurePriceHorizonLocked(now), s.analyzerConfig())
+	// Retain today's charge prices: removing them also removes the paired
+	// evening discharge, even when the battery is already full. This also
+	// reconstructs today's discharge schedule after a service restart.
+	plan := AnalyzePrices(s.futurePriceHorizonLocked(localMidnight(now)), s.analyzerConfig())
 	if s.automaticCycleCommittedLocked() {
 		s.pendingPlan = plan
 		return plan
@@ -1700,7 +1716,7 @@ func (s *Service) fetchTodayPrices(ctx context.Context) error {
 	s.mu.Lock()
 	s.todayPrices = prices // full day remains available for price settlement
 	plan := s.refreshCurrentPlanLocked(now)
-	futurePrices := len(s.futurePriceHorizonLocked(now))
+	futurePrices := len(s.futurePriceHorizonLocked(localMidnight(now)))
 	slotsTotal := len(s.todayPrices) + len(s.tomorrowPrices)
 	s.mu.Unlock()
 
@@ -1737,7 +1753,7 @@ func (s *Service) fetchTomorrowPrices(ctx context.Context) error {
 	s.mu.Lock()
 	s.tomorrowPrices = prices
 	plan := s.refreshCurrentPlanLocked(now)
-	futurePrices := len(s.futurePriceHorizonLocked(now))
+	futurePrices := len(s.futurePriceHorizonLocked(localMidnight(now)))
 	slotsTotal := len(s.todayPrices) + len(s.tomorrowPrices)
 	s.mu.Unlock()
 

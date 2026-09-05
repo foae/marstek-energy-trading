@@ -103,19 +103,19 @@ The `lastChargePrice` is still tracked for observability logging but no longer g
 
 ### Solar Self-Consumption
 
-When a HomeWizard P1 meter is configured, the service detects grid export (solar surplus) and charges the battery with free energy:
+When a HomeWizard P1 meter is configured, the service detects grid export (solar surplus) and charges the battery, bridging brief dips at low power:
 
 1. **Detection**: P1 meter is polled every 1 second. Negative `active_power_w` = exporting to grid = solar surplus.
-2. **Start confirmation**: Requires 3 consecutive readings above `SOLAR_MIN_SURPLUS_W` (default: 100W) to avoid false starts.
+2. **Start confirmation**: Requires 30 consecutive readings above `SOLAR_MIN_SURPLUS_W` (default: 100W). Failed meter or battery reads reset qualification.
 3. **Charging**: Battery charges at the detected surplus power (clamped to `CHARGE_POWER_W`). Power is dynamically adjusted with a 50W deadband to avoid flapping.
-4. **P1 feedback compensation**: The Marstek Venus E is AC-coupled, so its charge power is visible on the P1 meter as consumption. During active solar charging, the stop-threshold and power adjustment use `effectiveSurplus = measuredSurplus + currentChargePower` to recover the true solar surplus from the P1 reading. Without this, the system would oscillate (start→surplus drops→stop→surplus returns→start).
+4. **P1 feedback compensation**: During charging, `effectiveSurplus = measuredSurplus + measuredBatteryChargePower`; an EMA (alpha 0.05) smooths the result. Measured rather than requested battery power avoids treating an unachieved command as available surplus.
 5. **Ramp-up cooldown**: After starting or adjusting charge power, a 5-second cooldown prevents re-adjustment while the battery ramps to the new target (~3s). This avoids a positive feedback spiral where transient over-estimation of effective surplus causes the target power to spiral upward.
-6. **Stop hysteresis + debounce**: Stop threshold is 25W (1/4 of start threshold), requiring 3 consecutive low readings. The hysteresis gap (25W–100W) prevents cycling when surplus fluctuates near the start threshold. The debounce filters brief dips from clouds or appliance spikes.
+6. **Low-surplus grace**: EMA below `max(SOLAR_MIN_SURPLUS_W / 4, 75W)` starts a 60-second grace requesting 75W; recovery immediately clears it. Grace expiry stops charging. Surplus-loss sessions under ten minutes get a five-minute cooldown; three consecutive marginal sessions get fifteen minutes. Longer sessions and legitimate stops reset the streak and use sixty seconds. Battery-full and scheduled-window checks precede P1 reads. Failed adjustments immediately request a confirmed stop and five-minute cooldown; failed stops retain the session with throttled retries.
 7. **Scheduled window priority**: Scheduled trading windows always take priority over solar charging. Three rules enforce this:
    - **Yield on entry**: If solar charging is active when a scheduled charge or discharge window starts, solar charging stops (trade recorded), then the scheduled action begins immediately.
    - **Block during window**: `solarTick` will not start solar charging while a scheduled charge or discharge window is active — it resets the surplus counter and returns.
    - **Resume after window**: When a scheduled window ends and the state returns to idle, `solarTick` picks up any available surplus and resumes solar charging automatically.
-8. **Recording**: Solar charges are recorded as `solar_charge` trades with price = 0 EUR/kWh. They contribute to `chargedKWh` but not to `chargeCost` in P&L.
+8. **Recording**: `solar_charge` records retain total battery energy and zero solar price, with separate estimated grid energy and priced grid cost. Grid input is `min(measuredBatteryChargePower, max(netGridImport, 0))`, integrated between samples. Solar energy is the remainder. Grid cost uses each covered price slot; energy without a known price is explicitly unpriced, making reported P&L incomplete. Legacy records without split fields remain all-solar. Estimates use last observed power during telemetry gaps.
 
 ### Configurable Spread Threshold
 

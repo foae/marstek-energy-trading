@@ -22,14 +22,17 @@ const (
 
 // Trade represents a single trade record.
 type Trade struct {
-	Timestamp time.Time       `json:"timestamp"`
-	Action    TradeAction     `json:"action"`
-	PriceEUR  decimal.Decimal `json:"price_eur"`  // EUR/kWh
-	PowerW    int             `json:"power_w"`    // Watts
-	DurationS int             `json:"duration_s"` // Seconds
-	EnergyKWh decimal.Decimal `json:"energy_kwh"` // kWh traded
-	StartSOC  int             `json:"start_soc"`  // SOC at start
-	EndSOC    int             `json:"end_soc"`    // SOC at end
+	Timestamp       time.Time       `json:"timestamp"`
+	Action          TradeAction     `json:"action"`
+	PriceEUR        decimal.Decimal `json:"price_eur"`         // EUR/kWh
+	PowerW          int             `json:"power_w"`           // Watts
+	DurationS       int             `json:"duration_s"`        // Seconds
+	EnergyKWh       decimal.Decimal `json:"energy_kwh"`        // kWh battery input/output
+	GridEnergyKWh   decimal.Decimal `json:"grid_energy_kwh"`   // Grid portion of a solar charge
+	GridCostEUR     decimal.Decimal `json:"grid_cost_eur"`     // Interval-priced grid cost of a solar charge
+	GridUnpricedKWh decimal.Decimal `json:"grid_unpriced_kwh"` // Grid portion without an available price
+	StartSOC        int             `json:"start_soc"`         // SOC at start
+	EndSOC          int             `json:"end_soc"`           // SOC at end
 }
 
 // DailySummary contains the daily trading summary.
@@ -40,6 +43,8 @@ type DailySummary struct {
 	ChargeCycles      int             `json:"charge_cycles"`
 	DischargeCycles   int             `json:"discharge_cycles"`
 	SolarChargedKWh   decimal.Decimal `json:"solar_charged_kwh"`
+	GridChargedKWh    decimal.Decimal `json:"grid_charged_kwh"`
+	UnpricedGridKWh   decimal.Decimal `json:"unpriced_grid_kwh"`
 	SolarChargeCycles int             `json:"solar_charge_cycles"`
 	PnLEUR            decimal.Decimal `json:"pnl_eur"`
 	AvgChargePrice    decimal.Decimal `json:"avg_charge_price"`
@@ -124,6 +129,8 @@ func (r *Recorder) GetHistory() History {
 		chargeCost := decimal.Zero
 		dischargeRevenue := decimal.Zero
 		solarChargedKWh := decimal.Zero
+		gridChargedKWh := decimal.Zero
+		unpricedGridKWh := decimal.Zero
 		var chargeCycles, dischargeCycles, solarChargeCycles int
 
 		// Track min/max prices with seen flags to handle negative prices correctly
@@ -134,6 +141,7 @@ func (r *Recorder) GetHistory() History {
 			switch t.Action {
 			case ActionCharge:
 				chargedKWh = chargedKWh.Add(t.EnergyKWh)
+				gridChargedKWh = gridChargedKWh.Add(t.EnergyKWh)
 				chargeCost = chargeCost.Add(t.PriceEUR.Mul(t.EnergyKWh))
 				if !seenCharge || t.PriceEUR.LessThan(minChargePrice) {
 					minChargePrice = t.PriceEUR
@@ -141,9 +149,19 @@ func (r *Recorder) GetHistory() History {
 				}
 				chargeCycles++
 			case ActionSolarCharge:
-				// Solar energy is free: add to charged kWh but not to charge cost
 				chargedKWh = chargedKWh.Add(t.EnergyKWh)
-				solarChargedKWh = solarChargedKWh.Add(t.EnergyKWh)
+				solarChargedKWh = solarChargedKWh.Add(t.EnergyKWh.Sub(t.GridEnergyKWh))
+				gridChargedKWh = gridChargedKWh.Add(t.GridEnergyKWh)
+				unpricedGridKWh = unpricedGridKWh.Add(t.GridUnpricedKWh)
+				chargeCost = chargeCost.Add(t.GridCostEUR)
+				pricedGridKWh := t.GridEnergyKWh.Sub(t.GridUnpricedKWh)
+				if pricedGridKWh.GreaterThan(decimal.Zero) {
+					gridPrice := t.GridCostEUR.Div(pricedGridKWh)
+					if !seenCharge || gridPrice.LessThan(minChargePrice) {
+						minChargePrice = gridPrice
+						seenCharge = true
+					}
+				}
 				solarChargeCycles++
 			case ActionDischarge:
 				dischargedKWh = dischargedKWh.Add(t.EnergyKWh)
@@ -156,12 +174,12 @@ func (r *Recorder) GetHistory() History {
 			}
 		}
 
-		// Calculate energy-weighted average prices: sum(price * energy) / sum(energy)
-		// Use grid-only kWh for avg charge price (solar is free and would dilute the average)
-		gridChargedKWh := chargedKWh.Sub(solarChargedKWh)
+		// Calculate energy-weighted average prices: sum(price * energy) / sum(energy).
+		// Exclude grid input without a price from the charge-price average.
+		pricedGridChargedKWh := gridChargedKWh.Sub(unpricedGridKWh)
 		avgChargePrice := decimal.Zero
-		if !gridChargedKWh.IsZero() {
-			avgChargePrice = chargeCost.Div(gridChargedKWh)
+		if !pricedGridChargedKWh.IsZero() {
+			avgChargePrice = chargeCost.Div(pricedGridChargedKWh)
 		}
 		avgDischargePrice := decimal.Zero
 		if !dischargedKWh.IsZero() {
@@ -178,6 +196,8 @@ func (r *Recorder) GetHistory() History {
 			ChargeCycles:      chargeCycles,
 			DischargeCycles:   dischargeCycles,
 			SolarChargedKWh:   solarChargedKWh,
+			GridChargedKWh:    gridChargedKWh,
+			UnpricedGridKWh:   unpricedGridKWh,
 			SolarChargeCycles: solarChargeCycles,
 			PnLEUR:            pnl,
 			AvgChargePrice:    avgChargePrice,
@@ -232,6 +252,8 @@ func (r *Recorder) GetTotalPnL() decimal.Decimal {
 		switch t.Action {
 		case ActionCharge:
 			totalCost = totalCost.Add(t.PriceEUR.Mul(t.EnergyKWh))
+		case ActionSolarCharge:
+			totalCost = totalCost.Add(t.GridCostEUR)
 		case ActionDischarge:
 			totalRevenue = totalRevenue.Add(t.PriceEUR.Mul(t.EnergyKWh))
 		}
@@ -260,7 +282,7 @@ func (r *Recorder) saveTrades() error {
 		return nil // No persistence configured
 	}
 
-	if err := os.MkdirAll(r.dataDir, 0755); err != nil {
+	if err := os.MkdirAll(r.dataDir, 0o755); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
 	}
 
@@ -273,7 +295,7 @@ func (r *Recorder) saveTrades() error {
 	}
 
 	// Write to temp file first
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
 		return fmt.Errorf("write temp file: %w", err)
 	}
 

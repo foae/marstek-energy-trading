@@ -61,8 +61,17 @@ Direct UDP control is available but not enabled by default. See [docs/marstek-ap
 - **Resolution**: 15-minute intervals
 - **Prices**: EUR/MWh, converted internally to all-in EUR/kWh using `(NordPool + energy tax) × (1 + VAT) + supplier fee`
 
-### HomeWizard P1 Energy Meter (planned)
-Provides real-time house energy consumption. Future enhancement to pause charging when consumption exceeds ~17kWh total or ~5.7kWh per phase.
+### HomeWizard P1 Energy Meter
+The P1 meter enables solar self-consumption charging. Battery draw is compensated using measured battery power, and an EMA smooths the power target.
+
+- Start after 30 consecutive surplus readings (normally about 30 seconds).
+- When smoothed surplus falls below the useful charging threshold (at least 75 W), request 75 W for up to 60 seconds before stopping. Recovery clears the grace timer. The normal five-second battery settling interval still applies.
+- Surplus-loss sessions under 10 minutes receive a five-minute restart cooldown; three consecutive marginal sessions increase it to 15 minutes. Longer sessions and battery-full/scheduled-window stops reset the streak and use a one-minute cooldown.
+- Battery-full protection and scheduled windows override the grace even when the P1 meter is unavailable. Repeated P1 or battery telemetry failures stop charging through the existing fault path. A failed power adjustment immediately requests a confirmed stop; unsuccessful stops retain the session and use throttled retries.
+
+Bridging a dip can import grid energy: a 75 W floor for 60 seconds is 1.25 Wh with no solar surplus. This is not a bound on whole-house import or on energy used while the EMA settles. Fewer start/stop events do not imply a quantified battery lifespan improvement.
+
+Solar-session history separates estimated grid input (`grid_energy_kwh`) and its priced cost (`grid_cost_eur`) from solar energy. Grid attribution is capped at measured battery draw and net household import; it is not revenue-grade metering. Missing-price energy is reported as `grid_unpriced_kwh`, so P&L is incomplete until those costs are known. Older solar records retain their original all-solar interpretation. Daily totals include `grid_charged_kwh` and `unpriced_grid_kwh`.
 
 ## Quick Start
 

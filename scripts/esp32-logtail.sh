@@ -3,10 +3,14 @@
 # dropping the routine Modbus chatter, so an RS485 link freeze can be diagnosed from
 # the device side after the fact. Reconnects when the device reboots.
 #
-# Usage: scripts/esp32-logtail.sh [device-url] [output-file]
-#   nohup scripts/esp32-logtail.sh http://192.168.1.50 ~/esp32-events.log >/dev/null 2>&1 &
+# Usage: scripts/esp32-logtail.sh <device-url> [output-file]
+#   nohup scripts/esp32-logtail.sh http://battery-bridge.local ~/esp32-events.log >/dev/null 2>&1 &
 set -u
-URL=${1:-http://192.168.1.50}
+if (( $# < 1 )); then
+  printf 'usage: %s <device-url> [output-file]\n' "$0" >&2
+  exit 2
+fi
+URL=${1%/}
 OUT=${2:-$HOME/esp32-events.log}
 ESC=$(printf '\033')
 # Stamp in the trader's timezone so device and service logs line up.

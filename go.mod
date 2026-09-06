@@ -1,6 +1,6 @@
 module github.com/foae/marstek-energy-trading
 
-go 1.26.2
+go 1.26.6
 
 require (
 	github.com/caarlos0/env/v11 v11.4.1

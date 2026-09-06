@@ -1,0 +1,10 @@
+.git
+.github
+.env
+AGENTS.local.md
+data
+energy-trader
+vendor
+*.out
+coverage.*
+*.log

@@ -30,7 +30,6 @@ func (h *Handler) NewRouter() *chi.Mux {
 
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
 
 	r.Get("/health", h.healthHandler)
 	r.Get("/metrics", h.metricsHandler())

@@ -95,6 +95,8 @@ type Service struct {
 	nowFunc  func() time.Time // clock function for testing
 
 	mu                          sync.RWMutex
+	errorNotifyMu               sync.Mutex
+	linkDownNotifyMu            sync.Mutex
 	state                       State
 	currentPlan                 *TradingPlan
 	pendingPlan                 *TradingPlan // plan fetched while an automatic cycle is still committed
@@ -344,9 +346,11 @@ func (s *Service) accumulateMeasuredTradeEnergyAtLocked(measuredPowerW float64, 
 		return
 	}
 
-	powerW := max(measuredPowerW, 0)
+	// Integrate the sample observed at the start of the interval, then retain
+	// the newly observed sample for the next interval.
+	powerW := max(s.currentTradeLastPowerW, 0)
 	if !charging {
-		powerW = max(-measuredPowerW, 0)
+		powerW = max(-s.currentTradeLastPowerW, 0)
 	}
 	s.snapshotSessionPricesLocked()
 	for cursor := s.currentTradeLastUpdate; cursor.Before(at); {
@@ -603,7 +607,7 @@ func (s *Service) tick(ctx context.Context) {
 	}
 
 	// Get current price
-	currentPrice, ok := GetCurrentPrice(s.todayPrices, now)
+	currentPrice, ok := s.currentPriceLocked(now)
 	if !ok {
 		l.Warn("no price for current time slot")
 		switch s.state {
@@ -634,9 +638,7 @@ func (s *Service) tick(ctx context.Context) {
 			} else if !batStatus.ChargingFlag {
 				l.Warn("in charge window but battery charging disabled")
 			} else {
-				l.Info("decision: start charging",
-					"min_price", s.currentPlan.MinPrice,
-					"charge_threshold", s.currentPlan.MinPrice.Add(s.currentPlan.Spread.Mul(decimal.NewFromFloat(0.25))))
+				l.Info("decision: start charging", "min_price", s.currentPlan.MinPrice)
 				s.startChargingLocked(ctx, currentPrice, batStatus.SOC)
 			}
 		} else if inDischargeWindow {
@@ -649,8 +651,7 @@ func (s *Service) tick(ctx context.Context) {
 				lastChargeF, _ := s.lastChargePrice.Float64()
 				l.Info("decision: start discharging",
 					"last_charge_price", lastChargeF,
-					"max_price", s.currentPlan.MaxPrice,
-					"discharge_threshold", s.currentPlan.MaxPrice.Sub(s.currentPlan.Spread.Mul(decimal.NewFromFloat(0.25))))
+					"max_price", s.currentPlan.MaxPrice)
 				s.startDischargingLocked(ctx, currentPrice, batStatus.SOC, s.cfg.DischargePowerW, StateDischarging)
 			}
 		}
@@ -1283,9 +1284,6 @@ func (s *Service) stopChargingLocked(ctx context.Context, endSOC int) {
 	if err := s.recorder.RecordTrade(trade); err != nil {
 		l.Error("failed to record trade", "error", err)
 	}
-	s.mu.Lock()
-
-	s.mu.Unlock()
 	if s.telegramEnabled() {
 		if err := s.telegram.SendTradeEnd(ctx, "Charging", energyF, avgPriceF, endSOC); err != nil {
 			l.Warn("failed to send trade notification", "error", err)
@@ -1672,6 +1670,13 @@ func (s *Service) futurePriceHorizonLocked(now time.Time) []nordpool.Price {
 	return horizon
 }
 
+func (s *Service) currentPriceLocked(now time.Time) (decimal.Decimal, bool) {
+	if price, ok := GetCurrentPrice(s.todayPrices, now); ok {
+		return price, true
+	}
+	return GetCurrentPrice(s.tomorrowPrices, now)
+}
+
 func (s *Service) automaticCycleCommittedLocked() bool {
 	if s.state == StateCharging || s.state == StateDischarging {
 		return true
@@ -1994,15 +1999,19 @@ func (s *Service) notifyLinkDown(ctx context.Context, msg string) {
 	if !s.telegramEnabled() {
 		return
 	}
-	if s.now().Sub(s.lastLinkDownNotify) < linkDownNotifyInterval {
+	s.linkDownNotifyMu.Lock()
+	defer s.linkDownNotifyMu.Unlock()
+	now := s.now()
+	elapsed := now.Sub(s.lastLinkDownNotify)
+	if !s.lastLinkDownNotify.IsZero() && elapsed >= 0 && elapsed < linkDownNotifyInterval {
 		slog.Debug("link down notification rate limited", "msg", msg)
 		return
 	}
-	s.lastLinkDownNotify = s.now()
-
 	if err := s.telegram.SendError(ctx, msg); err != nil {
 		slog.Warn("failed to send link down notification", "error", err)
+		return
 	}
+	s.lastLinkDownNotify = now
 }
 
 // tryRestartBridge reboots the ESPHome bridge to recover a wedged RS485 link.
@@ -2052,16 +2061,20 @@ func (s *Service) notifyError(ctx context.Context, msg string) {
 	if !s.telegramEnabled() {
 		return
 	}
+	s.errorNotifyMu.Lock()
+	defer s.errorNotifyMu.Unlock()
+	now := s.now()
 	// Rate limit: only send one error notification per 15 minutes
-	if time.Since(s.lastErrorNotify) < 15*time.Minute {
+	elapsed := now.Sub(s.lastErrorNotify)
+	if !s.lastErrorNotify.IsZero() && elapsed >= 0 && elapsed < 15*time.Minute {
 		slog.Debug("error notification rate limited", "msg", msg)
 		return
 	}
-	s.lastErrorNotify = time.Now()
-
 	if err := s.telegram.SendError(ctx, msg); err != nil {
 		slog.Warn("failed to send error notification", "error", err)
+		return
 	}
+	s.lastErrorNotify = now
 }
 
 // handleTelegramCommands polls for and handles Telegram bot commands.
@@ -2132,7 +2145,7 @@ func (s *Service) handleManualDischargeCommand(ctx context.Context, args []strin
 
 	now := s.now()
 	s.mu.RLock()
-	currentPrice, _ := GetCurrentPrice(s.todayPrices, now)
+	currentPrice, _ := s.currentPriceLocked(now)
 	s.mu.RUnlock()
 
 	s.mu.Lock()
@@ -2360,10 +2373,7 @@ func (s *Service) GetCurrentStatus(ctx context.Context) CurrentStatus {
 	}
 
 	// Keep a zero-valued valid price distinct from an unavailable price.
-	if price, ok := GetCurrentPrice(s.todayPrices, now); ok {
-		status.CurrentPrice = price.InexactFloat64()
-		status.CurrentPriceKnown = true
-	} else if price, ok := GetCurrentPrice(s.tomorrowPrices, now); ok {
+	if price, ok := s.currentPriceLocked(now); ok {
 		status.CurrentPrice = price.InexactFloat64()
 		status.CurrentPriceKnown = true
 	}

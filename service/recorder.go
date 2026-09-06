@@ -396,8 +396,11 @@ func (r *Recorder) saveTrades() error {
 		return nil // No persistence configured
 	}
 
-	if err := os.MkdirAll(r.dataDir, 0o755); err != nil {
+	if err := os.MkdirAll(r.dataDir, 0o700); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
+	}
+	if err := os.Chmod(r.dataDir, 0o700); err != nil {
+		return fmt.Errorf("protect data dir: %w", err)
 	}
 
 	path := filepath.Join(r.dataDir, "trades.json")
@@ -409,9 +412,14 @@ func (r *Recorder) saveTrades() error {
 	}
 
 	// Persist file contents before publishing the new snapshot.
-	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("open temp file: %w", err)
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("protect temp file: %w", err)
 	}
 	_, writeErr := file.Write(data)
 	if writeErr == nil {
@@ -445,11 +453,25 @@ func (r *Recorder) LoadTrades() error {
 		r.persistenceErr = nil
 		return nil // No persistence configured
 	}
+	if err := os.MkdirAll(r.dataDir, 0o700); err != nil {
+		loadErr := fmt.Errorf("create data dir: %w", err)
+		r.persistenceErr = loadErr
+		return loadErr
+	}
+	if err := os.Chmod(r.dataDir, 0o700); err != nil {
+		loadErr := fmt.Errorf("protect data dir: %w", err)
+		r.persistenceErr = loadErr
+		return loadErr
+	}
 
 	path := filepath.Join(r.dataDir, "trades.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if saveErr := r.saveTrades(); saveErr != nil {
+				r.persistenceErr = saveErr
+				return saveErr
+			}
 			r.persistenceErr = nil
 			return nil
 		}
@@ -461,6 +483,11 @@ func (r *Recorder) LoadTrades() error {
 	var trades []Trade
 	if err := json.Unmarshal(data, &trades); err != nil {
 		loadErr := fmt.Errorf("unmarshal trades: %w", err)
+		r.persistenceErr = loadErr
+		return loadErr
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		loadErr := fmt.Errorf("protect trades file: %w", err)
 		r.persistenceErr = loadErr
 		return loadErr
 	}

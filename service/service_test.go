@@ -253,6 +253,7 @@ type MockNotifier struct {
 	TradeStartCalls   []TradeStartCall
 	TradeEndCalls     []TradeEndCall
 	ErrorCalls        []string
+	ErrorErr          error
 	DailySummaryCalls []telegram.DailySummaryData
 	DailySummaryErr   error
 	Commands          []string
@@ -305,7 +306,7 @@ func (m *MockNotifier) SendError(ctx context.Context, msg string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ErrorCalls = append(m.ErrorCalls, msg)
-	return nil
+	return m.ErrorErr
 }
 
 func (m *MockNotifier) SendStatus(ctx context.Context, data telegram.StatusData) error {
@@ -2913,5 +2914,76 @@ func TestDailySummaryRetriesCompletedPriorDayAfterMidnight(t *testing.T) {
 	}
 	if !svc.lastDailySummary.Equal(target) {
 		t.Fatalf("lastDailySummary = %s, want recovered day %s", svc.lastDailySummary, target)
+	}
+}
+
+func TestMeasuredTradeEnergyUsesPrecedingPowerSample(t *testing.T) {
+	start := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	svc := newTestService(testConfigSmallBattery(), NewMockBattery(50), nil, start)
+	svc.state = StateCharging
+	svc.nowFunc = func() time.Time { return start }
+	svc.beginMeasuredTradeLocked(500)
+
+	svc.accumulateMeasuredTradeEnergyAtLocked(1500, start.Add(time.Minute), true)
+	if svc.currentTradeEnergyWs != 500*60 {
+		t.Fatalf("first interval energy = %.0f Ws, want %d", svc.currentTradeEnergyWs, 500*60)
+	}
+	svc.accumulateMeasuredTradeEnergyAtLocked(0, start.Add(2*time.Minute), true)
+	if svc.currentTradeEnergyWs != (500+1500)*60 {
+		t.Fatalf("total energy = %.0f Ws, want %d", svc.currentTradeEnergyWs, (500+1500)*60)
+	}
+}
+
+func TestErrorNotificationFailureDoesNotConsumeRateLimit(t *testing.T) {
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	notifier := &MockNotifier{ErrorErr: errors.New("telegram unavailable")}
+	svc := newTestService(testConfigSmallBattery(), NewMockBattery(50), nil, now)
+	svc.nowFunc = func() time.Time { return now }
+	svc.telegram = notifier
+
+	svc.notifyError(context.Background(), "first")
+	if !svc.lastErrorNotify.IsZero() {
+		t.Fatal("failed notification consumed the rate limit")
+	}
+	notifier.ErrorErr = nil
+	svc.notifyError(context.Background(), "retry")
+	svc.notifyError(context.Background(), "throttled")
+	if len(notifier.ErrorCalls) != 2 {
+		t.Fatalf("notification attempts = %d, want failed attempt plus successful retry", len(notifier.ErrorCalls))
+	}
+}
+
+func TestLinkDownNotificationFailureDoesNotConsumeRateLimit(t *testing.T) {
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	notifier := &MockNotifier{ErrorErr: errors.New("telegram unavailable")}
+	svc := newTestService(testConfigSmallBattery(), NewMockBattery(50), nil, now)
+	svc.nowFunc = func() time.Time { return now }
+	svc.telegram = notifier
+
+	svc.notifyLinkDown(context.Background(), "first")
+	if !svc.lastLinkDownNotify.IsZero() {
+		t.Fatal("failed link-down notification consumed the rate limit")
+	}
+	notifier.ErrorErr = nil
+	svc.notifyLinkDown(context.Background(), "retry")
+	svc.notifyLinkDown(context.Background(), "throttled")
+	if len(notifier.ErrorCalls) != 2 {
+		t.Fatalf("notification attempts = %d, want failed attempt plus successful retry", len(notifier.ErrorCalls))
+	}
+}
+
+func TestBackwardClockCorrectionDoesNotSuppressNotifications(t *testing.T) {
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	notifier := &MockNotifier{}
+	svc := newTestService(testConfigSmallBattery(), NewMockBattery(50), nil, now)
+	svc.nowFunc = func() time.Time { return now }
+	svc.telegram = notifier
+	svc.lastErrorNotify = now.Add(time.Hour)
+	svc.lastLinkDownNotify = now.Add(time.Hour)
+
+	svc.notifyError(context.Background(), "battery error")
+	svc.notifyLinkDown(context.Background(), "link down")
+	if len(notifier.ErrorCalls) != 2 {
+		t.Fatalf("notification attempts = %d, want both alerts after backward clock correction", len(notifier.ErrorCalls))
 	}
 }

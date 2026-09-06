@@ -16,6 +16,7 @@
 coverage.*
 *.coverprofile
 profile.cov
+*.log
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
@@ -26,6 +27,9 @@ go.work.sum
 
 # env file
 .env
+
+# Maintainer-local agent and deployment configuration
+AGENTS.local.md
 
 # Runtime data
 data/

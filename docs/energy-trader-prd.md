@@ -17,7 +17,7 @@ A Go service that performs energy price arbitrage using a Marstek Venus E batter
 
 ### ESPHome Bridge (Default)
 - **Protocol**: HTTP REST API
-- **Default URL**: `http://192.168.1.50`
+- **URL**: Required through `ESPHOME_URL`; no device address is assumed
 - **Endpoints**:
   - `GET /sensor/{name}` - Read sensor values (SOC, temperature, power)
   - `POST /number/{name}/set?value=X` - Set charge/discharge power
@@ -34,15 +34,15 @@ A Go service that performs energy price arbitrage using a Marstek Venus E batter
 - **Connectivity check**: `GET /api` - returns device info
 - **Timeout**: 5 seconds
 - **Purpose**: Detects solar surplus (grid export) for battery charging; captured solar is valued at the configured all-in export opportunity rate.
-- **Auto-discovery**: When `HOMEWIZARD_P1_URL` is not set, the service attempts two discovery methods in order:
+- **Auto-discovery**: Only when `HOMEWIZARD_P1_URL=auto`, the service attempts two discovery methods in order:
   1. **mDNS** (3s timeout): Browses `_hwenergy._tcp` on the local network. Filters for `product_type=HWE-P1` and `api_enabled=1` in TXT records.
   2. **HTTP scan** (30s timeout): Falls back to probing `GET /api` on `192.168.0.x` and `192.168.1.x` (64 concurrent workers, 500ms connect timeout). Checks `product_type=HWE-P1` in JSON response. Useful when mDNS is unavailable (e.g., Docker bridge networks).
-  If both methods fail, P1 features are gracefully disabled.
+  If both methods fail, P1 features are gracefully disabled. An empty value disables P1 support without scanning the LAN.
 
 ### Legacy UDP API (Preserved)
-- **Protocol**: UDP JSON-RPC to `192.168.1.255:30000`
-- **Documentation**: [docs/marstek-api.md](marstek-api.md)
-- **Status**: Code preserved in `clients/marstek/` but not used by default
+- **Protocol**: UDP JSON-RPC to a configured device address
+- **Documentation**: [legacy-udp.md](legacy-udp.md)
+- **Status**: Library code is preserved in `clients/marstek/` but is not wired into the executable
 
 ### NordPool API
 - **Endpoint**: `https://dataportal-api.nordpoolgroup.com/api/DayAheadPriceIndices`
@@ -231,7 +231,7 @@ Load from `.env` file with fallback to environment variables.
 |----------|---------|-------------|
 | `SERVICE_NAME` | `energy-trader` | Service identifier |
 | `LOG_LEVEL` | `info` | debug/info/warn/error |
-| `HTTP_LISTEN_ADDR` | `:8080` | HTTP server address |
+| `HTTP_LISTEN_ADDR` | `127.0.0.1:8080` | HTTP server address; API has no authentication or TLS |
 | `DATA_DIR` | `./data` | Data storage directory |
 | `TZ` | `Europe/Amsterdam` | Timezone |
 | `NORDPOOL_AREA` | `NL` | Price area code |
@@ -240,13 +240,13 @@ Load from `.env` file with fallback to environment variables.
 | `BATTERY_EFFICIENCY` | `0.90` | Round-trip efficiency |
 | `BATTERY_CAPACITY_KWH` | `5.12` | Battery capacity (kWh) |
 | `BATTERY_MIN_SOC` | `0.11` | Minimum SOC (0.0-1.0) |
-| `MAX_CYCLES_PER_DAY` | `2` | Max charge/discharge cycles per day |
-| `ESPHOME_URL` | `http://192.168.1.50` | ESPHome device URL |
-| `BATTERY_UDP_ADDR` | - | Legacy UDP address (optional) |
+| `MAX_CYCLES_PER_DAY` | `2` | Max cycles selected over the loaded planning horizon |
+| `ESPHOME_URL` | required | ESPHome device URL |
+| `BATTERY_UDP_ADDR` | - | Unwired legacy library configuration |
 | `CHARGE_POWER_W` | `2500` | Charge power (watts) |
 | `DISCHARGE_POWER_W` | `2500` | Discharge power (watts) |
-| `PASSIVE_MODE_TIMEOUT_S` | `300` | Passive mode timeout |
-| `HOMEWIZARD_P1_URL` | - | HomeWizard P1 meter URL (optional, empty = auto-discover via mDNS + HTTP scan) |
+| `PASSIVE_MODE_TIMEOUT_S` | `300` | Service refresh basis; not a battery-side command expiry |
+| `HOMEWIZARD_P1_URL` | - | Empty disables P1; URL selects a meter; `auto` opts into discovery and LAN scanning |
 | `SOLAR_MIN_SURPLUS_W` | `100` | Min surplus watts to start solar charging |
 | `TELEGRAM_BOT_TOKEN` | - | Telegram bot token (enables notifications and command registration) |
 | `TELEGRAM_CHAT_ID` | - | Private Telegram chat allowed to issue commands |
@@ -277,13 +277,13 @@ marstek-energy-trading/
 │   ├── esphome/client.go        # ESPHome HTTP client (default)
 │   ├── homewizard/              # HomeWizard P1 meter (solar surplus + mDNS discovery)
 │   │   ├── client.go            # HTTP client for P1 data/device info
-│   │   └── discover.go          # Auto-discovery (mDNS + HTTP scan fallback)
+│   │   └── discover.go          # Opt-in discovery (mDNS + HTTP scan fallback)
 │   ├── marstek/client.go        # Battery UDP (legacy, preserved)
 │   ├── nordpool/client.go       # NordPool API
 │   └── telegram/client.go       # Telegram bot
 ├── internal/config/config.go    # Configuration
 ├── docs/
-│   ├── marstek-api.md           # Legacy UDP API docs
+│   ├── legacy-udp.md            # Legacy UDP client notes
 │   └── energy-trader-prd.md     # This file
 ├── Dockerfile
 ├── Makefile
@@ -298,6 +298,15 @@ make run            # Run locally
 make test           # Run tests
 make docker-build   # Build Docker image
 ```
+
+## Safety and Accounting Boundaries
+
+- The ESPHome backend has no battery-side command expiry. A process, host, network, or bridge failure can leave the last forced command active until the battery's BMS intervenes or control is restored.
+- Startup and graceful shutdown attempt a confirmed stop, but abrupt termination cannot guarantee one. Container shutdown must allow at least 95 seconds.
+- The HTTP API, ESPHome API, and HomeWizard local API have no authentication in this design and must remain on trusted networks. Status and metrics reveal household and financial data.
+- Active plans and partial active-session energy are not persisted. Restart reconstruction does not prove that an earlier paired charge completed.
+- Import and export use one symmetric configured tariff. P&L is operational cash-flow estimation, not inventory-matched profit or revenue-grade metering.
+- The repository does not provide the ESPHome firmware configuration or an independent hardware watchdog.
 
 ## Out of Scope (v1)
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -112,13 +113,13 @@ func (c *Client) RegisterCommands(ctx context.Context) error {
 	url := fmt.Sprintf(setMyCommandsAPI, c.botToken)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
-		return fmt.Errorf("create Telegram command request: %w", err)
+		return c.redactedError("create Telegram command request", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("register Telegram commands: %w", err)
+		return c.redactedError("register Telegram commands", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -156,13 +157,13 @@ func (c *Client) SendMessage(ctx context.Context, text string) error {
 	url := fmt.Sprintf(sendMessageAPI, c.botToken)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return c.redactedError("create Telegram message request", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("send message: %w", err)
+		return c.redactedError("send Telegram message", err)
 	}
 	defer resp.Body.Close()
 
@@ -199,7 +200,7 @@ func (c *Client) SendTradeEnd(ctx context.Context, action string, energyKWh floa
 
 // SendError sends an error notification.
 func (c *Client) SendError(ctx context.Context, errMsg string) error {
-	text := fmt.Sprintf("⚠️ <b>Error</b>\n%s", errMsg)
+	text := fmt.Sprintf("⚠️ <b>Error</b>\n%s", html.EscapeString(errMsg))
 	return c.SendMessage(ctx, text)
 }
 
@@ -486,12 +487,12 @@ func (c *Client) PollCommands(ctx context.Context) ([]string, error) {
 	url := fmt.Sprintf(getUpdatesAPI+"?offset=%d&timeout=1", c.botToken, c.lastUpdateID+1)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, c.redactedError("create Telegram updates request", err)
 	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, c.redactedError("poll Telegram updates", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -503,7 +504,7 @@ func (c *Client) PollCommands(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	if !result.OK {
-		return nil, fmt.Errorf("Telegram getUpdates returned ok=false")
+		return nil, fmt.Errorf("telegram getUpdates returned ok=false")
 	}
 
 	maxUpdateID := c.lastUpdateID
@@ -536,6 +537,14 @@ func (c *Client) PollCommands(ctx context.Context) ([]string, error) {
 	}
 
 	return commands, nil
+}
+
+func (c *Client) redactedError(action string, err error) error {
+	message := err.Error()
+	if c.botToken != "" {
+		message = strings.ReplaceAll(message, c.botToken, "[REDACTED]")
+	}
+	return fmt.Errorf("%s: %s", action, message)
 }
 
 func (c *Client) persistLastUpdateID(updateID int64) error {

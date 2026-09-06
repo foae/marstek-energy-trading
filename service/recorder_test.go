@@ -310,11 +310,57 @@ func TestGetTodaySummary_NoTrades(t *testing.T) {
 }
 
 func TestLoadTrades_FileNotFound(t *testing.T) {
-	r := NewRecorder(t.TempDir(), 0.90, time.UTC)
+	dir := t.TempDir()
+	r := NewRecorder(dir, 0.90, time.UTC)
 
-	// Should return nil (graceful) when file doesn't exist
 	if err := r.LoadTrades(); err != nil {
 		t.Errorf("LoadTrades() error = %v, want nil for missing file", err)
+	}
+	info, err := os.Stat(filepath.Join(dir, "trades.json"))
+	if err != nil {
+		t.Fatalf("stat initialized trades file: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("trades file mode = %o, want 600", got)
+	}
+}
+
+func TestLoadTrades_CreatesPrivateDataDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	r := NewRecorder(dir, 0.90, time.UTC)
+
+	if err := r.LoadTrades(); err != nil {
+		t.Fatalf("LoadTrades() error = %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat data directory: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Errorf("data directory mode = %o, want 700", got)
+	}
+}
+
+func TestRecordTradeProtectsStaleTemporaryFile(t *testing.T) {
+	dir := t.TempDir()
+	tmpPath := filepath.Join(dir, "trades.json.tmp")
+	if err := os.WriteFile(tmpPath, []byte("stale"), 0o644); err != nil {
+		t.Fatalf("create stale temp file: %v", err)
+	}
+	if err := os.Chmod(tmpPath, 0o644); err != nil {
+		t.Fatalf("set stale temp mode: %v", err)
+	}
+
+	r := NewRecorder(dir, 0.90, time.UTC)
+	if err := r.RecordTrade(Trade{Timestamp: time.Now(), Action: ActionCharge}); err != nil {
+		t.Fatalf("RecordTrade() error = %v", err)
+	}
+	info, err := os.Stat(filepath.Join(dir, "trades.json"))
+	if err != nil {
+		t.Fatalf("stat trades file: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("trades file mode = %o, want 600", got)
 	}
 }
 

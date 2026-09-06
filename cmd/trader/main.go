@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -23,12 +26,23 @@ import (
 )
 
 func main() {
-	// Load .env file (optional, falls back to env vars)
-	_ = godotenv.Load()
+	var envFileInvalid bool
+	if err := godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		// Do not include the parser error: it can quote a credential-bearing line.
+		slog.Error("could not load .env; automatic operation will not start")
+		envFileInvalid = true
+	}
 
 	// Parse configuration
 	cfg, err := config.Load()
 	if err != nil {
+		if envFileInvalid {
+			emergencyURL := os.Getenv("ESPHOME_URL")
+			if emergencyURL == "" {
+				emergencyURL = emergencyESPHomeURL(".env")
+			}
+			reconcileBatteryAfterEnvFailure(emergencyURL)
+		}
 		slog.Error("failed to load config", "error", err)
 		os.Exit(1)
 	}
@@ -73,16 +87,21 @@ func main() {
 	esphomeClient := esphome.New(cfg.ESPHomeURL, minSOC)
 	defer esphomeClient.Close()
 	esphomeClient.SetRestartButton(cfg.ESPHomeRestartButton)
-	slog.Info("using ESPHome battery backend", "url", cfg.ESPHomeURL, "min_soc", minSOC, "bridge_restart", esphomeClient.RestartAvailable())
+	slog.Info("using ESPHome battery backend", "host", endpointHost(cfg.ESPHomeURL), "min_soc", minSOC, "bridge_restart", esphomeClient.RestartAvailable())
+	if envFileInvalid {
+		reconcileBatteryAfterEnvFailure(cfg.ESPHomeURL)
+		os.Exit(1)
+	}
 	p1URL := cfg.HomeWizardP1URL
-	if p1URL == "" {
+	if p1URL == "auto" {
 		if discovered, err := homewizard.Discover(context.Background()); err != nil {
 			slog.Info("HomeWizard P1 not discovered, meter disabled", "error", err)
+			p1URL = ""
 		} else {
 			p1URL = discovered.URL
 			slog.Info(
 				"HomeWizard P1 auto-discovered",
-				"url", p1URL,
+				"host", endpointHost(p1URL),
 				"serial", discovered.Serial,
 				"hostname", discovered.Hostname,
 				"method", discovered.Method,
@@ -92,9 +111,9 @@ func main() {
 	p1Client := homewizard.New(p1URL)
 	if p1Client.Enabled() {
 		if info, err := p1Client.GetDeviceInfo(); err != nil {
-			slog.Warn("HomeWizard P1 meter unreachable at startup, will retry during operation", "url", p1URL, "error", err)
+			slog.Warn("HomeWizard P1 meter unreachable at startup, will retry during operation", "host", endpointHost(p1URL), "error", err)
 		} else {
-			slog.Info("HomeWizard P1 meter enabled", "url", p1URL, "product", info.ProductName, "serial", info.Serial, "firmware", info.Firmware)
+			slog.Info("HomeWizard P1 meter enabled", "host", endpointHost(p1URL), "product", info.ProductName, "serial", info.Serial, "firmware", info.Firmware)
 		}
 	} else {
 		slog.Info("HomeWizard P1 meter disabled (no URL configured)")
@@ -106,8 +125,9 @@ func main() {
 		filepath.Join(cfg.DataDir, "telegram-update-offset"),
 	)
 	if err != nil {
-		slog.Error("failed to initialize Telegram client", "error", err)
-		os.Exit(1)
+		// Telegram is optional and must not prevent startup battery reconciliation.
+		slog.Warn("failed to initialize Telegram client; integration disabled", "error", err)
+		telegramClient, _ = telegram.New("", "", "")
 	}
 
 	if telegramClient.Enabled() {
@@ -179,4 +199,63 @@ func main() {
 	wg.Wait()
 
 	slog.Info("shutdown complete")
+}
+
+func endpointHost(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "[invalid]"
+	}
+	return parsed.Host
+}
+
+func reconcileBatteryAfterEnvFailure(rawURL string) {
+	rawURL = safeEmergencyESPHomeURL(rawURL)
+	if rawURL == "" {
+		slog.Error("cannot identify a safe ESPHome endpoint for emergency stop after .env load failure")
+		return
+	}
+	client := esphome.New(rawURL, 11)
+	stopCtx, cancel := context.WithTimeout(context.Background(), 50*time.Second)
+	err := client.IdleContext(stopCtx)
+	cancel()
+	if err != nil {
+		slog.Error("failed to confirm battery stop after .env load failure", "error", err)
+		return
+	}
+	slog.Info("battery stop confirmed after .env load failure")
+}
+
+// emergencyESPHomeURL extracts only the battery endpoint from a malformed
+// dotenv file. It is used to stop the battery, never to start normal operation.
+func emergencyESPHomeURL(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var result string
+	for _, line := range strings.Split(string(data), "\n") {
+		assignment := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "export "))
+		key, _, found := strings.Cut(assignment, "=")
+		if !found || strings.TrimSpace(key) != "ESPHOME_URL" {
+			continue
+		}
+		// Every later assignment supersedes the earlier one, including an empty or
+		// invalid value. Parse the line with the same syntax as the normal loader.
+		result = ""
+		values, err := godotenv.Unmarshal(line)
+		if err == nil {
+			result = safeEmergencyESPHomeURL(values["ESPHOME_URL"])
+		}
+	}
+	return result
+}
+
+func safeEmergencyESPHomeURL(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return ""
+	}
+	return rawURL
 }

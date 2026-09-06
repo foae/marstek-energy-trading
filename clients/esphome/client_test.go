@@ -217,11 +217,10 @@ func TestGetBatteryStatusPreservesZeroMinSOC(t *testing.T) {
 func TestCharge(t *testing.T) {
 	server, calledPathsPtr := newControlTestServer(t, "")
 	defer server.Close()
-	calledPaths := *calledPathsPtr
 
 	client := New(server.URL, 11)
 	err := client.Charge(2500, 300)
-	calledPaths = *calledPathsPtr
+	calledPaths := *calledPathsPtr
 	if err != nil {
 		t.Fatalf("Charge() error = %v", err)
 	}
@@ -429,11 +428,10 @@ func TestChargeContext_CancelsControlConfirmation(t *testing.T) {
 func TestDischarge(t *testing.T) {
 	server, calledPathsPtr := newControlTestServer(t, "")
 	defer server.Close()
-	calledPaths := *calledPathsPtr
 
 	client := New(server.URL, 11)
 	err := client.Discharge(800, 300)
-	calledPaths = *calledPathsPtr
+	calledPaths := *calledPathsPtr
 	if err != nil {
 		t.Fatalf("Discharge() error = %v", err)
 	}
@@ -461,7 +459,6 @@ func TestDischarge(t *testing.T) {
 func TestIdle_StopFailureKeepsRS485Enabled(t *testing.T) {
 	server, calledPathsPtr := newControlTestServer(t, "stop")
 	defer server.Close()
-	calledPaths := *calledPathsPtr
 
 	client := New(server.URL, 11)
 	if err := client.Charge(1000, 300); err != nil {
@@ -469,7 +466,7 @@ func TestIdle_StopFailureKeepsRS485Enabled(t *testing.T) {
 	}
 	*calledPathsPtr = nil
 	err := client.Idle()
-	calledPaths = *calledPathsPtr
+	calledPaths := *calledPathsPtr
 	if err == nil {
 		t.Fatal("Idle() error = nil, want error when stop fails")
 	}
@@ -523,12 +520,11 @@ func TestIdleContextSucceedsWhenStopIsConfirmedAfterEnableFailure(t *testing.T) 
 func TestSetPassiveMode_Charge(t *testing.T) {
 	server, calledPathsPtr := newControlTestServer(t, "")
 	defer server.Close()
-	calledPaths := *calledPathsPtr
 
 	client := New(server.URL, 11)
 	// Negative power = charge
 	err := client.SetPassiveMode(-2500, 300)
-	calledPaths = *calledPathsPtr
+	calledPaths := *calledPathsPtr
 	if err != nil {
 		t.Fatalf("SetPassiveMode() error = %v", err)
 	}
@@ -544,12 +540,11 @@ func TestSetPassiveMode_Charge(t *testing.T) {
 func TestSetPassiveMode_Discharge(t *testing.T) {
 	server, calledPathsPtr := newControlTestServer(t, "")
 	defer server.Close()
-	calledPaths := *calledPathsPtr
 
 	client := New(server.URL, 11)
 	// Positive power = discharge
 	err := client.SetPassiveMode(800, 300)
-	calledPaths = *calledPathsPtr
+	calledPaths := *calledPathsPtr
 	if err != nil {
 		t.Fatalf("SetPassiveMode() error = %v", err)
 	}

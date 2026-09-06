@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -141,5 +142,48 @@ func TestRegisterCommandsReturnsTelegramAPIFailure(t *testing.T) {
 	err = client.RegisterCommands(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "commands rejected") {
 		t.Fatalf("RegisterCommands() error = %v, want Telegram failure", err)
+	}
+}
+
+func TestTransportErrorsRedactBotToken(t *testing.T) {
+	const token = "123456:secret-token"
+	client, err := New(token, "123", filepath.Join(t.TempDir(), "telegram-update-offset"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("dial failed for %s", req.URL)
+	})}
+
+	err = client.SendMessage(context.Background(), "test")
+	if err == nil {
+		t.Fatal("SendMessage() error = nil, want transport error")
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("SendMessage() leaked token in error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "[REDACTED]") {
+		t.Fatalf("SendMessage() error = %v, want redaction marker", err)
+	}
+}
+
+func TestSendErrorEscapesHTML(t *testing.T) {
+	client, err := New("token", "123", filepath.Join(t.TempDir(), "telegram-update-offset"))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		var body sendMessageRequest
+		if decodeErr := json.NewDecoder(req.Body).Decode(&body); decodeErr != nil {
+			return nil, decodeErr
+		}
+		if strings.Contains(body.Text, "<device>") || !strings.Contains(body.Text, "&lt;device&gt;") {
+			return nil, errors.New("error message was not HTML escaped")
+		}
+		return telegramUpdatesResponse(`{"ok":true,"result":true}`), nil
+	})}
+
+	if err := client.SendError(context.Background(), "failed <device>"); err != nil {
+		t.Fatalf("SendError() error = %v", err)
 	}
 }

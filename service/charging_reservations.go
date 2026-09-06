@@ -104,7 +104,7 @@ func (s *Service) solarEconomicalLocked(now time.Time, soc int) bool {
 	if reservation.Deadline.IsZero() || !reservation.Feasible {
 		return true
 	}
-	price, known := GetCurrentPrice(s.todayPrices, now)
+	price, known := s.currentPriceLocked(now)
 	if !known {
 		return false
 	}

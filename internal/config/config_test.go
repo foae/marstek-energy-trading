@@ -2,6 +2,7 @@ package config
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -198,6 +199,38 @@ func TestValidate_MinPriceSpread(t *testing.T) {
 	}
 }
 
+func TestValidate_RequiresESPHomeURL(t *testing.T) {
+	cfg := validConfig()
+	cfg.ESPHomeURL = ""
+	if err := cfg.validate(); err == nil {
+		t.Fatal("validate() error = nil, want required ESPHOME_URL error")
+	}
+}
+
+func TestValidate_AllowsExplicitHomeWizardDiscovery(t *testing.T) {
+	cfg := validConfig()
+	cfg.HomeWizardP1URL = "auto"
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate() error = %v, want HOMEWIZARD_P1_URL=auto to be valid", err)
+	}
+}
+
+func TestValidate_RejectsCredentialBearingEndpointURLs(t *testing.T) {
+	for _, endpoint := range []string{
+		"http://user:password@battery.local",
+		"http://battery.local?token=secret",
+		"http://battery.local#secret",
+	} {
+		cfg := validConfig()
+		cfg.ESPHomeURL = endpoint
+		if err := cfg.validate(); err == nil {
+			t.Errorf("validate() error = nil for endpoint %q", endpoint)
+		} else if strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "password") {
+			t.Errorf("validate() leaked endpoint credentials: %v", err)
+		}
+	}
+}
+
 func TestValidate_AllInPricing(t *testing.T) {
 	valid := validConfig()
 	valid.EnergyTaxEURPerKWh = decimal.RequireFromString("0.09161")
@@ -273,6 +306,7 @@ func TestValidateDischargePower(t *testing.T) {
 }
 
 func TestLoad_CustomValues(t *testing.T) {
+	t.Setenv("ESPHOME_URL", "http://192.168.1.50")
 	t.Setenv("HOMEWIZARD_P1_URL", "http://192.168.1.100")
 	t.Setenv("SOLAR_MIN_SURPLUS_W", "200")
 	t.Setenv("ESPHOME_RESTART_BUTTON", "restart")
@@ -294,6 +328,7 @@ func TestLoad_CustomValues(t *testing.T) {
 }
 
 func TestLoad_AllInPricing(t *testing.T) {
+	t.Setenv("ESPHOME_URL", "http://192.168.1.50")
 	t.Setenv("ENERGY_TAX_EUR_PER_KWH", "0.09161")
 	t.Setenv("VAT_RATE", "0.21")
 	t.Setenv("SUPPLIER_FEE_EUR_PER_KWH", "0.02")
@@ -318,6 +353,7 @@ func setValidLoadEnvironment(t *testing.T) {
 	t.Helper()
 
 	for key, value := range map[string]string{
+		"ESPHOME_URL":              "http://192.168.1.50",
 		"TZ":                       "Europe/Amsterdam",
 		"NORDPOOL_CURRENCY":        "EUR",
 		"MIN_PRICE_SPREAD":         "0.05",

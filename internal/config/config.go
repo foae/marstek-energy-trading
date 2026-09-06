@@ -20,7 +20,7 @@ type Config struct {
 	// Service
 	ServiceName    string `env:"SERVICE_NAME" envDefault:"energy-trader"`
 	LogLevel       string `env:"LOG_LEVEL" envDefault:"info"`
-	HTTPListenAddr string `env:"HTTP_LISTEN_ADDR" envDefault:":8080"`
+	HTTPListenAddr string `env:"HTTP_LISTEN_ADDR" envDefault:"127.0.0.1:8080"`
 	DataDir        string `env:"DATA_DIR" envDefault:"./data"`
 	TZ             string `env:"TZ" envDefault:"Europe/Amsterdam"`
 
@@ -39,15 +39,15 @@ type Config struct {
 	MaxCyclesPerDay    int     `env:"MAX_CYCLES_PER_DAY" envDefault:"2"`
 
 	// Battery
-	BatteryUDPAddr       string `env:"BATTERY_UDP_ADDR"`                             // No default (optional, for UDP client)
-	ESPHomeURL           string `env:"ESPHOME_URL" envDefault:"http://192.168.1.50"` // ESPHome REST API
+	BatteryUDPAddr       string `env:"BATTERY_UDP_ADDR"` // No default (optional, for UDP client)
+	ESPHomeURL           string `env:"ESPHOME_URL"`      // Required ESPHome REST API URL
 	ChargePowerW         int    `env:"CHARGE_POWER_W" envDefault:"2500"`
 	DischargePowerW      int    `env:"DISCHARGE_POWER_W" envDefault:"2500"`
 	PassiveModeTimeoutS  int    `env:"PASSIVE_MODE_TIMEOUT_S" envDefault:"300"`
 	ESPHomeRestartButton string `env:"ESPHOME_RESTART_BUTTON"` // ESPHome restart button name as exposed in its web URLs, e.g. "Restart"; empty = manual power-cycle only
 
 	// HomeWizard P1 meter (optional)
-	HomeWizardP1URL  string `env:"HOMEWIZARD_P1_URL"`                    // Empty = disabled
+	HomeWizardP1URL  string `env:"HOMEWIZARD_P1_URL"`                    // Empty = disabled; "auto" = explicit discovery
 	SolarMinSurplusW int    `env:"SOLAR_MIN_SURPLUS_W" envDefault:"100"` // Min surplus watts to start solar charging
 
 	// Telegram (optional)
@@ -108,15 +108,24 @@ func (c *Config) validate() error {
 	if c.DischargePowerW < MinDischargePowerW || c.DischargePowerW > MaxDischargePowerW {
 		return fmt.Errorf("DISCHARGE_POWER_W must be between %d and %d, got %d", MinDischargePowerW, MaxDischargePowerW, c.DischargePowerW)
 	}
+	if c.ESPHomeURL == "" {
+		return fmt.Errorf("ESPHOME_URL is required")
+	}
 	for _, setting := range [...]struct{ name, endpoint string }{
 		{"ESPHOME_URL", c.ESPHomeURL}, {"HOMEWIZARD_P1_URL", c.HomeWizardP1URL},
 	} {
 		if setting.name == "HOMEWIZARD_P1_URL" && setting.endpoint == "" {
 			continue
 		}
+		if setting.name == "HOMEWIZARD_P1_URL" && setting.endpoint == "auto" {
+			continue
+		}
 		parsed, err := url.Parse(setting.endpoint)
 		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-			return fmt.Errorf("%s must be an absolute HTTP(S) URL, got %q", setting.name, setting.endpoint)
+			return fmt.Errorf("%s must be an absolute HTTP(S) URL", setting.name)
+		}
+		if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return fmt.Errorf("%s must not contain credentials, a query, or a fragment", setting.name)
 		}
 	}
 	if _, err := time.LoadLocation(c.TZ); err != nil {

@@ -331,7 +331,7 @@ func (c *Client) getSensorFloatContext(ctx context.Context, path string) (float6
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("GET %s: %w", path, err)
+		return 0, c.redactedTransportError("GET "+path, err)
 	}
 	defer resp.Body.Close()
 
@@ -541,7 +541,7 @@ func (c *Client) pressButton(ctx context.Context, name string) (int, error) {
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("POST restart: %w", err)
+		return 0, c.redactedTransportError("POST restart", err)
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
@@ -666,7 +666,7 @@ func (c *Client) setNumber(ctx context.Context, path string, value float64) erro
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("POST %s: %w", path, err)
+		return c.redactedTransportError("POST "+path, err)
 	}
 	defer resp.Body.Close()
 
@@ -687,7 +687,7 @@ func (c *Client) setSelect(ctx context.Context, path string, option string) erro
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("POST %s: %w", path, err)
+		return c.redactedTransportError("POST "+path, err)
 	}
 	defer resp.Body.Close()
 
@@ -773,7 +773,7 @@ func (c *Client) getControlValue(ctx context.Context, path string) (string, erro
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("GET %s: %w", path, err)
+		return "", c.redactedTransportError("GET "+path, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -793,4 +793,30 @@ func (c *Client) getControlValue(ctx context.Context, path string) (string, erro
 		return strings.TrimSpace(string(entity.Value)), nil
 	}
 	return entity.State, nil
+}
+
+func (c *Client) redactedTransportError(action string, err error) error {
+	return &endpointTransportError{action: action, message: redactEndpoint(err.Error(), c.baseURL), err: err}
+}
+
+type endpointTransportError struct {
+	action  string
+	message string
+	err     error
+}
+
+func (e *endpointTransportError) Error() string { return e.action + ": " + e.message }
+func (e *endpointTransportError) Unwrap() error { return e.err }
+
+func redactEndpoint(message, baseURL string) string {
+	values := []string{baseURL}
+	if parsed, err := url.Parse(baseURL); err == nil {
+		values = append(values, parsed.Host, parsed.Hostname())
+	}
+	for _, value := range values {
+		if value != "" {
+			message = strings.ReplaceAll(message, value, "[REDACTED_ENDPOINT]")
+		}
+	}
+	return message
 }

@@ -225,7 +225,7 @@ func probeP1(ctx context.Context, client *http.Client, ip string) *DiscoveryResu
 		return nil
 	}
 
-	slog.Info("found HomeWizard P1 via HTTP scan", "ip", ip, "serial", info.Serial, "product", info.ProductName)
+	slog.Info("found HomeWizard P1 via HTTP scan", "product", info.ProductName)
 	return &DiscoveryResult{
 		URL:      "http://" + ip,
 		Serial:   info.Serial,

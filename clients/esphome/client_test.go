@@ -15,6 +15,31 @@ import (
 	"github.com/foae/marstek-energy-trading/clients/marstek"
 )
 
+type errorRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f errorRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestTransportErrorsRedactEndpoint(t *testing.T) {
+	const endpoint = "http://192.0.2.10"
+	client := New(endpoint, 11)
+	client.httpClient.Transport = errorRoundTripper(func(req *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("dial tcp 192.0.2.10:80 for %s: %w", req.URL, context.DeadlineExceeded)
+	})
+
+	_, err := client.GetBatteryPower(context.Background())
+	if err == nil {
+		t.Fatal("GetBatteryPower() error = nil, want transport error")
+	}
+	if strings.Contains(err.Error(), endpoint) || strings.Contains(err.Error(), "192.0.2.10") || !strings.Contains(err.Error(), "[REDACTED_ENDPOINT]") {
+		t.Fatalf("GetBatteryPower() error did not redact endpoint: %v", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("GetBatteryPower() error lost timeout classification: %v", err)
+	}
+}
+
 func newControlTestServer(t *testing.T, failOption string, initialRSMode ...string) (*httptest.Server, *[]string) {
 	t.Helper()
 	calledPaths := make([]string, 0)

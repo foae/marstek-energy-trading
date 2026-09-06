@@ -87,7 +87,7 @@ func main() {
 	esphomeClient := esphome.New(cfg.ESPHomeURL, minSOC)
 	defer esphomeClient.Close()
 	esphomeClient.SetRestartButton(cfg.ESPHomeRestartButton)
-	slog.Info("using ESPHome battery backend", "host", endpointHost(cfg.ESPHomeURL), "min_soc", minSOC, "bridge_restart", esphomeClient.RestartAvailable())
+	slog.Info("using ESPHome battery backend", "min_soc", minSOC, "bridge_restart", esphomeClient.RestartAvailable())
 	if envFileInvalid {
 		reconcileBatteryAfterEnvFailure(cfg.ESPHomeURL)
 		os.Exit(1)
@@ -101,9 +101,6 @@ func main() {
 			p1URL = discovered.URL
 			slog.Info(
 				"HomeWizard P1 auto-discovered",
-				"host", endpointHost(p1URL),
-				"serial", discovered.Serial,
-				"hostname", discovered.Hostname,
 				"method", discovered.Method,
 			)
 		}
@@ -111,9 +108,9 @@ func main() {
 	p1Client := homewizard.New(p1URL)
 	if p1Client.Enabled() {
 		if info, err := p1Client.GetDeviceInfo(); err != nil {
-			slog.Warn("HomeWizard P1 meter unreachable at startup, will retry during operation", "host", endpointHost(p1URL), "error", err)
+			slog.Warn("HomeWizard P1 meter unreachable at startup, will retry during operation", "error", err)
 		} else {
-			slog.Info("HomeWizard P1 meter enabled", "host", endpointHost(p1URL), "product", info.ProductName, "serial", info.Serial, "firmware", info.Firmware)
+			slog.Info("HomeWizard P1 meter enabled", "product", info.ProductName, "firmware", info.Firmware)
 		}
 	} else {
 		slog.Info("HomeWizard P1 meter disabled (no URL configured)")
@@ -199,14 +196,6 @@ func main() {
 	wg.Wait()
 
 	slog.Info("shutdown complete")
-}
-
-func endpointHost(rawURL string) string {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return "[invalid]"
-	}
-	return parsed.Host
 }
 
 func reconcileBatteryAfterEnvFailure(rawURL string) {

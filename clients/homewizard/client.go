@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -59,7 +60,7 @@ func (c *Client) GetDeviceInfo() (*DeviceInfo, error) {
 
 	resp, err := c.httpClient.Get(c.baseURL + "/api")
 	if err != nil {
-		return nil, fmt.Errorf("GET /api: %w", err)
+		return nil, c.redactedTransportError("GET /api", err)
 	}
 	defer resp.Body.Close()
 
@@ -85,7 +86,7 @@ func (c *Client) GetActivePowerW() (float64, error) {
 
 	resp, err := c.httpClient.Get(c.baseURL + "/api/v1/data")
 	if err != nil {
-		return 0, fmt.Errorf("GET /api/v1/data: %w", err)
+		return 0, c.redactedTransportError("GET /api/v1/data", err)
 	}
 	defer resp.Body.Close()
 
@@ -106,4 +107,30 @@ func (c *Client) GetActivePowerW() (float64, error) {
 		return 0, fmt.Errorf("decode data response: non-finite active_power_w")
 	}
 	return *data.ActivePowerW, nil
+}
+
+func (c *Client) redactedTransportError(action string, err error) error {
+	return &endpointTransportError{action: action, message: redactEndpoint(err.Error(), c.baseURL), err: err}
+}
+
+type endpointTransportError struct {
+	action  string
+	message string
+	err     error
+}
+
+func (e *endpointTransportError) Error() string { return e.action + ": " + e.message }
+func (e *endpointTransportError) Unwrap() error { return e.err }
+
+func redactEndpoint(message, baseURL string) string {
+	values := []string{baseURL}
+	if parsed, err := url.Parse(baseURL); err == nil {
+		values = append(values, parsed.Host, parsed.Hostname())
+	}
+	for _, value := range values {
+		if value != "" {
+			message = strings.ReplaceAll(message, value, "[REDACTED_ENDPOINT]")
+		}
+	}
+	return message
 }

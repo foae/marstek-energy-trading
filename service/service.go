@@ -418,7 +418,7 @@ func (s *Service) Start(ctx context.Context) error {
 	if err != nil {
 		slog.Warn("battery discovery failed, will retry", "error", err)
 	} else {
-		slog.Info("battery discovered", "device", device.Device, "ip", device.IP)
+		slog.Info("battery discovered", "device", device.Device)
 	}
 
 	// Fetch initial prices

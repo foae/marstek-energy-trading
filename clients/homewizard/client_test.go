@@ -1,10 +1,39 @@
 package homewizard
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+type errorRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f errorRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestTransportErrorsRedactEndpoint(t *testing.T) {
+	const endpoint = "http://192.0.2.20"
+	client := New(endpoint)
+	client.httpClient.Transport = errorRoundTripper(func(req *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("dial tcp 192.0.2.20:80 for %s: %w", req.URL, context.DeadlineExceeded)
+	})
+
+	_, err := client.GetActivePowerW()
+	if err == nil {
+		t.Fatal("GetActivePowerW() error = nil, want transport error")
+	}
+	if strings.Contains(err.Error(), endpoint) || strings.Contains(err.Error(), "192.0.2.20") || !strings.Contains(err.Error(), "[REDACTED_ENDPOINT]") {
+		t.Fatalf("GetActivePowerW() error did not redact endpoint: %v", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("GetActivePowerW() error lost timeout classification: %v", err)
+	}
+}
 
 func TestGetActivePowerW_Import(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

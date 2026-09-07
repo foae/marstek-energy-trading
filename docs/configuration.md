@@ -18,7 +18,7 @@ All settings are environment variables, typically provided through a `.env` file
 | `BATTERY_EFFICIENCY` | `0.90` | Round-trip efficiency in `(0, 1]` |
 | `BATTERY_CAPACITY_KWH` | `5.12` | Nominal battery capacity |
 | `BATTERY_MIN_SOC` | `0.11` | Minimum SOC fraction |
-| `MAX_CYCLES_PER_DAY` | `2` | Maximum cycles selected over the loaded planning horizon |
+| `MAX_CYCLES_PER_DAY` | `2` | Maximum new cycles selected over the loaded planning horizon; stored-energy discharge recovery does not consume this allowance |
 | `ESPHOME_URL` | required | Absolute URL of the ESPHome bridge |
 | `ESPHOME_RESTART_BUTTON` | empty | Optional restart-button name exposed by ESPHome |
 | `CHARGE_POWER_W` | `2500` | Charge target, 75-2500 W |

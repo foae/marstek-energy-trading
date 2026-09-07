@@ -489,3 +489,30 @@ func TestSendTradingPlanFitsTelegramMessageLimit(t *testing.T) {
 		t.Fatalf("message did not report retained plan:\n%s", message.Text)
 	}
 }
+
+func TestDailySummaryIncludesMixedContinuationEnergy(t *testing.T) {
+	client, err := New("token", "123", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var message sendMessageRequest
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if err := json.NewDecoder(req.Body).Decode(&message); err != nil {
+			return nil, err
+		}
+		return telegramUpdatesResponse(`{"ok":true,"result":true}`), nil
+	})}
+	err = client.SendDailySummaryFull(context.Background(), DailySummaryData{
+		Date:       time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC),
+		ChargedKWh: .75, SolarChargedKWh: .25, SolarChargeCycles: 1,
+		DischargedKWh: .5, PnLEUR: -.1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Charged:</b> 0.75 kWh", "Solar charged:</b> 0.25 kWh", "Discharged:</b> 0.50 kWh"} {
+		if !strings.Contains(message.Text, want) {
+			t.Errorf("summary omitted %q:\n%s", want, message.Text)
+		}
+	}
+}

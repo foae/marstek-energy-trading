@@ -254,7 +254,7 @@ func emergencyESPHomeURL(path string) string {
 func safeEmergencyESPHomeURL(rawURL string) string {
 	rawURL = strings.TrimSpace(rawURL)
 	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || strings.ContainsAny(rawURL, "?#") {
 		return ""
 	}
 	return rawURL

@@ -4,7 +4,9 @@ Planning, pricing and accounting, and solar-charging rules. The detailed state m
 
 ## Planning
 
-The analyzer evaluates every contiguous charge window followed by every valid contiguous discharge window. Dynamic programming selects up to `MAX_CYCLES_PER_DAY` non-overlapping pairs that maximize summed expected profit over the loaded planning horizon. Despite the environment variable's historical name, this is a horizon-wide planning limit, not a persisted calendar-day execution counter.
+The analyzer evaluates contiguous charge windows followed by valid contiguous discharge windows. Dynamic programming selects up to `MAX_CYCLES_PER_DAY` non-overlapping new pairs that maximize summed expected profit over the loaded planning horizon. Despite the environment variable's historical name, this is a horizon-wide planning limit, not a persisted calendar-day execution counter. Ended, retired, and final-minute windows are excluded before capped selection.
+
+Recovery of stored energy is separate from new-cycle selection. Observed battery energy above minimum SOC, or an active solar session, can recover a historical pair's upcoming discharge without reserving its expired grid charge. This includes restarting partway through an uncommitted discharge. Recovery must finish before the first newly selected charge window, so it cannot crowd out new purchases or overlap them. Persisted grid commitments and live solar retention remain authoritative.
 
 A pair's expected profit per input kWh is:
 
@@ -34,7 +36,11 @@ NordPool EUR/MWh prices are converted to one all-in EUR/kWh rate:
 
 That same configured rate values import, discharge/export, and solar export opportunity cost. This assumes symmetric import/export value and does not model a separate feed-in tariff.
 
+NordPool responses are validated against CET/CEST market-day boundaries, then assembled into the configured timezone's local calendar days. A local day can span adjacent market publications; until the next publication, only a contiguous known prefix is used. Incomplete calendars are refreshed every 15 minutes, including after midnight promotion, without erasing previously known coverage.
+
 Energy is integrated from measured battery-power samples. New cross-midnight records retain exact per-day energy, tariff value, and unpriced-energy allocations; historical aggregate records without those allocations are split proportionally. P&L is cash flow, calculated as priced discharge value minus priced grid cost. It is not inventory-matched profit, does not deduct solar opportunity cost, and is incomplete when grid-charge or discharge energy cannot be priced. Telegram labels partial daily and cumulative figures as known cash flow and reports the unpriced quantity. The files and metrics are operational estimates, not revenue-grade metering.
+
+Serialized session bounds are rounded outward to whole seconds so both sides of a fractional-second midnight crossing remain representable. Energy and tariff allocations still use the exact measured interval, not the rounded duration.
 
 ## Solar Charging
 

@@ -352,6 +352,18 @@ func (s *Service) tradeDayAllocationLocked(allocations *[]TradeDayAllocation, at
 	return &(*allocations)[len(*allocations)-1]
 }
 
+// serializedTradeInterval contains the measured interval at the history format's
+// whole-second resolution. Round both endpoints outward so midnight energy is
+// never assigned to a day omitted by the serialized interval.
+func serializedTradeInterval(start, end time.Time) (time.Time, int) {
+	start = start.Truncate(time.Second)
+	roundedEnd := end.Truncate(time.Second)
+	if roundedEnd.Before(end) {
+		roundedEnd = roundedEnd.Add(time.Second)
+	}
+	return start, int(roundedEnd.Sub(start) / time.Second)
+}
+
 func completeTradeDayAllocations(allocations []TradeDayAllocation, start time.Time, durationS int, loc *time.Location) []TradeDayAllocation {
 	if durationS <= 0 {
 		return nil
@@ -669,6 +681,7 @@ func (s *Service) tick(ctx context.Context) {
 	if s.state != StateCharging && s.state != StateDischarging {
 		s.clearExpiredAutomaticCycleCommitmentLocked(ctx, now)
 	}
+	s.activateRecoveryCycleLocked()
 
 	// Create contextual logger for this tick
 	l := slog.With(
@@ -949,9 +962,12 @@ func (s *Service) solarTick(ctx context.Context) {
 	s.mu.Lock()
 	s.currentTradeLastSOC = batterySOC
 	s.cacheBatteryTelemetryLocked(batterySOC, esStatus.BatteryPower)
+	s.activateRecoveryCycleLocked()
 	if s.state == StateSolarCharging {
 		if batterySOC >= solarChargeUpperSOC {
 			s.solarUpperSOCHold = true
+			s.accumulateSolarEnergyLocked(measuredChargePowerW)
+			s.solarGridPowerW = min(s.solarGridPowerW, measuredChargePowerW)
 			s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonBatteryFull)
 			s.mu.Unlock()
 			return
@@ -959,6 +975,7 @@ func (s *Service) solarTick(ctx context.Context) {
 		now := s.now()
 		if s.solarBlockedLocked(now, batterySOC) {
 			s.accumulateSolarEnergyLocked(measuredChargePowerW)
+			s.solarGridPowerW = min(s.solarGridPowerW, measuredChargePowerW)
 			s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonYieldWindow)
 			s.mu.Unlock()
 			s.tick(ctx)
@@ -1337,8 +1354,7 @@ func (s *Service) stopSolarChargingLocked(ctx context.Context, endSOC int, reaso
 	)
 	l.Info("stopping solar charge session")
 
-	tradeStart := s.currentTradeStart.Truncate(time.Second)
-	tradeDurationS := int(duration.Seconds())
+	tradeStart, tradeDurationS := serializedTradeInterval(s.currentTradeStart, stopTime)
 	trade := Trade{
 		Timestamp:          tradeStart,
 		Action:             ActionSolarCharge,
@@ -1390,7 +1406,8 @@ func (s *Service) stopSolarChargingLocked(ctx context.Context, endSOC int, reaso
 	s.mu.Unlock()
 	if s.telegramEnabled() {
 		var text strings.Builder
-		fmt.Fprintf(&text,
+		fmt.Fprintf(
+			&text,
 			"<b>Solar charging completed</b>\nBattery energy: %.2f kWh\nSolar energy: %.2f kWh\nGrid energy: %.2f kWh\n",
 			energyF, solarEnergyF, gridEnergyF,
 		)
@@ -1710,8 +1727,7 @@ func (s *Service) stopChargingLocked(ctx context.Context, endSOC int) {
 	)
 	l.Info("stopping charge session")
 
-	tradeStart := s.currentTradeStart.Truncate(time.Second)
-	tradeDurationS := int(duration.Seconds())
+	tradeStart, tradeDurationS := serializedTradeInterval(s.currentTradeStart, stopTime)
 	trade := Trade{
 		Timestamp:      tradeStart,
 		Action:         ActionCharge,
@@ -1890,8 +1906,7 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 	)
 	l.Info("stopping discharge session")
 
-	tradeStart := s.currentTradeStart.Truncate(time.Second)
-	tradeDurationS := int(duration.Seconds())
+	tradeStart, tradeDurationS := serializedTradeInterval(s.currentTradeStart, stopTime)
 	trade := Trade{
 		Timestamp:      tradeStart,
 		Action:         ActionDischarge,
@@ -2277,21 +2292,52 @@ func (s *Service) checkPriceFetch(ctx context.Context) {
 	if haveToday {
 		s.refreshCurrentPlanLocked(now)
 	}
-	haveTomorrow := len(s.tomorrowPrices) > 0 && localMidnight(s.tomorrowPrices[0].Time).Equal(today.AddDate(0, 0, 1))
+	completeToday := priceDayComplete(s.todayPrices, today)
+	completeTomorrow := priceDayComplete(s.tomorrowPrices, today.AddDate(0, 0, 1))
 	s.mu.Unlock()
-	if !haveToday {
+	if !completeToday {
 		if err := s.fetchTodayPrices(ctx); err != nil {
 			slog.Error("failed to fetch current day's prices; will retry", "error", err)
 			s.notifyError(ctx, "Failed to fetch today's prices: "+err.Error())
 		}
 	}
-	// Publication may be delayed or temporarily unavailable; retry beyond 13:00.
-	if now.Hour() >= 13 && !haveTomorrow {
+	// A local day may straddle two market publication days. Retry incomplete
+	// prefixes on this existing cadence, regardless of the scheduling timezone.
+	if !completeTomorrow {
 		if err := s.fetchTomorrowPrices(ctx); err != nil {
+			if errors.Is(err, nordpool.ErrPricesUnavailable) {
+				return
+			}
 			slog.Warn("failed to fetch tomorrow's prices; will retry", "error", err)
 			s.notifyError(ctx, "Failed to fetch tomorrow's prices: "+err.Error())
 		}
 	}
+}
+
+func priceDayComplete(prices []nordpool.Price, start time.Time) bool {
+	end := start.AddDate(0, 0, 1)
+	cursor := start
+	for _, price := range prices {
+		if !price.Time.Equal(cursor) || !cursor.Before(end) {
+			return false
+		}
+		cursor = cursor.Add(15 * time.Minute)
+	}
+	return cursor.Equal(end)
+}
+
+// retainPriceCoverage accepts tariff updates without erasing an already-known
+// suffix when a later market day is temporarily returned as unpublished.
+func retainPriceCoverage(prices, previous []nordpool.Price) []nordpool.Price {
+	if len(prices) == 0 {
+		return previous
+	}
+	if len(prices) < len(previous) && prices[0].Time.Equal(previous[0].Time) {
+		combined := append([]nordpool.Price(nil), previous...)
+		copy(combined, prices)
+		return combined
+	}
+	return prices
 }
 
 // futurePriceHorizonLocked deduplicates and orders all non-expired price slots
@@ -2390,23 +2436,49 @@ func (s *Service) clearExpiredAutomaticCycleCommitmentLocked(ctx context.Context
 // refreshCurrentPlanLocked preserves a started cycle through its discharge end,
 // including idle time between charging and discharging.
 func (s *Service) refreshCurrentPlanLocked(now time.Time) *TradingPlan {
-	// Retain today's charge prices: removing them also removes the paired
-	// evening discharge, even when the battery is already full. This also
-	// reconstructs today's discharge schedule after a service restart.
-	plan := AnalyzePrices(s.futurePriceHorizonLocked(localMidnight(now)), s.analyzerConfig())
-	for _, window := range s.retiredDischargeWindows {
-		plan = retireDischargeWindow(plan, window)
-	}
+	cfg := s.analyzerConfig()
+	cfg.Now = now
+	cfg.RetiredDischargeWindows = s.retiredDischargeWindows
 	if s.automaticCycleCleanupPending && s.automaticCycleCommit != nil {
-		plan = retireDischargeWindow(plan, s.automaticCycleCommit.DischargeWindow)
+		cfg.RetiredDischargeWindows = append(append([]TimeWindow(nil), s.retiredDischargeWindows...), s.automaticCycleCommit.DischargeWindow)
 	}
+	plan := AnalyzePrices(s.futurePriceHorizonLocked(localMidnight(now)), cfg)
 	if s.automaticCycleCommittedLocked() {
 		s.pendingPlan = plan
 		return s.currentPlan
 	}
 	s.currentPlan = plan
 	s.pendingPlan = nil
+	s.activateRecoveryCycleLocked()
 	return plan
+}
+
+// activateRecoveryCycleLocked admits only observed stored energy, not a missed
+// grid purchase. Recovery cannot displace new cycles and carries no charge window.
+func (s *Service) activateRecoveryCycleLocked() {
+	plan := s.currentPlan
+	if plan == nil || plan.recoveryCycle == nil || !s.batteryTelemetryAvailable ||
+		(s.state != StateIdle && s.state != StateSolarCharging) ||
+		(s.state != StateSolarCharging && s.batteryTelemetrySOC <= s.cfg.MinSOCPercent()) {
+		return
+	}
+	recovery := plan.recoveryCycle
+	if recovery.DischargeWindow.End.Sub(s.now()) <= minimumAutomaticControlWindow {
+		return
+	}
+	// The historical pair lets solar acquire retention and prevents a later
+	// grid reservation from beginning before this recovered discharge ends.
+	cycles := make([]TradeCycle, len(plan.Cycles)+1)
+	cycles[0] = *recovery
+	copy(cycles[1:], plan.Cycles)
+	plan.Cycles = cycles
+	windows := make([]TimeWindow, len(plan.DischargeWindows)+1)
+	windows[0] = recovery.DischargeWindow
+	copy(windows[1:], plan.DischargeWindows)
+	plan.DischargeWindows = windows
+	plan.DischargeOnly = len(plan.ChargeWindows) == 0
+	plan.IsProfitable = true
+	plan.recoveryCycle = nil
 }
 
 func (s *Service) restoreAutomaticCycleCommitment() error {
@@ -2496,7 +2568,7 @@ func (s *Service) fetchTodayPrices(ctx context.Context) error {
 
 	now := s.now()
 	s.mu.Lock()
-	s.todayPrices = prices // full day remains available for price settlement
+	s.todayPrices = retainPriceCoverage(prices, s.todayPrices)
 	plan := s.refreshCurrentPlanLocked(now)
 	candidatePlan := plan
 	planRetained := s.pendingPlan != nil && plan != nil && plan == s.currentPlan
@@ -2544,7 +2616,7 @@ func (s *Service) fetchTomorrowPrices(ctx context.Context) error {
 
 	now := s.now()
 	s.mu.Lock()
-	s.tomorrowPrices = prices
+	s.tomorrowPrices = retainPriceCoverage(prices, s.tomorrowPrices)
 	plan := s.refreshCurrentPlanLocked(now)
 	candidatePlan := plan
 	planRetained := s.pendingPlan != nil && plan != nil && plan == s.currentPlan

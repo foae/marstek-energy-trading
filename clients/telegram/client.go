@@ -275,8 +275,8 @@ func (c *Client) SendDailySummaryFull(ctx context.Context, data DailySummaryData
 			totalPnLLabel,
 			totalSign, data.TotalPnLEUR,
 		)
-	} else if data.ChargeCycles == 0 && data.DischargeCycles == 0 && data.SolarChargedKWh > 0 {
-		// Solar-only sessions can still import priced grid energy while settling.
+	} else if data.ChargeCycles == 0 && data.DischargeCycles == 0 &&
+		data.DischargedKWh == 0 && data.ChargedKWh == data.SolarChargedKWh && data.SolarChargedKWh > 0 {
 		text = fmt.Sprintf(
 			"%s <b>Daily Summary - %s</b>\n\n"+
 				"☀️ <b>Solar charged:</b> %.2f kWh (%d sessions)\n\n"+
@@ -306,7 +306,7 @@ func (c *Client) SendDailySummaryFull(ctx context.Context, data DailySummaryData
 			data.MinChargePrice,
 		)
 
-		if data.SolarChargeCycles > 0 {
+		if data.SolarChargeCycles > 0 || data.SolarChargedKWh > 0 {
 			text += fmt.Sprintf(
 				"\n☀️ <b>Solar charged:</b> %.2f kWh (%d sessions)\n",
 				data.SolarChargedKWh, data.SolarChargeCycles,

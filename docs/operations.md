@@ -51,6 +51,8 @@ If upgrading from a version that stored state in the repository's `./data` bind 
 docker stop -t 95 energy-trader  # if the old container is running
 make docker-build
 make docker-migrate-data
+docker rm energy-trader        # remove the stopped old container, not its data
+make docker-run
 ```
 
 Wait for the old container to stop cleanly before migrating so trade history and Telegram state cannot change during the copy. The migration copies `./data` into `energy-trader-data`, sets ownership for the image's non-root user, cleans a partial copy if an operation fails, and refuses to overwrite a non-empty destination volume. Keep the original directory as a backup until `/status` confirms the expected history.

@@ -56,3 +56,11 @@ func TestEmergencyESPHomeURLDoesNotRetainSupersededEndpoint(t *testing.T) {
 		t.Fatalf("emergencyESPHomeURL() = %q, want superseded endpoint cleared", got)
 	}
 }
+
+func TestEmergencyESPHomeURLRejectsEmptyURLDelimiters(t *testing.T) {
+	for _, endpoint := range []string{"http://battery.local?", "http://battery.local#"} {
+		if got := safeEmergencyESPHomeURL(endpoint); got != "" {
+			t.Errorf("unsafe emergency endpoint accepted: %q", got)
+		}
+	}
+}

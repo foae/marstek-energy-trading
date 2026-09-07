@@ -68,3 +68,19 @@ func TestCrossMidnightDischargeStartsBeforePriceCalendarSwap(t *testing.T) {
 		t.Fatalf("cross-midnight discharge did not start before calendar swap: state=%s power=%d", svc.state, battery.CurrentPower)
 	}
 }
+
+func TestPartiallyDischargedBatteryRecoversAfterRestart(t *testing.T) {
+	base := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	now := base.Add(30 * time.Minute)
+	battery := NewMockBattery(48)
+	prices := makePrices(base, .05, .10, .40, .35)
+	svc := newTestService(testConfigSmallBattery(), battery, prices, now)
+	// A graceful restart can interrupt an uncommitted discharge after its SOC
+	// has fallen below full, while the same discharge window is still open.
+	svc.currentPlan = nil
+	svc.checkPriceFetch(context.Background())
+	svc.tick(context.Background())
+	if svc.State() != StateDischarging || battery.CurrentPower >= 0 {
+		t.Fatalf("remaining stored energy was stranded after restart: state=%s power=%d", svc.State(), battery.CurrentPower)
+	}
+}

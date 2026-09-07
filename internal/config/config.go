@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/caarlos0/env/v11"
@@ -127,7 +128,7 @@ func (c *Config) validate() error {
 		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 			return fmt.Errorf("%s must be an absolute HTTP(S) URL", setting.name)
 		}
-		if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		if parsed.User != nil || strings.ContainsAny(setting.endpoint, "?#") {
 			return fmt.Errorf("%s must not contain credentials, a query, or a fragment", setting.name)
 		}
 	}

@@ -443,6 +443,124 @@ func TestAnalyzePrices_MaximizesTotalProfitAcrossCycles(t *testing.T) {
 	}
 }
 
+func TestAnalyzePrices_NowExcludesExpiredCycleAndPreservesStaticAnalysis(t *testing.T) {
+	baseTime := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+	values := make([]float64, 96)
+	for i := range values {
+		values[i] = 0.20
+	}
+	for i := 0; i < 8; i++ {
+		values[i] = 0.05
+	}
+	for i := 8; i < 16; i++ {
+		values[i] = 0.50
+	}
+	for i := 48; i < 56; i++ {
+		values[i] = 0.10
+	}
+	for i := 56; i < 64; i++ {
+		values[i] = 0.30
+	}
+
+	cfg := defaultTestConfig()
+	cfg.MaxCyclesPerDay = 1
+
+	staticPlan := AnalyzePrices(makePrices(baseTime, values...), cfg)
+	if len(staticPlan.Cycles) != 1 ||
+		!staticPlan.Cycles[0].ChargeWindow.Start.Equal(baseTime) ||
+		!staticPlan.Cycles[0].DischargeWindow.Start.Equal(baseTime.Add(2*time.Hour)) ||
+		!decimalEqual(staticPlan.Cycles[0].Profit, 0.40) {
+		t.Fatalf("zero Now must retain the historical best cycle, got %+v", staticPlan.Cycles)
+	}
+
+	cfg.Now = baseTime.Add(10 * time.Hour)
+	plan := AnalyzePrices(makePrices(baseTime, values...), cfg)
+	if len(plan.Cycles) != 1 {
+		t.Fatalf("expected one future cycle, got %+v", plan.Cycles)
+	}
+	cycle := plan.Cycles[0]
+	if !cycle.ChargeWindow.Start.Equal(baseTime.Add(12*time.Hour)) ||
+		!cycle.DischargeWindow.Start.Equal(baseTime.Add(14*time.Hour)) ||
+		!decimalEqual(cycle.Profit, 0.17) {
+		t.Errorf("expected the 12:00-16:00 0.17-profit cycle, got %+v", cycle)
+	}
+}
+
+func TestAnalyzePrices_NowKeepsInProgressWindowsEligible(t *testing.T) {
+	baseTime := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+	values := make([]float64, 96)
+	for i := range values {
+		values[i] = 0.20
+	}
+	for i := 36; i < 44; i++ {
+		values[i] = 0.10
+	}
+	for i := 48; i < 56; i++ {
+		values[i] = 0.30
+	}
+
+	cfg := defaultTestConfig()
+	cfg.MaxCyclesPerDay = 1
+	cfg.Now = baseTime.Add(10 * time.Hour)
+	plan := AnalyzePrices(makePrices(baseTime, values...), cfg)
+	if len(plan.Cycles) != 1 ||
+		!plan.Cycles[0].ChargeWindow.Start.Equal(baseTime.Add(9*time.Hour)) ||
+		!plan.Cycles[0].ChargeWindow.End.After(cfg.Now) {
+		t.Fatalf("expected the in-progress 09:00-11:00 charge window to remain eligible, got %+v", plan.Cycles)
+	}
+}
+
+func TestAnalyzePrices_NowExcludesWindowsEndingExactlyNow(t *testing.T) {
+	baseTime := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+	values := make([]float64, 16)
+	for i := 0; i < 8; i++ {
+		values[i] = 0.05
+	}
+	for i := 8; i < 16; i++ {
+		values[i] = 0.50
+	}
+
+	cfg := defaultTestConfig()
+	cfg.MaxCyclesPerDay = 1
+	cfg.Now = baseTime.Add(2 * time.Hour)
+	plan := AnalyzePrices(makePrices(baseTime, values...), cfg)
+	if len(plan.Cycles) != 0 {
+		t.Errorf("expected the charge window ending at Now to be excluded, got %+v", plan.Cycles)
+	}
+}
+
+func TestAnalyzePrices_RetiredDischargeWindowDoesNotConsumeCycleCap(t *testing.T) {
+	baseTime := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+	cfg := smallWindowConfig()
+	cfg.Efficiency = 1
+	cfg.MaxCyclesPerDay = 1
+	cfg.RetiredDischargeWindows = []TimeWindow{{
+		Start: baseTime.Add(15 * time.Minute),
+		End:   baseTime.Add(30 * time.Minute),
+	}}
+
+	plan := AnalyzePrices(makePrices(baseTime, 0.25, 0.55, 0.10, 0.30), cfg)
+	if len(plan.Cycles) != 1 {
+		t.Fatalf("expected one non-retired future cycle, got %+v", plan.Cycles)
+	}
+	cycle := plan.Cycles[0]
+	if !cycle.ChargeWindow.Start.Equal(baseTime.Add(30*time.Minute)) ||
+		!cycle.DischargeWindow.Start.Equal(baseTime.Add(45*time.Minute)) {
+		t.Errorf("expected the later eligible cycle after retiring the higher-profit discharge, got %+v", cycle)
+	}
+}
+
+func TestAnalyzePrices_SkipsCycleWithoutControlLeadTime(t *testing.T) {
+	base := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+	cfg := smallWindowConfig()
+	cfg.MaxCyclesPerDay = 1
+	cfg.Now = base.Add(14 * time.Minute)
+	plan := AnalyzePrices(makePrices(base, .05, .50, .10, .30), cfg)
+	if len(plan.Cycles) != 1 || !plan.Cycles[0].ChargeWindow.Start.Equal(base.Add(30*time.Minute)) {
+		t.Fatalf("final-minute candidate consumed the cap: %+v", plan.Cycles)
+	}
+}
+
 func TestAnalyzePrices_RejectsWindowsAcrossPriceGaps(t *testing.T) {
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
 	cfg := AnalyzerConfig{

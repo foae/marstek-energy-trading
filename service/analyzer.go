@@ -60,17 +60,20 @@ type TradingPlan struct {
 	Spread           decimal.Decimal // MaxPrice - MinPrice
 	IsProfitable     bool            // At least one profitable cycle exists
 	DischargeOnly    bool            // Restored commitment may discharge but cannot resume grid charging
+	recoveryCycle    *TradeCycle     // Historical pairing for stored energy; never consumes the new-cycle cap
 }
 
 // AnalyzerConfig contains parameters for price analysis.
 type AnalyzerConfig struct {
-	Efficiency         float64 // Battery round-trip efficiency (0.0-1.0)
-	MinPriceSpread     float64 // Minimum expected profit in EUR/kWh after efficiency loss
-	BatteryCapacityKWh float64 // Battery capacity in kWh
-	BatteryMinSOC      float64 // Minimum SOC (0.0-1.0), e.g., 0.11 for 11%
-	ChargePowerW       int     // Charge power in watts
-	DischargePowerW    int     // Discharge power in watts
-	MaxCyclesPerDay    int     // Maximum charge/discharge cycles per day
+	Efficiency              float64      // Battery round-trip efficiency (0.0-1.0)
+	MinPriceSpread          float64      // Minimum expected profit in EUR/kWh after efficiency loss
+	BatteryCapacityKWh      float64      // Battery capacity in kWh
+	BatteryMinSOC           float64      // Minimum SOC (0.0-1.0), e.g., 0.11 for 11%
+	ChargePowerW            int          // Charge power in watts
+	DischargePowerW         int          // Discharge power in watts
+	MaxCyclesPerDay         int          // Maximum charge/discharge cycles per day
+	Now                     time.Time    // Current time; zero retains static-horizon analysis
+	RetiredDischargeWindows []TimeWindow // Completed discharge windows excluded from new cycles
 }
 
 // AnalyzePrices analyzes the day-ahead prices and returns a trading plan.
@@ -132,6 +135,10 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 	if maxCycles <= 0 {
 		maxCycles = 2
 	}
+	cutoff := cfg.Now
+	if !cutoff.IsZero() {
+		cutoff = cutoff.Add(minimumAutomaticControlWindow)
+	}
 
 	cycles := selectOptimalCycles(
 		slots,
@@ -140,6 +147,8 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 		efficiency,
 		minProfit,
 		maxCycles,
+		cutoff,
+		cfg.RetiredDischargeWindows,
 	)
 
 	// Extract charge and discharge windows from cycles for backwards compatibility
@@ -154,6 +163,7 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 		ChargeWindows:    chargeWindows,
 		DischargeWindows: dischargeWindows,
 		Cycles:           cycles,
+		recoveryCycle:    selectRecoveryCycle(slots, chargeWindowSize, dischargeWindowSize, efficiency, minProfit, cfg, cycles),
 		MinPrice:         minPrice,
 		MaxPrice:         maxPrice,
 		Spread:           spread,
@@ -163,14 +173,14 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 
 // selectOptimalCycles uses dynamic programming to maximize total profit from up
 // to maxCycles chronological, non-overlapping charge/discharge pairs.
-func selectOptimalCycles(prices []priceSlot, chargeWindowSize, dischargeWindowSize int, efficiency, minProfit decimal.Decimal, maxCycles int) []TradeCycle {
+func selectOptimalCycles(prices []priceSlot, chargeWindowSize, dischargeWindowSize int, efficiency, minProfit decimal.Decimal, maxCycles int, now time.Time, retiredDischargeWindows []TimeWindow) []TradeCycle {
 	maxCycles = min(maxCycles, len(prices)/(chargeWindowSize+dischargeWindowSize))
 	if maxCycles == 0 {
 		return nil
 	}
 
-	chargeAverages := precomputeWindowAverages(prices, chargeWindowSize)
-	dischargeAverages := precomputeWindowAverages(prices, dischargeWindowSize)
+	chargeAverages := precomputeWindowAverages(prices, chargeWindowSize, now, nil)
+	dischargeAverages := precomputeWindowAverages(prices, dischargeWindowSize, now, retiredDischargeWindows)
 	profits := make([][]decimal.Decimal, maxCycles+1)
 	choices := make([][]cycleChoice, maxCycles+1)
 	for cycleCount := range profits {
@@ -238,9 +248,60 @@ func selectOptimalCycles(prices []priceSlot, chargeWindowSize, dischargeWindowSi
 	return cycles
 }
 
+// selectRecoveryCycle preserves a discharge opportunity for energy already in
+// the battery. It cannot crowd out new cycles or overlap their charge windows.
+func selectRecoveryCycle(prices []priceSlot, chargeSize, dischargeSize int, efficiency, minProfit decimal.Decimal, cfg AnalyzerConfig, cycles []TradeCycle) *TradeCycle {
+	if cfg.Now.IsZero() || len(prices) == 0 || !prices[0].Time.Before(cfg.Now) {
+		return nil
+	}
+	var before time.Time
+	if len(cycles) > 0 {
+		before = cycles[0].ChargeWindow.Start
+		if !before.After(cfg.Now.Add(minimumAutomaticControlWindow)) {
+			return nil
+		}
+	}
+	charges := precomputeWindowAverages(prices, chargeSize, time.Time{}, nil)
+	discharges := precomputeWindowAverages(prices, dischargeSize, cfg.Now.Add(minimumAutomaticControlWindow), cfg.RetiredDischargeWindows)
+	var best *TradeCycle
+	for chargeStart, charge := range charges {
+		if !charge.valid {
+			continue
+		}
+		chargeEnd := prices[chargeStart+chargeSize-1].Time.Add(15 * time.Minute)
+		if chargeEnd.After(cfg.Now) {
+			break
+		}
+		for dischargeStart := chargeStart + chargeSize; dischargeStart+dischargeSize <= len(prices); dischargeStart++ {
+			discharge := discharges[dischargeStart]
+			dischargeEnd := prices[dischargeStart+dischargeSize-1].Time.Add(15 * time.Minute)
+			if !before.IsZero() && dischargeEnd.After(before) {
+				break
+			}
+			if !discharge.valid {
+				continue
+			}
+			profit := discharge.price.Mul(efficiency).Sub(charge.price)
+			if !profit.IsPositive() || profit.LessThan(minProfit) || (best != nil && !profit.GreaterThan(best.Profit)) {
+				continue
+			}
+			if best == nil {
+				best = &TradeCycle{}
+			}
+			*best = TradeCycle{
+				ChargeWindow:    TimeWindow{Start: prices[chargeStart].Time, End: chargeEnd, Price: charge.price},
+				DischargeWindow: TimeWindow{Start: prices[dischargeStart].Time, End: dischargeEnd, Price: discharge.price},
+				Profit:          profit,
+			}
+		}
+	}
+	return best
+}
+
 // precomputeWindowAverages calculates each contiguous quarter-hour window once.
-// A window is invalid when it spans a missing or duplicate price slot.
-func precomputeWindowAverages(prices []priceSlot, windowSize int) []averagedWindow {
+// A window is invalid when it spans a missing or duplicate price slot, has ended,
+// or matches a retired discharge window.
+func precomputeWindowAverages(prices []priceSlot, windowSize int, now time.Time, retiredWindows []TimeWindow) []averagedWindow {
 	averages := make([]averagedWindow, len(prices))
 	if windowSize <= 0 || windowSize > len(prices) {
 		return averages
@@ -256,7 +317,8 @@ func precomputeWindowAverages(prices []priceSlot, windowSize int) []averagedWind
 	}
 	divisor := decimal.NewFromInt(int64(windowSize))
 	for start := 0; start+windowSize <= len(prices); start++ {
-		if invalidTransitions == 0 {
+		end := prices[start+windowSize-1].Time.Add(15 * time.Minute)
+		if invalidTransitions == 0 && (now.IsZero() || end.After(now)) && !isRetiredWindow(prices[start].Time, end, retiredWindows) {
 			averages[start] = averagedWindow{
 				price: sum.Div(divisor),
 				valid: true,
@@ -275,6 +337,15 @@ func precomputeWindowAverages(prices []priceSlot, windowSize int) []averagedWind
 		}
 	}
 	return averages
+}
+
+func isRetiredWindow(start, end time.Time, retiredWindows []TimeWindow) bool {
+	for _, retired := range retiredWindows {
+		if retired.Start.Equal(start) && retired.End.Equal(end) {
+			return true
+		}
+	}
+	return false
 }
 
 // calculateWindowSize calculates the number of 15-minute slots needed for a full charge/discharge.

@@ -229,6 +229,8 @@ func TestValidate_RejectsCredentialBearingEndpointURLs(t *testing.T) {
 		"http://user:password@battery.local",
 		"http://battery.local?token=secret",
 		"http://battery.local#secret",
+		"http://battery.local?",
+		"http://battery.local#",
 	} {
 		cfg := validConfig()
 		cfg.ESPHomeURL = endpoint

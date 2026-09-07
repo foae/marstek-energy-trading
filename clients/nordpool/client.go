@@ -3,6 +3,7 @@ package nordpool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -16,6 +17,9 @@ const (
 	baseURL    = "https://dataportal-api.nordpoolgroup.com/api/DayAheadPriceIndices"
 	resolution = "15" // 15-minute resolution
 )
+
+// ErrPricesUnavailable means the requested local-day prefix is not published yet.
+var ErrPricesUnavailable = errors.New("prices unavailable")
 
 // Price represents a single price point.
 type Price struct {
@@ -90,16 +94,91 @@ type multiIndexEntry struct {
 	EntryPerArea  map[string]*float64 `json:"entryPerArea"`
 }
 
-// FetchDayAheadPrices fetches day-ahead prices for the given date.
-// Returns prices in EUR/kWh (converted from EUR/MWh).
+// FetchDayAheadPrices returns the configured local day's prices in EUR/kWh.
+// When an adjacent market day is unpublished, it returns only the contiguous
+// known prefix; malformed or failed market-day requests remain errors.
 func (c *Client) FetchDayAheadPrices(ctx context.Context, date time.Time) ([]Price, error) {
 	loc := c.loc
 	if loc == nil {
 		loc = date.Location()
 	}
-	requestedDay := date.In(loc)
-	dateStr := requestedDay.Format("2006-01-02")
+	requestedDate := date.In(loc)
+	requestedStart := time.Date(
+		requestedDate.Year(), requestedDate.Month(), requestedDate.Day(), 0, 0, 0, 0, loc,
+	)
+	requestedEnd := requestedStart.AddDate(0, 0, 1)
 
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	marketLoc, err := time.LoadLocation("Europe/Oslo")
+	if err != nil {
+		return nil, fmt.Errorf("load Nord Pool market timezone: %w", err)
+	}
+	marketDate := requestedStart.In(marketLoc)
+	marketStart := time.Date(marketDate.Year(), marketDate.Month(), marketDate.Day(), 0, 0, 0, 0, marketLoc)
+
+	prices := make([]Price, 0, int(requestedEnd.Sub(requestedStart)/(15*time.Minute)))
+	expectedStart := requestedStart
+	for marketStart.Before(requestedEnd) {
+		marketEnd := marketStart.AddDate(0, 0, 1)
+
+		marketPrices, published, err := c.fetchMarketDay(ctx, marketStart, marketEnd)
+		if err != nil {
+			return nil, err
+		}
+		if !published {
+			if len(prices) == 0 {
+				return nil, fmt.Errorf(
+					"%w for requested day %s: market day %s is unpublished",
+					ErrPricesUnavailable,
+					requestedStart.Format("2006-01-02"),
+					marketStart.Format("2006-01-02"),
+				)
+			}
+			return prices, nil
+		}
+
+		for _, price := range marketPrices {
+			if price.Time.Before(requestedStart) {
+				continue
+			}
+			if !price.Time.Before(requestedEnd) {
+				break
+			}
+			if !price.Time.Equal(expectedStart) {
+				return nil, fmt.Errorf(
+					"incomplete or unordered price series: got slot %s, want %s",
+					price.Time,
+					expectedStart,
+				)
+			}
+
+			prices = append(prices, Price{
+				Time:  price.Time.In(loc),
+				Value: price.Value,
+			})
+			expectedStart = expectedStart.Add(15 * time.Minute)
+		}
+
+		marketStart = marketEnd
+	}
+	if !expectedStart.Equal(requestedEnd) {
+		return nil, fmt.Errorf(
+			"incomplete price series: ends at %s, want %s",
+			expectedStart,
+			requestedEnd,
+		)
+	}
+
+	return prices, nil
+}
+
+func (c *Client) fetchMarketDay(
+	ctx context.Context,
+	marketStart time.Time,
+	marketEnd time.Time,
+) ([]Price, bool, error) {
+	dateStr := marketStart.Format("2006-01-02")
 	params := url.Values{}
 	params.Set("date", dateStr)
 	params.Set("indexNames", c.area)
@@ -108,38 +187,37 @@ func (c *Client) FetchDayAheadPrices(ctx context.Context, date time.Time) ([]Pri
 	params.Set("resolutionInMinutes", resolution)
 
 	reqURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
-
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, false, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch prices: %w", err)
+		return nil, false, fmt.Errorf("fetch prices: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return nil, false, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
 	var apiResp apiResponse
 	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+		return nil, false, fmt.Errorf("decode response: %w", err)
 	}
 	if apiResp.Currency != c.currency {
-		return nil, fmt.Errorf("unexpected currency %q, want %q", apiResp.Currency, c.currency)
+		return nil, false, fmt.Errorf("unexpected currency %q, want %q", apiResp.Currency, c.currency)
 	}
 	if apiResp.ResolutionInMin != 15 {
-		return nil, fmt.Errorf("unexpected resolution %d minutes, want 15", apiResp.ResolutionInMin)
+		return nil, false, fmt.Errorf("unexpected resolution %d minutes, want 15", apiResp.ResolutionInMin)
 	}
 	if apiResp.DeliveryDateCET != dateStr {
-		return nil, fmt.Errorf("unexpected delivery date %q, want %q", apiResp.DeliveryDateCET, dateStr)
+		return nil, false, fmt.Errorf("unexpected delivery date %q, want %q", apiResp.DeliveryDateCET, dateStr)
 	}
 	if apiResp.Market != "DayAhead" {
-		return nil, fmt.Errorf("unexpected market %q, want %q", apiResp.Market, "DayAhead")
+		return nil, false, fmt.Errorf("unexpected market %q, want %q", apiResp.Market, "DayAhead")
 	}
 	areaFound := false
 	for _, area := range apiResp.IndexNames {
@@ -149,65 +227,69 @@ func (c *Client) FetchDayAheadPrices(ctx context.Context, date time.Time) ([]Pri
 		}
 	}
 	if !areaFound {
-		return nil, fmt.Errorf("response index names do not include area %q", c.area)
+		return nil, false, fmt.Errorf("response index names do not include area %q", c.area)
 	}
 	if len(apiResp.MultiIndexEntries) == 0 {
-		return nil, fmt.Errorf("no price entries returned for %s", dateStr)
+		return nil, false, nil
 	}
 
 	prices := make([]Price, 0, len(apiResp.MultiIndexEntries))
 	seen := make(map[time.Time]struct{}, len(apiResp.MultiIndexEntries))
-	dayStart := time.Date(requestedDay.Year(), requestedDay.Month(), requestedDay.Day(), 0, 0, 0, 0, requestedDay.Location())
-	expectedStart := dayStart
+	expectedStart := marketStart
 	for _, entry := range apiResp.MultiIndexEntries {
-		// Parse delivery start time
-		t, err := time.Parse(time.RFC3339, entry.DeliveryStart)
+		start, err := time.Parse(time.RFC3339, entry.DeliveryStart)
 		if err != nil {
-			return nil, fmt.Errorf("parse time %q: %w", entry.DeliveryStart, err)
+			return nil, false, fmt.Errorf("parse time %q: %w", entry.DeliveryStart, err)
 		}
-		t = t.In(loc)
-		if t.Year() != requestedDay.Year() || t.Month() != requestedDay.Month() || t.Day() != requestedDay.Day() {
-			return nil, fmt.Errorf("price slot %s is outside requested day %s", entry.DeliveryStart, dateStr)
+		start = start.In(marketStart.Location())
+		if start.Before(marketStart) || !start.Before(marketEnd) {
+			return nil, false, fmt.Errorf("price slot %s is outside requested day %s", entry.DeliveryStart, dateStr)
 		}
 		end, err := time.Parse(time.RFC3339, entry.DeliveryEnd)
 		if err != nil {
-			return nil, fmt.Errorf("parse delivery end %q: %w", entry.DeliveryEnd, err)
+			return nil, false, fmt.Errorf("parse delivery end %q: %w", entry.DeliveryEnd, err)
 		}
-		if end.Sub(t) != 15*time.Minute {
-			return nil, fmt.Errorf("unexpected slot duration at %s: %s", entry.DeliveryStart, end.Sub(t))
+		if end.Sub(start) != 15*time.Minute {
+			return nil, false, fmt.Errorf("unexpected slot duration at %s: %s", entry.DeliveryStart, end.Sub(start))
 		}
-		if _, duplicate := seen[t]; duplicate {
-			return nil, fmt.Errorf("duplicate price slot at %s", entry.DeliveryStart)
+		if _, duplicate := seen[start]; duplicate {
+			return nil, false, fmt.Errorf("duplicate price slot at %s", entry.DeliveryStart)
 		}
-		seen[t] = struct{}{}
+		seen[start] = struct{}{}
 
-		// Get price for our area (in EUR/MWh)
 		pricePerMWh, ok := entry.EntryPerArea[c.area]
 		if !ok || pricePerMWh == nil {
-			return nil, fmt.Errorf("no price for area %q at %s", c.area, entry.DeliveryStart)
+			return nil, false, fmt.Errorf("no price for area %q at %s", c.area, entry.DeliveryStart)
 		}
 		if math.IsNaN(*pricePerMWh) || math.IsInf(*pricePerMWh, 0) {
-			return nil, fmt.Errorf("non-finite price for area %q at %s", c.area, entry.DeliveryStart)
+			return nil, false, fmt.Errorf("non-finite price for area %q at %s", c.area, entry.DeliveryStart)
 		}
-		if !t.Equal(expectedStart) {
-			return nil, fmt.Errorf("incomplete or unordered price series: got slot %s, want %s", t, expectedStart)
+		if !start.Equal(expectedStart) {
+			return nil, false, fmt.Errorf(
+				"incomplete or unordered price series: got slot %s, want %s",
+				start,
+				expectedStart,
+			)
 		}
-		expectedStart = end
+		expectedStart = end.In(marketStart.Location())
 
 		// Convert from EUR/MWh to EUR/kWh, then add the configured taxes and fee.
 		wholesalePrice := decimal.NewFromFloat(*pricePerMWh).Div(decimal.NewFromInt(1000))
 		allInPrice, _ := c.pricing.Apply(wholesalePrice).Float64()
 		prices = append(prices, Price{
-			Time:  t,
+			Time:  start,
 			Value: allInPrice,
 		})
 	}
-	dayEnd := dayStart.AddDate(0, 0, 1)
-	if !expectedStart.Equal(dayEnd) {
-		return nil, fmt.Errorf("incomplete price series: ends at %s, want %s", expectedStart, dayEnd)
+	if !expectedStart.Equal(marketEnd) {
+		return nil, false, fmt.Errorf(
+			"incomplete price series: ends at %s, want %s",
+			expectedStart,
+			marketEnd,
+		)
 	}
 
-	return prices, nil
+	return prices, true, nil
 }
 
 // FetchTodayPrices fetches day-ahead prices for today.

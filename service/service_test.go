@@ -456,6 +456,7 @@ func newTestService(cfg *config.Config, battery *MockBattery, prices []nordpool.
 	recorder := NewRecorder("", cfg.BatteryEfficiency, time.UTC)
 	svc := &Service{
 		cfg:         cfg,
+		nordpool:    &MockPriceProvider{TodayPrices: prices},
 		battery:     battery,
 		recorder:    recorder,
 		state:       StateIdle,
@@ -1298,6 +1299,7 @@ func newTestServiceWithMeter(cfg *config.Config, battery *MockBattery, meter *Mo
 	recorder := NewRecorder("", cfg.BatteryEfficiency, time.UTC)
 	svc := &Service{
 		cfg:         cfg,
+		nordpool:    &MockPriceProvider{TodayPrices: prices},
 		battery:     battery,
 		meter:       meter,
 		recorder:    recorder,
@@ -5264,5 +5266,219 @@ func TestBackwardClockCorrectionDoesNotSuppressNotifications(t *testing.T) {
 	svc.notifyLinkDown(context.Background(), "link down")
 	if len(notifier.ErrorCalls) != 2 {
 		t.Fatalf("notification attempts = %d, want both alerts after backward clock correction", len(notifier.ErrorCalls))
+	}
+}
+
+func TestCompletedTradeRetainsFractionalMidnightEnergy(t *testing.T) {
+	for _, state := range []State{StateCharging, StateDischarging, StateSolarCharging} {
+		t.Run(string(state), func(t *testing.T) {
+			start := time.Date(2026, 9, 6, 23, 59, 59, 900_000_000, time.UTC)
+			now := start
+			cfg := testConfig()
+			svc := newTestService(cfg, NewMockBattery(50), nil, now)
+			svc.recorder = NewRecorder(t.TempDir(), cfg.BatteryEfficiency, time.UTC)
+			svc.nowFunc = func() time.Time { return now }
+			svc.state = state
+			svc.currentTradeStart = start
+			svc.currentTradeSOC = 50
+			powerW := 1000.0
+			if state == StateDischarging {
+				powerW = -powerW
+			}
+			svc.beginMeasuredTradeLocked(powerW)
+			svc.solarLastUpdate = start
+			svc.solarMeasuredChargePowerW = 1000
+			now = time.Date(2026, 9, 7, 0, 0, 1, 0, time.UTC)
+			svc.mu.Lock()
+			switch state {
+			case StateCharging:
+				svc.stopChargingLocked(context.Background(), 50)
+			case StateDischarging:
+				svc.stopDischargingLocked(context.Background(), 50)
+			case StateSolarCharging:
+				svc.stopSolarChargingLocked(context.Background(), 50, solarStopReasonSurplusGone)
+			}
+			svc.mu.Unlock()
+
+			reloaded := NewRecorder(svc.recorder.dataDir, cfg.BatteryEfficiency, time.UTC)
+			if err := reloaded.LoadTrades(); err != nil {
+				t.Fatal(err)
+			}
+			history := reloaded.GetHistory()
+			if len(history.Days) != 2 {
+				t.Fatalf("persisted days = %d, want both sides of midnight", len(history.Days))
+			}
+			for _, day := range history.Days {
+				seconds := 0.1
+				if day.Date == "2026-09-07" {
+					seconds = 1
+				}
+				got := day.ChargedKWh
+				if state == StateDischarging {
+					got = day.DischargedKWh
+				}
+				want := decimal.NewFromFloat(1000 * seconds / 3_600_000)
+				if got.Sub(want).Abs().GreaterThan(decimal.New(1, -9)) {
+					t.Errorf("day %s energy = %s, want %s", day.Date, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestSolarPriorityStopSettlesLatestBatteryPower(t *testing.T) {
+	for _, batteryFull := range []bool{true, false} {
+		t.Run(fmt.Sprintf("battery_full=%t", batteryFull), func(t *testing.T) {
+			now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+			battery := NewMockBattery(50)
+			if batteryFull {
+				battery.SOC = 99
+			}
+			battery.CurrentPower = 0
+			battery.DischargFlag = false
+			battery.IdleHook = func() { now = now.Add(10 * time.Second) }
+			svc := newTestServiceWithMeter(testConfig(), battery, NewMockMeter(true, 500), nil, now)
+			svc.nowFunc = func() time.Time { return now }
+			svc.state = StateSolarCharging
+			svc.currentTradeStart = now.Add(-time.Second)
+			svc.currentTradeSOC = 50
+			svc.solarLastUpdate = svc.currentTradeStart
+			svc.solarMeasuredChargePowerW = 500
+			svc.solarGridPowerW = 500
+			svc.solarChargePower = 500
+			if !batteryFull {
+				svc.currentPlan = &TradingPlan{
+					IsProfitable:     true,
+					DischargeWindows: []TimeWindow{{Start: now, End: now.Add(time.Hour)}},
+				}
+			}
+			svc.solarTick(context.Background())
+			history := svc.recorder.GetHistory()
+			if len(history.Days) != 1 || len(history.Days[0].Trades) != 1 {
+				t.Fatalf("completed solar session was lost: %+v", history)
+			}
+			trade := history.Days[0].Trades[0]
+			want := decimal.NewFromFloat(500.0 / 3_600_000)
+			if trade.EnergyKWh.Sub(want).Abs().GreaterThan(decimal.New(1, -9)) ||
+				trade.GridEnergyKWh.Sub(want).Abs().GreaterThan(decimal.New(1, -9)) {
+				t.Fatalf("battery/grid energy = %s/%s, want %s each", trade.EnergyKWh, trade.GridEnergyKWh, want)
+			}
+		})
+	}
+}
+
+func TestPriceRefreshExecutesFuturePurchaseAfterMissedCycle(t *testing.T) {
+	day := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+	cfg := testConfig()
+	cfg.MaxCyclesPerDay = 1
+	prices := make([]nordpool.Price, 96)
+	for i := range prices {
+		value := .20
+		switch {
+		case i < 8:
+			value = .05
+		case i < 16:
+			value = .50
+		case i >= 48 && i < 56:
+			value = .10
+		case i >= 56 && i < 64:
+			value = .30
+		}
+		prices[i] = nordpool.Price{Time: day.Add(time.Duration(i) * 15 * time.Minute), Value: value}
+	}
+	now := day.Add(10 * time.Hour)
+	battery := NewMockBattery(11)
+	svc := newTestService(cfg, battery, prices, now)
+	svc.recorder = NewRecorder(t.TempDir(), cfg.BatteryEfficiency, time.UTC)
+	svc.nowFunc = func() time.Time { return now }
+	svc.checkPriceFetch(context.Background())
+	now = day.Add(12 * time.Hour)
+	svc.tick(context.Background())
+	if svc.State() != StateCharging || len(battery.ChargeCalls) != 1 {
+		t.Fatalf("future purchase suppressed by expired cycle: state=%s calls=%v", svc.State(), battery.ChargeCalls)
+	}
+}
+
+func TestRecoveredDischargeLeavesFuturePurchaseExecutable(t *testing.T) {
+	base := time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC)
+	now := base.Add(30 * time.Minute)
+	cfg := testConfigSmallBattery()
+	cfg.MaxCyclesPerDay = 1
+	prices := makePrices(base, .05, .40, .20, .20, .10, .50)
+	battery := NewMockBattery(99)
+	svc := newTestService(cfg, battery, prices, now)
+	svc.recorder = NewRecorder(t.TempDir(), cfg.BatteryEfficiency, time.UTC)
+	svc.nowFunc = func() time.Time { return now }
+	svc.currentPlan = nil
+	svc.checkPriceFetch(context.Background())
+	svc.tick(context.Background())
+	if svc.State() != StateDischarging {
+		t.Fatalf("stored energy recovery did not start: %s", svc.State())
+	}
+	now = base.Add(45 * time.Minute)
+	battery.SOC = 11
+	svc.tick(context.Background())
+	now = base.Add(time.Hour)
+	svc.tick(context.Background())
+	if svc.State() != StateCharging || len(battery.ChargeCalls) != 1 {
+		t.Fatalf("recovery blocked subsequent purchase: state=%s calls=%v", svc.State(), battery.ChargeCalls)
+	}
+}
+
+func TestPriceRefreshCompletesPromotedLocalDayPrefix(t *testing.T) {
+	day := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+	values := make([]float64, 96)
+	for i := range values {
+		values[i] = .25
+	}
+	prices := makePrices(day, values...)
+	now := day.Add(15 * time.Minute)
+	svc := newTestService(testConfig(), NewMockBattery(50), makePrices(day.AddDate(0, 0, -1), values...), now)
+	svc.nowFunc = func() time.Time { return now }
+	svc.tomorrowPrices = prices[:88] // UTC's trailing two hours are published later.
+	svc.nordpool = &MockPriceProvider{TodayPrices: prices}
+	svc.checkPriceFetch(context.Background())
+	now = day.Add(23 * time.Hour)
+	status := svc.GetCurrentStatus(context.Background())
+	if !status.CurrentPriceKnown || status.CurrentPrice != .25 {
+		t.Fatalf("promoted prefix was not completed: %+v", status)
+	}
+}
+
+func TestPriceRefreshRetainsKnownSuffixAfterShorterPublication(t *testing.T) {
+	for _, tomorrow := range []bool{false, true} {
+		t.Run(fmt.Sprintf("tomorrow=%t", tomorrow), func(t *testing.T) {
+			day := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+			values := make([]float64, 96)
+			for i := range values {
+				values[i] = .25
+			}
+			prices := makePrices(day, values...)
+			prefix := append([]nordpool.Price(nil), prices[:88]...)
+			prefix[0].Value = .15
+			now := day
+			svc := newTestService(testConfig(), NewMockBattery(50), prices, now)
+			svc.nowFunc = func() time.Time { return now }
+			provider := &MockPriceProvider{TodayPrices: prefix, TomorrowPrices: prefix}
+			svc.nordpool = provider
+			var err error
+			if tomorrow {
+				svc.todayPrices = nil
+				svc.tomorrowPrices = prices
+				err = svc.fetchTomorrowPrices(context.Background())
+			} else {
+				err = svc.fetchTodayPrices(context.Background())
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status := svc.GetCurrentStatus(context.Background()); !status.CurrentPriceKnown || status.CurrentPrice != .15 {
+				t.Fatalf("updated prefix not applied: %+v", status)
+			}
+			now = day.Add(23 * time.Hour)
+			if status := svc.GetCurrentStatus(context.Background()); !status.CurrentPriceKnown || status.CurrentPrice != .25 {
+				t.Fatalf("previously published suffix was erased: %+v", status)
+			}
+		})
 	}
 }

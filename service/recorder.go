@@ -24,20 +24,34 @@ const (
 
 // Trade represents a single trade record.
 type Trade struct {
+	Timestamp          time.Time            `json:"timestamp"`
+	Action             TradeAction          `json:"action"`
+	PriceEUR           decimal.Decimal      `json:"price_eur"`            // EUR/kWh
+	PowerW             int                  `json:"power_w"`              // Watts
+	DurationS          int                  `json:"duration_s"`           // Seconds
+	EnergyKWh          decimal.Decimal      `json:"energy_kwh"`           // kWh battery input/output
+	GridEnergyKWh      decimal.Decimal      `json:"grid_energy_kwh"`      // Grid portion of a solar charge
+	GridCostEUR        decimal.Decimal      `json:"grid_cost_eur"`        // Interval-priced grid cost of a solar charge
+	GridUnpricedKWh    decimal.Decimal      `json:"grid_unpriced_kwh"`    // Grid portion without an available price
+	StartSOC           int                  `json:"start_soc"`            // SOC at start
+	EndSOC             int                  `json:"end_soc"`              // SOC at end
+	UnpricedKWh        decimal.Decimal      `json:"unpriced_kwh"`         // Battery energy without an interval price
+	OpportunityCostEUR decimal.Decimal      `json:"opportunity_cost_eur"` // Estimated value of solar energy not exported
+	EnergyBasis        string               `json:"energy_basis"`         // Method used to estimate EnergyKWh; blank for historic trades
+	DayAllocations     []TradeDayAllocation `json:"day_allocations,omitempty"`
+}
+
+// TradeDayAllocation preserves exact accounting when a session crosses a local day boundary.
+type TradeDayAllocation struct {
 	Timestamp          time.Time       `json:"timestamp"`
-	Action             TradeAction     `json:"action"`
-	PriceEUR           decimal.Decimal `json:"price_eur"`            // EUR/kWh
-	PowerW             int             `json:"power_w"`              // Watts
-	DurationS          int             `json:"duration_s"`           // Seconds
-	EnergyKWh          decimal.Decimal `json:"energy_kwh"`           // kWh battery input/output
-	GridEnergyKWh      decimal.Decimal `json:"grid_energy_kwh"`      // Grid portion of a solar charge
-	GridCostEUR        decimal.Decimal `json:"grid_cost_eur"`        // Interval-priced grid cost of a solar charge
-	GridUnpricedKWh    decimal.Decimal `json:"grid_unpriced_kwh"`    // Grid portion without an available price
-	StartSOC           int             `json:"start_soc"`            // SOC at start
-	EndSOC             int             `json:"end_soc"`              // SOC at end
-	UnpricedKWh        decimal.Decimal `json:"unpriced_kwh"`         // Battery energy without an interval price
-	OpportunityCostEUR decimal.Decimal `json:"opportunity_cost_eur"` // Estimated value of solar energy not exported
-	EnergyBasis        string          `json:"energy_basis"`         // Method used to estimate EnergyKWh; blank for historic trades
+	DurationS          int             `json:"duration_s"`
+	EnergyKWh          decimal.Decimal `json:"energy_kwh"`
+	GridEnergyKWh      decimal.Decimal `json:"grid_energy_kwh"`
+	GridCostEUR        decimal.Decimal `json:"grid_cost_eur"`
+	GridUnpricedKWh    decimal.Decimal `json:"grid_unpriced_kwh"`
+	UnpricedKWh        decimal.Decimal `json:"unpriced_kwh"`
+	OpportunityCostEUR decimal.Decimal `json:"opportunity_cost_eur"`
+	PricedValueEUR     decimal.Decimal `json:"priced_value_eur"`
 }
 
 // DailySummary contains the daily trading summary.
@@ -51,6 +65,7 @@ type DailySummary struct {
 	GridChargedKWh          decimal.Decimal `json:"grid_charged_kwh"`
 	UnpricedGridKWh         decimal.Decimal `json:"unpriced_grid_kwh"`
 	UnpricedKWh             decimal.Decimal `json:"unpriced_kwh"`
+	CashFlowUnpricedKWh     decimal.Decimal `json:"cash_flow_unpriced_kwh"`
 	SolarChargeCycles       int             `json:"solar_charge_cycles"`
 	SolarOpportunityCostEUR decimal.Decimal `json:"solar_opportunity_cost_eur"`
 	PnLEUR                  decimal.Decimal `json:"pnl_eur"` // Cash flow, not inventory-matched trading profit
@@ -72,13 +87,22 @@ type History struct {
 
 // Recorder records trades and calculates P&L.
 type Recorder struct {
-	mu             sync.Mutex
-	dataDir        string
-	persistenceErr error
-	efficiency     decimal.Decimal
-	trades         []Trade
-	loc            *time.Location
+	mu              sync.Mutex
+	dataDir         string
+	persistenceErr  error
+	efficiency      decimal.Decimal
+	trades          []Trade
+	tradesDirty     bool
+	loc             *time.Location
+	syncDirectoryFn func(string) error
+	mkdirAllFn      func(string, os.FileMode) error
+	pendingDirSyncs []string
 }
+
+const (
+	automaticCycleCommitmentFile = "automatic-cycle-commitment.json"
+	retiredDischargeWindowsFile  = "retired-discharge-windows.json"
+)
 
 // NewRecorder creates a new trade recorder.
 func NewRecorder(dataDir string, efficiency float64, loc *time.Location) *Recorder {
@@ -101,9 +125,102 @@ func (r *Recorder) RecordTrade(trade Trade) error {
 	if r.persistenceErr != nil {
 		return fmt.Errorf("trade persistence blocked after failed load: %w", r.persistenceErr)
 	}
+	if err := validateTradeDayAllocations(trade); err != nil {
+		return err
+	}
 
 	r.trades = append(r.trades, trade)
-	return r.saveTrades()
+	r.tradesDirty = true
+	if err := r.saveTrades(); err != nil {
+		return err
+	}
+	r.tradesDirty = false
+	return nil
+}
+
+func validateTradeDayAllocations(trade Trade) error {
+	if len(trade.DayAllocations) == 0 {
+		return nil
+	}
+	tradeEnd := trade.Timestamp.Add(time.Duration(trade.DurationS) * time.Second)
+	totalDurationS := 0
+	var previousAllocationEnd time.Time
+	var energy, gridEnergy, gridCost, gridUnpriced, unpriced, opportunityCost, pricedValue decimal.Decimal
+	for i, allocation := range trade.DayAllocations {
+		if allocation.Timestamp.IsZero() || (i > 0 && !allocation.Timestamp.After(trade.DayAllocations[i-1].Timestamp)) {
+			return fmt.Errorf("trade day allocations are not strictly chronological")
+		}
+		allocationEnd := allocation.Timestamp.Add(time.Duration(allocation.DurationS) * time.Second)
+		if allocation.DurationS <= 0 || allocation.Timestamp.Before(trade.Timestamp) || allocation.Timestamp.After(tradeEnd) || allocationEnd.After(tradeEnd) {
+			return fmt.Errorf("trade day allocation is outside the aggregate trade interval")
+		}
+		if i > 0 && allocation.Timestamp.Before(previousAllocationEnd) {
+			return fmt.Errorf("trade day allocations overlap")
+		}
+		previousAllocationEnd = allocationEnd
+		totalDurationS += allocation.DurationS
+		for name, value := range map[string]decimal.Decimal{
+			"energy": allocation.EnergyKWh, "grid energy": allocation.GridEnergyKWh,
+			"unpriced grid energy": allocation.GridUnpricedKWh, "unpriced energy": allocation.UnpricedKWh,
+		} {
+			if value.IsNegative() {
+				return fmt.Errorf("trade day allocation has negative %s", name)
+			}
+		}
+		energyComponentsInvalid := allocation.GridEnergyKWh.GreaterThan(allocation.EnergyKWh) ||
+			allocation.GridUnpricedKWh.GreaterThan(allocation.GridEnergyKWh) || allocation.UnpricedKWh.GreaterThan(allocation.EnergyKWh)
+		if trade.Action == ActionSolarCharge {
+			energyComponentsInvalid = energyComponentsInvalid || allocation.UnpricedKWh.GreaterThan(allocation.EnergyKWh.Sub(allocation.GridEnergyKWh))
+		}
+		if energyComponentsInvalid {
+			return fmt.Errorf("trade day allocation energy components are inconsistent")
+		}
+		energy = energy.Add(allocation.EnergyKWh)
+		gridEnergy = gridEnergy.Add(allocation.GridEnergyKWh)
+		gridCost = gridCost.Add(allocation.GridCostEUR)
+		gridUnpriced = gridUnpriced.Add(allocation.GridUnpricedKWh)
+		unpriced = unpriced.Add(allocation.UnpricedKWh)
+		opportunityCost = opportunityCost.Add(allocation.OpportunityCostEUR)
+		pricedValue = pricedValue.Add(allocation.PricedValueEUR)
+	}
+	if totalDurationS != trade.DurationS {
+		return fmt.Errorf("trade day allocation durations do not cover the aggregate trade interval")
+	}
+	closeEnough := func(a, b decimal.Decimal) bool {
+		return a.Sub(b).Abs().LessThanOrEqual(decimal.New(1, -9))
+	}
+	if !closeEnough(energy, trade.EnergyKWh) || !closeEnough(gridEnergy, trade.GridEnergyKWh) ||
+		!closeEnough(gridCost, trade.GridCostEUR) || !closeEnough(gridUnpriced, trade.GridUnpricedKWh) ||
+		!closeEnough(unpriced, trade.UnpricedKWh) || !closeEnough(opportunityCost, trade.OpportunityCostEUR) {
+		return fmt.Errorf("trade day allocations do not match aggregate accounting")
+	}
+	if trade.Action != ActionSolarCharge {
+		expectedValue := trade.PriceEUR.Mul(trade.EnergyKWh.Sub(trade.UnpricedKWh))
+		if !closeEnough(pricedValue, expectedValue) {
+			return fmt.Errorf("trade day allocation priced value does not match aggregate accounting")
+		}
+	} else if !pricedValue.IsZero() {
+		return fmt.Errorf("solar trade day allocation has scheduled-trade priced value")
+	}
+	return nil
+}
+
+// FlushTrades retries a previously failed trade-history write.
+func (r *Recorder) FlushTrades() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.persistenceErr != nil {
+		return fmt.Errorf("trade persistence blocked after failed load: %w", r.persistenceErr)
+	}
+	if !r.tradesDirty {
+		return nil
+	}
+	if err := r.saveTrades(); err != nil {
+		return err
+	}
+	r.tradesDirty = false
+	return nil
 }
 
 // GetHistory returns the full trading history grouped by local calendar day.
@@ -152,6 +269,7 @@ func (r *Recorder) GetHistory() History {
 		gridChargedKWh := decimal.Zero
 		unpricedGridKWh := decimal.Zero
 		unpricedKWh := decimal.Zero
+		cashFlowUnpricedKWh := decimal.Zero
 		solarOpportunityCostEUR := decimal.Zero
 		pricedChargeKWh := decimal.Zero
 		pricedDischargeKWh := decimal.Zero
@@ -171,6 +289,7 @@ func (r *Recorder) GetHistory() History {
 				chargedKWh = chargedKWh.Add(t.EnergyKWh)
 				gridChargedKWh = gridChargedKWh.Add(t.EnergyKWh)
 				unpricedKWh = unpricedKWh.Add(t.UnpricedKWh)
+				cashFlowUnpricedKWh = cashFlowUnpricedKWh.Add(t.UnpricedKWh)
 				chargeCost = chargeCost.Add(t.PriceEUR.Mul(pricedEnergyKWh))
 				pricedChargeKWh = pricedChargeKWh.Add(pricedEnergyKWh)
 				if pricedEnergyKWh.GreaterThan(decimal.Zero) {
@@ -189,6 +308,7 @@ func (r *Recorder) GetHistory() History {
 				gridChargedKWh = gridChargedKWh.Add(t.GridEnergyKWh)
 				unpricedGridKWh = unpricedGridKWh.Add(t.GridUnpricedKWh)
 				unpricedKWh = unpricedKWh.Add(t.UnpricedKWh).Add(t.GridUnpricedKWh)
+				cashFlowUnpricedKWh = cashFlowUnpricedKWh.Add(t.GridUnpricedKWh)
 				solarOpportunityCostEUR = solarOpportunityCostEUR.Add(t.OpportunityCostEUR)
 				chargeCost = chargeCost.Add(t.GridCostEUR)
 				pricedChargeKWh = pricedChargeKWh.Add(pricedGridKWh)
@@ -206,6 +326,7 @@ func (r *Recorder) GetHistory() History {
 				pricedEnergyKWh := t.EnergyKWh.Sub(t.UnpricedKWh)
 				dischargedKWh = dischargedKWh.Add(t.EnergyKWh)
 				unpricedKWh = unpricedKWh.Add(t.UnpricedKWh)
+				cashFlowUnpricedKWh = cashFlowUnpricedKWh.Add(t.UnpricedKWh)
 				dischargeRevenue = dischargeRevenue.Add(t.PriceEUR.Mul(pricedEnergyKWh))
 				pricedDischargeKWh = pricedDischargeKWh.Add(pricedEnergyKWh)
 				if pricedEnergyKWh.GreaterThan(decimal.Zero) {
@@ -242,6 +363,7 @@ func (r *Recorder) GetHistory() History {
 			GridChargedKWh:          gridChargedKWh,
 			UnpricedGridKWh:         unpricedGridKWh,
 			UnpricedKWh:             unpricedKWh,
+			CashFlowUnpricedKWh:     cashFlowUnpricedKWh,
 			SolarChargeCycles:       solarChargeCycles,
 			SolarOpportunityCostEUR: solarOpportunityCostEUR,
 			PnLEUR:                  pnl,
@@ -269,6 +391,32 @@ type tradeFragment struct {
 
 // splitTradeByLocalDay proportionally estimates each local-day share of an aggregate trade.
 func splitTradeByLocalDay(trade Trade, loc *time.Location) []tradeFragment {
+	if len(trade.DayAllocations) > 0 {
+		fragments := make([]tradeFragment, 0, len(trade.DayAllocations))
+		for i, allocation := range trade.DayAllocations {
+			fragment := trade
+			fragment.Timestamp = allocation.Timestamp
+			if i == 0 && localMidnight(trade.Timestamp.In(loc)).Equal(localMidnight(allocation.Timestamp.In(loc))) {
+				fragment.Timestamp = trade.Timestamp
+			}
+			fragment.DurationS = allocation.DurationS
+			fragment.EnergyKWh = allocation.EnergyKWh
+			fragment.GridEnergyKWh = allocation.GridEnergyKWh
+			fragment.GridCostEUR = allocation.GridCostEUR
+			fragment.GridUnpricedKWh = allocation.GridUnpricedKWh
+			fragment.UnpricedKWh = allocation.UnpricedKWh
+			fragment.OpportunityCostEUR = allocation.OpportunityCostEUR
+			fragment.DayAllocations = nil
+			pricedEnergyKWh := allocation.EnergyKWh.Sub(allocation.UnpricedKWh)
+			if trade.Action != ActionSolarCharge && pricedEnergyKWh.IsPositive() {
+				fragment.PriceEUR = allocation.PricedValueEUR.Div(pricedEnergyKWh)
+			} else if trade.Action != ActionSolarCharge {
+				fragment.PriceEUR = decimal.Zero
+			}
+			fragments = append(fragments, tradeFragment{trade: fragment, startsTrade: i == 0})
+		}
+		return fragments
+	}
 	if trade.DurationS <= 0 {
 		return []tradeFragment{{trade: trade, startsTrade: true}}
 	}
@@ -393,23 +541,26 @@ func (r *Recorder) GetLastChargeTrade() *Trade {
 // saveTrades persists trades to a JSON file atomically.
 func (r *Recorder) saveTrades() error {
 	if r.dataDir == "" {
-		return nil // No persistence configured
+		return nil
 	}
-
-	if err := os.MkdirAll(r.dataDir, 0o700); err != nil {
-		return fmt.Errorf("create data dir: %w", err)
-	}
-	if err := os.Chmod(r.dataDir, 0o700); err != nil {
-		return fmt.Errorf("protect data dir: %w", err)
-	}
-
-	path := filepath.Join(r.dataDir, "trades.json")
-	tmpPath := path + ".tmp"
-
 	data, err := json.MarshalIndent(r.trades, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal trades: %w", err)
 	}
+	return r.saveJSONFile("trades.json", data)
+}
+
+func (r *Recorder) saveJSONFile(name string, data []byte) error {
+	if r.dataDir == "" {
+		return nil // No persistence configured
+	}
+
+	if err := r.ensureDataDirectory(); err != nil {
+		return err
+	}
+
+	path := filepath.Join(r.dataDir, name)
+	tmpPath := path + ".tmp"
 
 	// Persist file contents before publishing the new snapshot.
 	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
@@ -434,14 +585,183 @@ func (r *Recorder) saveTrades() error {
 	// Atomic rename (on POSIX systems)
 	if err := os.Rename(tmpPath, path); err != nil {
 		os.Remove(tmpPath) // Clean up on failure
-		return fmt.Errorf("rename trades file: %w", err)
+		return fmt.Errorf("rename %s: %w", name, err)
 	}
 
-	dir, err := os.Open(r.dataDir)
+	return r.syncDirectory(r.dataDir)
+}
+
+func (r *Recorder) ensureDataDirectory() error {
+	if err := r.flushPendingDirectorySyncs(); err != nil {
+		return err
+	}
+
+	var missing []string
+	for path := filepath.Clean(r.dataDir); ; path = filepath.Dir(path) {
+		info, err := os.Stat(path)
+		if err == nil {
+			if !info.IsDir() {
+				return fmt.Errorf("create data dir: %s is not a directory", path)
+			}
+			break
+		}
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect data dir %s: %w", path, err)
+		}
+		missing = append(missing, path)
+		if parent := filepath.Dir(path); parent == path {
+			break
+		}
+	}
+	// Record every publication obligation before creation. MkdirAll may create
+	// only part of the tree before returning an error.
+	for i := len(missing) - 1; i >= 0; i-- {
+		r.pendingDirSyncs = append(r.pendingDirSyncs, filepath.Dir(missing[i]))
+	}
+	mkdirAll := os.MkdirAll
+	if r.mkdirAllFn != nil {
+		mkdirAll = r.mkdirAllFn
+	}
+	if err := mkdirAll(r.dataDir, 0o700); err != nil {
+		return fmt.Errorf("create data dir: %w", err)
+	}
+	if err := os.Chmod(r.dataDir, 0o700); err != nil {
+		return fmt.Errorf("protect data dir: %w", err)
+	}
+	return r.flushPendingDirectorySyncs()
+}
+
+// flushPendingDirectorySyncs publishes newly-created directory entries from
+// the shallowest parent down. The final file write syncs dataDir itself.
+func (r *Recorder) flushPendingDirectorySyncs() error {
+	for len(r.pendingDirSyncs) > 0 {
+		path := r.pendingDirSyncs[0]
+		if err := r.syncDirectory(path); err != nil {
+			// A failed MkdirAll may have queued a directory that it never created.
+			if errors.Is(err, os.ErrNotExist) {
+				r.pendingDirSyncs = r.pendingDirSyncs[1:]
+				continue
+			}
+			return fmt.Errorf("publish data directory through %s: %w", path, err)
+		}
+		r.pendingDirSyncs = r.pendingDirSyncs[1:]
+	}
+	return nil
+}
+
+func (r *Recorder) syncDirectory(path string) error {
+	if r.syncDirectoryFn != nil {
+		return r.syncDirectoryFn(path)
+	}
+	dir, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("open data directory for sync: %w", err)
+		return fmt.Errorf("open directory %s for sync: %w", path, err)
 	}
 	return errors.Join(dir.Sync(), dir.Close())
+}
+
+// SaveAutomaticCycleCommitment records the discharge pairing before a grid
+// charge command. Passing nil clears the commitment.
+func (r *Recorder) SaveAutomaticCycleCommitment(cycle *TradeCycle) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.dataDir == "" {
+		return nil
+	}
+	path := filepath.Join(r.dataDir, automaticCycleCommitmentFile)
+	if cycle == nil {
+		if err := r.ensureDataDirectory(); err != nil {
+			return fmt.Errorf("prepare automatic cycle commitment directory: %w", err)
+		}
+		err := os.Remove(path)
+		if os.IsNotExist(err) {
+			// A previous unlink may have succeeded before its directory sync failed.
+			// Retrying must sync the already-absent deletion before reporting success.
+			return r.syncDirectory(r.dataDir)
+		}
+		if err != nil {
+			return fmt.Errorf("clear automatic cycle commitment: %w", err)
+		}
+		return r.syncDirectory(r.dataDir)
+	}
+	data, err := json.MarshalIndent(cycle, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal automatic cycle commitment: %w", err)
+	}
+	return r.saveJSONFile(automaticCycleCommitmentFile, data)
+}
+
+// SaveRetiredDischargeWindows persists completed windows so restart cannot recreate them.
+func (r *Recorder) SaveRetiredDischargeWindows(windows []TimeWindow) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.dataDir == "" {
+		return nil
+	}
+	data, err := json.MarshalIndent(windows, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal retired discharge windows: %w", err)
+	}
+	return r.saveJSONFile(retiredDischargeWindowsFile, data)
+}
+
+// LoadRetiredDischargeWindows restores completed windows that must stay retired.
+func (r *Recorder) LoadRetiredDischargeWindows() ([]TimeWindow, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.dataDir == "" {
+		return nil, nil
+	}
+	path := filepath.Join(r.dataDir, retiredDischargeWindowsFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read retired discharge windows %s: %w", path, err)
+	}
+	var windows []TimeWindow
+	if err := json.Unmarshal(data, &windows); err != nil {
+		return nil, fmt.Errorf("unmarshal retired discharge windows %s: %w", path, err)
+	}
+	for _, window := range windows {
+		if !window.Start.Before(window.End) {
+			return nil, fmt.Errorf("retired discharge windows %s contains an invalid window", path)
+		}
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return nil, fmt.Errorf("protect retired discharge windows %s: %w", path, err)
+	}
+	return windows, nil
+}
+
+// LoadAutomaticCycleCommitment returns a previously persisted cycle, if any.
+func (r *Recorder) LoadAutomaticCycleCommitment() (*TradeCycle, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.dataDir == "" {
+		return nil, nil
+	}
+	path := filepath.Join(r.dataDir, automaticCycleCommitmentFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read automatic cycle commitment %s: %w", path, err)
+	}
+	var cycle TradeCycle
+	if err := json.Unmarshal(data, &cycle); err != nil {
+		return nil, fmt.Errorf("unmarshal automatic cycle commitment %s: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return nil, fmt.Errorf("protect automatic cycle commitment %s: %w", path, err)
+	}
+	return &cycle, nil
 }
 
 // LoadTrades loads trades from the JSON file.
@@ -451,15 +771,11 @@ func (r *Recorder) LoadTrades() error {
 
 	if r.dataDir == "" {
 		r.persistenceErr = nil
+		r.tradesDirty = false
 		return nil // No persistence configured
 	}
-	if err := os.MkdirAll(r.dataDir, 0o700); err != nil {
-		loadErr := fmt.Errorf("create data dir: %w", err)
-		r.persistenceErr = loadErr
-		return loadErr
-	}
-	if err := os.Chmod(r.dataDir, 0o700); err != nil {
-		loadErr := fmt.Errorf("protect data dir: %w", err)
+	if err := r.ensureDataDirectory(); err != nil {
+		loadErr := fmt.Errorf("prepare data dir: %w", err)
 		r.persistenceErr = loadErr
 		return loadErr
 	}
@@ -473,6 +789,7 @@ func (r *Recorder) LoadTrades() error {
 				return saveErr
 			}
 			r.persistenceErr = nil
+			r.tradesDirty = false
 			return nil
 		}
 		loadErr := fmt.Errorf("read trades file: %w", err)
@@ -486,6 +803,13 @@ func (r *Recorder) LoadTrades() error {
 		r.persistenceErr = loadErr
 		return loadErr
 	}
+	for i, trade := range trades {
+		if err := validateTradeDayAllocations(trade); err != nil {
+			loadErr := fmt.Errorf("validate trade %d: %w", i, err)
+			r.persistenceErr = loadErr
+			return loadErr
+		}
+	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		loadErr := fmt.Errorf("protect trades file: %w", err)
 		r.persistenceErr = loadErr
@@ -494,5 +818,6 @@ func (r *Recorder) LoadTrades() error {
 
 	r.trades = trades
 	r.persistenceErr = nil
+	r.tradesDirty = false
 	return nil
 }

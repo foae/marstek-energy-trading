@@ -61,22 +61,24 @@ const (
 )
 
 const (
-	batteryStartVerificationTimeout  = 10 * time.Second
-	batteryStartVerificationInterval = time.Second
-	batteryActivePowerThresholdW     = 50.0
-	batteryControlFailureCooldown    = 5 * time.Minute
-	batteryLinkDownCooldown          = 30 * time.Minute
-	batteryShutdownTimeout           = 60 * time.Second
-	batteryShutdownAttemptTimeout    = 30 * time.Second
-	batteryStopRetryInterval         = 5 * time.Second
+	batteryStartVerificationTimeout   = 10 * time.Second
+	batteryStartVerificationInterval  = time.Second
+	batteryActivePowerThresholdW      = 50.0
+	batteryControlFailureCooldown     = 5 * time.Minute
+	batteryLinkDownCooldown           = 30 * time.Minute
+	batteryShutdownTimeout            = 60 * time.Second
+	batteryShutdownAttemptTimeout     = 30 * time.Second
+	batteryStopRetryInterval          = 5 * time.Second
+	minimumAutomaticControlWindow     = time.Minute
+	dailySummaryRetryCooldown         = 15 * time.Minute
+	automaticCycleCommitmentMaxFuture = 72 * time.Hour
 	// A dead RS485 link fails the stop command instantly, so the normal 5s retry
-	// would spin. Writes are provably dropped, so nothing is running to stop.
+	// would spin while the bridge restart path attempts recovery.
 	batteryLinkDownStopRetryInterval = 5 * time.Minute
 	// A wedged RS485 link only recovers with an ESP32 reboot; don't reboot in a loop.
 	bridgeRestartMinInterval       = 10 * time.Minute
 	bridgeRebootGrace              = time.Minute // ESP32 is unreachable for ~30 s after a restart
 	linkDownNotifyInterval         = 15 * time.Minute
-	statusBatteryTimeout           = 5 * time.Second
 	solarTelemetryFailureThreshold = 10 * time.Second
 	solarStatusFallbackTimeout     = 3 * time.Second
 )
@@ -94,43 +96,56 @@ type Service struct {
 	loc      *time.Location   // timezone location
 	nowFunc  func() time.Time // clock function for testing
 
-	mu                          sync.RWMutex
-	errorNotifyMu               sync.Mutex
-	linkDownNotifyMu            sync.Mutex
-	state                       State
-	currentPlan                 *TradingPlan
-	pendingPlan                 *TradingPlan // plan fetched while an automatic cycle is still committed
-	todayPrices                 []nordpool.Price
-	tomorrowPrices              []nordpool.Price
-	lastPassiveRefresh          time.Time
-	currentTradeStart           time.Time
-	currentTradeSOC             int
-	currentTradeLastSOC         int
-	currentTradePowerW          int
-	currentTradeLastPowerW      float64
-	currentTradeLastUpdate      time.Time
-	currentTradeEnergyWs        float64
-	currentTradePricedEnergyWs  float64
-	currentTradeUnpricedWs      float64
-	currentTradeCostEUR         decimal.Decimal
-	currentTradePrices          []nordpool.Price
-	lastChargePrice             decimal.Decimal // informational price of the most recent grid charge
-	observedChargePowerW        float64
-	manualOverrideUntil         time.Time
-	lastErrorNotify             time.Time     // rate limit error notifications
-	lastMidnightSwap            time.Time     // track last midnight price swap to avoid repeated fetches
-	lastDailySummary            time.Time     // track last midnight price of a successfully sent summary
-	batteryCooldownUntil        time.Time     // suppress command retries after the battery ignores a command
-	batteryVerificationTimeout  time.Duration // test override for battery start verification timeout
-	batteryVerificationInterval time.Duration // test override for battery start verification polling
-	batteryStopRetryDelay       time.Duration // test override for failed-stop retry delay
-	lastStopAttempt             time.Time     // throttle retries when a stop command fails
-	lastStopLinkDown            bool          // last stop failure was a dead RS485 link; back off harder
-	stopPending                 bool          // irreversible intent until a confirmed stop
-	pendingSolarStopReason      solarStopReason
-	linkDownSince               time.Time // first detection of a frozen RS485 link during an active session
-	lastLinkDownNotify          time.Time // rate limit link-down notifications (own limiter)
-	lastBridgeRestart           time.Time // rate limit ESPHome bridge restarts
+	mu                           sync.RWMutex
+	errorNotifyMu                sync.Mutex
+	linkDownNotifyMu             sync.Mutex
+	state                        State
+	currentPlan                  *TradingPlan
+	pendingPlan                  *TradingPlan // plan fetched while an automatic cycle is still committed
+	automaticCycleCommit         *TradeCycle  // persisted discharge pairing for grid energy already purchased
+	automaticCycleCommitDurable  bool         // the current grid pairing is confirmed published and synced
+	automaticCycleCleanupPending bool         // record must be cleared and cannot authorize further control
+	solarCycleRetention          *TradeCycle  // live discharge pairing for solar energy admitted against a cycle
+	todayPrices                  []nordpool.Price
+	tomorrowPrices               []nordpool.Price
+	lastPassiveRefresh           time.Time
+	currentTradeStart            time.Time
+	currentTradeSOC              int
+	currentTradeLastSOC          int
+	currentTradePowerW           int
+	currentTradeLastPowerW       float64
+	currentTradeLastUpdate       time.Time
+	currentTradeEnergyWs         float64
+	currentTradePricedEnergyWs   float64
+	currentTradeUnpricedWs       float64
+	currentTradeCostEUR          decimal.Decimal
+	currentTradePrices           []nordpool.Price
+	currentTradeDayAllocations   []TradeDayAllocation
+	lastChargePrice              decimal.Decimal // informational price of the most recent grid charge
+	observedChargePowerW         float64
+	manualOverrideUntil          time.Time
+	lastErrorNotify              time.Time     // rate limit error notifications
+	lastEconomicSkipSlot         time.Time     // rate limit expected-profit skip decisions to one per tariff slot
+	lastUnpricedDischargeSlot    time.Time     // rate limit retained-discharge tariff warnings to one per slot
+	lastCommitmentClearWarning   time.Time     // rate limit persistent cleanup warnings
+	lastCommitmentPersistError   time.Time     // rate limit persistent save errors
+	lastTelegramPollWarning      time.Time     // rate limit command-poll warnings independently of battery alerts
+	lastDailySummary             time.Time     // track last midnight price of a successfully sent summary
+	nextDailySummaryAttempt      time.Time     // back off failed sends after the immediate midnight recovery attempt
+	batteryCooldownUntil         time.Time     // suppress command retries after the battery ignores a command
+	batteryVerificationTimeout   time.Duration // test override for battery start verification timeout
+	batteryVerificationInterval  time.Duration // test override for battery start verification polling
+	batteryStopRetryDelay        time.Duration // test override for failed-stop retry delay
+	batteryShutdownTimeout       time.Duration // test override for graceful shutdown deadline
+	lastStopAttempt              time.Time     // throttle retries when a stop command fails
+	lastStopLinkDown             bool          // last stop failure was a dead RS485 link; back off harder
+	stopPending                  bool          // irreversible intent until a confirmed stop
+	pendingSolarStopReason       solarStopReason
+	linkDownSince                time.Time // first detection of a frozen RS485 link during an active session
+	lastLinkDownNotify           time.Time // rate limit link-down notifications (own limiter)
+	lastBridgeRestart            time.Time // rate limit ESPHome bridge restarts
+	retiredDischargeWindows      []TimeWindow
+	retiredDischargeWindowsDirty bool
 
 	// Battery telemetry is sampled only by the serialized control loop. Status
 	// readers expose this cache together with its observation time.
@@ -152,7 +167,7 @@ type Service struct {
 	solarGridUnpricedWs           float64
 	solarOpportunityCostEUR       decimal.Decimal
 	solarOpportunityUnpricedWs    float64
-	solarControlFailed            bool
+	solarDayAllocations           []TradeDayAllocation
 	solarLastUpdate               time.Time // last time solar energy was accumulated
 	solarCooldownUntil            time.Time // no new session may start before this time
 	solarSurplusEMA               float64   // exponentially weighted moving average of surplus
@@ -324,7 +339,50 @@ func (s *Service) beginMeasuredTradeLocked(measuredPowerW float64) {
 	s.currentTradeUnpricedWs = 0
 	s.currentTradeCostEUR = decimal.Zero
 	s.currentTradePrices = nil
+	s.currentTradeDayAllocations = nil
 	s.snapshotSessionPricesLocked()
+}
+
+func (s *Service) tradeDayAllocationLocked(allocations *[]TradeDayAllocation, at time.Time) *TradeDayAllocation {
+	day := localMidnight(at.In(s.loc))
+	if n := len(*allocations); n > 0 && localMidnight((*allocations)[n-1].Timestamp.In(s.loc)).Equal(day) {
+		return &(*allocations)[n-1]
+	}
+	*allocations = append(*allocations, TradeDayAllocation{Timestamp: at})
+	return &(*allocations)[len(*allocations)-1]
+}
+
+func completeTradeDayAllocations(allocations []TradeDayAllocation, start time.Time, durationS int, loc *time.Location) []TradeDayAllocation {
+	if durationS <= 0 {
+		return nil
+	}
+	byDay := make(map[string]TradeDayAllocation, len(allocations))
+	for _, allocation := range allocations {
+		byDay[allocation.Timestamp.In(loc).Format("2006-01-02")] = allocation
+	}
+
+	end := start.Add(time.Duration(durationS) * time.Second)
+	cursor := start
+	allocatedDurationS := 0
+	completed := make([]TradeDayAllocation, 0, len(allocations)+1)
+	for cursor.Before(end) {
+		dayEnd := localMidnight(cursor.In(loc)).AddDate(0, 0, 1)
+		fragmentEnd := end
+		if dayEnd.Before(end) {
+			fragmentEnd = dayEnd
+		}
+		fragmentDurationS := int(fragmentEnd.Sub(cursor).Seconds())
+		if fragmentEnd.Equal(end) {
+			fragmentDurationS = durationS - allocatedDurationS
+		}
+		allocation := byDay[cursor.In(loc).Format("2006-01-02")]
+		allocation.Timestamp = cursor
+		allocation.DurationS = fragmentDurationS
+		completed = append(completed, allocation)
+		allocatedDurationS += fragmentDurationS
+		cursor = fragmentEnd
+	}
+	return completed
 }
 
 func (s *Service) accumulateMeasuredTradeEnergyLocked(measuredPowerW float64) {
@@ -355,15 +413,23 @@ func (s *Service) accumulateMeasuredTradeEnergyAtLocked(measuredPowerW float64, 
 	s.snapshotSessionPricesLocked()
 	for cursor := s.currentTradeLastUpdate; cursor.Before(at); {
 		price, end, known := s.sessionPriceAtLocked(cursor, at)
+		if dayEnd := localMidnight(cursor.In(s.loc)).AddDate(0, 0, 1); dayEnd.Before(end) {
+			end = dayEnd
+		}
 		ws := powerW * end.Sub(cursor).Seconds()
+		energyKWh := decimal.NewFromFloat(ws / 3_600_000)
+		allocation := s.tradeDayAllocationLocked(&s.currentTradeDayAllocations, cursor)
+		allocation.DurationS += int(end.Sub(cursor).Seconds())
+		allocation.EnergyKWh = allocation.EnergyKWh.Add(energyKWh)
 		s.currentTradeEnergyWs += ws
 		if known {
 			s.currentTradePricedEnergyWs += ws
-			s.currentTradeCostEUR = s.currentTradeCostEUR.Add(
-				price.Mul(decimal.NewFromFloat(ws / 3_600_000)),
-			)
+			value := price.Mul(energyKWh)
+			s.currentTradeCostEUR = s.currentTradeCostEUR.Add(value)
+			allocation.PricedValueEUR = allocation.PricedValueEUR.Add(value)
 		} else {
 			s.currentTradeUnpricedWs += ws
+			allocation.UnpricedKWh = allocation.UnpricedKWh.Add(energyKWh)
 		}
 		cursor = end
 	}
@@ -389,23 +455,50 @@ func (s *Service) Start(ctx context.Context) error {
 		if connectErr := s.battery.Connect(); connectErr != nil {
 			return fmt.Errorf("load trades: %w; connect battery for safe idle: %v", err, connectErr)
 		}
-		if idleErr := s.battery.IdleContext(ctx); idleErr != nil {
+		if idleErr := s.idleBattery(ctx); idleErr != nil {
 			return fmt.Errorf("load trades: %w; set battery idle: %v", err, idleErr)
 		}
 		return err
 	}
+	retiredWindows, err := s.recorder.LoadRetiredDischargeWindows()
+	if err != nil {
+		slog.Error("failed to load retired discharge windows; refusing to trade", "error", err)
+		if connectErr := s.battery.Connect(); connectErr != nil {
+			return fmt.Errorf("load retired discharge windows: %w; connect battery for safe idle: %v", err, connectErr)
+		}
+		if idleErr := s.idleBattery(ctx); idleErr != nil {
+			return fmt.Errorf("load retired discharge windows: %w; set battery idle: %v", err, idleErr)
+		}
+		return err
+	}
+	s.mu.Lock()
+	s.retiredDischargeWindows = retiredWindows
+	s.retiredDischargeWindowsDirty = false
+	s.mu.Unlock()
 
 	// Restore the last charge price for informational status and logging only.
 	if lastCharge := s.recorder.GetLastChargeTrade(); lastCharge != nil {
+		s.mu.Lock()
 		s.lastChargePrice = lastCharge.PriceEUR
-		slog.Info("restored informational last charge price", "price", s.lastChargePrice)
+		s.mu.Unlock()
+		slog.Info("restored informational last charge price", "price", lastCharge.PriceEUR)
+	}
+	if err := s.restoreAutomaticCycleCommitment(); err != nil {
+		slog.Error("failed to restore automatic cycle commitment; refusing to trade", "error", err)
+		if connectErr := s.battery.Connect(); connectErr != nil {
+			return fmt.Errorf("restore automatic cycle commitment: %w; connect battery for safe idle: %v", err, connectErr)
+		}
+		if idleErr := s.idleBattery(ctx); idleErr != nil {
+			return fmt.Errorf("restore automatic cycle commitment: %w; set battery idle: %v", err, idleErr)
+		}
+		return err
 	}
 
 	// Connect to battery
 	if err := s.battery.Connect(); err != nil {
 		return err
 	}
-	if err := s.battery.IdleContext(ctx); err != nil {
+	if err := s.idleBattery(ctx); err != nil {
 		s.mu.Lock()
 		s.state = StateStopping
 		s.lastStopAttempt = s.now()
@@ -438,9 +531,12 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 	}
 
-	// Start main loop
+	// Start main loop. The boundary timer forces an immediate control-loop
+	// re-evaluation at every 15-minute tariff boundary.
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
+	priceBoundaryTimer := time.NewTimer(durationUntilNextPriceBoundary(s.now()))
+	defer priceBoundaryTimer.Stop()
 
 	// Price fetch ticker (check every 15 minutes, fetch at 13:00)
 	priceTicker := time.NewTicker(15 * time.Minute)
@@ -466,14 +562,17 @@ func (s *Service) Start(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			slog.Info("stopping trading service")
-			if err := s.stopBatteryOnShutdown(); err != nil {
-				slog.Error("failed to stop battery during shutdown", "error", err)
-				return fmt.Errorf("stop battery during shutdown: %w", err)
+			if err := s.shutdown(); err != nil {
+				return err
 			}
 			return ctx.Err()
 
 		case <-ticker.C:
 			s.tick(ctx)
+
+		case <-priceBoundaryTimer.C:
+			s.tick(ctx)
+			priceBoundaryTimer.Reset(durationUntilNextPriceBoundary(s.now()))
 
 		case <-priceTicker.C:
 			s.checkPriceFetch(ctx)
@@ -490,17 +589,22 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 }
 
-// tick is called every minute to evaluate trading decisions.
+func durationUntilNextPriceBoundary(now time.Time) time.Duration {
+	return now.Truncate(15 * time.Minute).Add(15 * time.Minute).Sub(now)
+}
+
+// tick evaluates trading decisions every minute and at exact tariff boundaries.
 func (s *Service) tick(ctx context.Context) {
-	now := s.now()
 	if s.retryStopping(ctx) {
 		return
 	}
+	s.retryTradePersistence(ctx)
 
 	// Get battery telemetry OUTSIDE the lock (network I/O).
 	batStatus, err := s.battery.GetBatteryStatusContext(ctx)
 	if err != nil {
 		s.mu.Lock()
+		s.batteryTelemetryAvailable = false
 		switch s.state {
 		case StateCharging:
 			s.stopChargingLocked(ctx, s.currentTradeLastSOC)
@@ -528,6 +632,7 @@ func (s *Service) tick(ctx context.Context) {
 			s.accumulateMeasuredTradeEnergyLocked(measuredPowerW)
 		}
 	} else {
+		s.batteryTelemetryAvailable = false
 		switch s.state {
 		case StateCharging:
 			s.stopChargingLocked(ctx, batStatus.SOC)
@@ -553,11 +658,17 @@ func (s *Service) tick(ctx context.Context) {
 	if activeSession {
 		s.checkLinkDuringSession(ctx)
 	}
+	// Network reads can cross a tariff boundary. Take the decision timestamp only
+	// after they finish so an expired price cannot start or refresh a command.
+	now := s.now()
 
 	// Now lock for state access and updates.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.currentTradeLastSOC = batStatus.SOC
+	if s.state != StateCharging && s.state != StateDischarging {
+		s.clearExpiredAutomaticCycleCommitmentLocked(ctx, now)
+	}
 
 	// Create contextual logger for this tick
 	l := slog.With(
@@ -606,25 +717,41 @@ func (s *Service) tick(ctx context.Context) {
 		return
 	}
 
-	// Get current price
+	// Resolve the control window before the live price. A retained discharge is
+	// an obligation even when the corresponding tariff sample is unavailable.
+	dischargeWindow, inDischargeWindow := s.dischargeWindowAtLocked(now)
 	currentPrice, ok := s.currentPriceLocked(now)
 	if !ok {
-		l.Warn("no price for current time slot")
-		switch s.state {
-		case StateCharging:
-			s.stopChargingLocked(ctx, batStatus.SOC)
-		case StateDischarging:
-			s.stopDischargingLocked(ctx, batStatus.SOC)
+		retainedDischarge := inDischargeWindow &&
+			(s.automaticCycleCommit != nil || s.solarCycleRetention != nil)
+		if retainedDischarge {
+			currentPrice = dischargeWindow.Price
+			slot := now.Truncate(15 * time.Minute)
+			if !slot.Equal(s.lastUnpricedDischargeSlot) {
+				s.lastUnpricedDischargeSlot = slot
+				l.Warn("current tariff unavailable; honoring retained discharge obligation as unpriced energy")
+			}
+		} else {
+			l.Warn("no price for current time slot")
+			switch s.state {
+			case StateCharging:
+				s.stopChargingLocked(ctx, batStatus.SOC)
+			case StateDischarging:
+				s.stopDischargingLocked(ctx, batStatus.SOC)
+			}
+			return
 		}
-		return
 	}
 
-	// Enrich logger with price context
-	l = l.With("price_eur_kwh", currentPrice)
+	if ok {
+		l = l.With("price_eur_kwh", currentPrice, "price_known", true)
+	} else {
+		l = l.With("planned_discharge_price_eur_kwh", currentPrice, "price_known", false)
+	}
 
 	// Decide action based on current time window
-	inChargeWindow := s.gridReservedLocked(now, batStatus.SOC)
-	inDischargeWindow := s.currentPlan.IsInDischargeWindow(now)
+	reservation := s.chargeReservationLocked(now, batStatus.SOC)
+	inChargeWindow := reservation.contains(now)
 
 	switch s.state {
 	case StateIdle:
@@ -652,7 +779,14 @@ func (s *Service) tick(ctx context.Context) {
 				l.Info("decision: start discharging",
 					"last_charge_price", lastChargeF,
 					"max_price", s.currentPlan.MaxPrice)
-				s.startDischargingLocked(ctx, currentPrice, batStatus.SOC, s.cfg.DischargePowerW, StateDischarging)
+				s.startDischargingLocked(ctx, currentPrice, ok, batStatus.SOC, s.cfg.DischargePowerW, StateDischarging)
+			}
+		} else if reservation.currentPriceTooHigh && !reservation.Feasible {
+			slot := now.Truncate(15 * time.Minute)
+			if !slot.Equal(s.lastEconomicSkipSlot) {
+				s.lastEconomicSkipSlot = slot
+				l.Info("decision: skip charging - expected profit below configured minimum",
+					"max_charge_price_eur_kwh", reservation.maxChargePrice)
 			}
 		}
 
@@ -675,19 +809,40 @@ func (s *Service) tick(ctx context.Context) {
 				return
 			}
 			if batStatus.SOC > minSOC && batStatus.DischargFlag {
-				s.startDischargingLocked(ctx, currentPrice, batStatus.SOC, s.cfg.DischargePowerW, StateDischarging)
+				s.startDischargingLocked(ctx, currentPrice, ok, batStatus.SOC, s.cfg.DischargePowerW, StateDischarging)
 			}
 		}
 
 	case StateCharging:
-		if !inChargeWindow {
-			l.Info("decision: stop charging - left charge window")
-			s.stopChargingLocked(ctx, batStatus.SOC)
-		} else if batStatus.SOC >= 100 {
+		if batStatus.SOC >= 100 {
 			l.Info("decision: stop charging - battery full")
 			s.stopChargingLocked(ctx, batStatus.SOC)
+		} else if !inChargeWindow {
+			if reservation.currentPriceTooHigh {
+				l.Info("decision: stop charging - expected profit below configured minimum",
+					"max_charge_price_eur_kwh", reservation.maxChargePrice)
+			} else {
+				l.Info("decision: stop charging - left reserved charge window")
+			}
+			s.stopChargingLocked(ctx, batStatus.SOC)
 		} else {
-			if !s.refreshPassiveModeLocked(ctx, -s.cfg.ChargePowerW) {
+			chargeWindow, _ := reservation.windowAt(now)
+			if chargeWindow.End.Sub(now) <= minimumAutomaticControlWindow {
+				if !chargeWindow.End.Equal(chargeWindow.End.Truncate(15 * time.Minute)) {
+					l.Info("decision: stop charging - truncated reservation ending before next control tick", "reservation_end", chargeWindow.End)
+					s.stopChargingLocked(ctx, batStatus.SOC)
+				} else {
+					l.Debug("skipping charge refresh near tariff boundary", "reservation_end", chargeWindow.End)
+				}
+				return
+			}
+			refreshCtx, cancelRefresh := context.WithTimeout(ctx, chargeWindow.End.Sub(now))
+			refreshed := s.refreshPassiveModeLocked(refreshCtx, -s.cfg.ChargePowerW)
+			cancelRefresh()
+			if !refreshed {
+				s.stopChargingLocked(ctx, batStatus.SOC)
+			} else if !s.gridReservedLocked(s.now(), batStatus.SOC) {
+				l.Info("decision: stop charging - reservation expired during refresh")
 				s.stopChargingLocked(ctx, batStatus.SOC)
 			}
 		}
@@ -701,7 +856,17 @@ func (s *Service) tick(ctx context.Context) {
 			l.Info("decision: stop discharging - battery at min SOC", "min_soc", minSOC)
 			s.stopDischargingLocked(ctx, batStatus.SOC)
 		} else {
-			if !s.refreshPassiveModeLocked(ctx, s.cfg.DischargePowerW) {
+			if dischargeWindow.End.Sub(now) <= minimumAutomaticControlWindow {
+				l.Debug("skipping discharge refresh near window end", "window_end", dischargeWindow.End)
+				return
+			}
+			refreshCtx, cancelRefresh := context.WithTimeout(ctx, dischargeWindow.End.Sub(now))
+			refreshed := s.refreshPassiveModeLocked(refreshCtx, s.cfg.DischargePowerW)
+			cancelRefresh()
+			if !refreshed {
+				s.stopDischargingLocked(ctx, batStatus.SOC)
+			} else if _, active := s.dischargeWindowAtLocked(s.now()); !active {
+				l.Info("decision: stop discharging - discharge window expired during refresh")
 				s.stopDischargingLocked(ctx, batStatus.SOC)
 			}
 		}
@@ -727,15 +892,29 @@ func (s *Service) accumulateSolarEnergyAtLocked(measuredChargePowerW float64, at
 		s.snapshotSessionPricesLocked()
 		for cursor := s.solarLastUpdate; cursor.Before(at); {
 			price, end, known := s.sessionPriceAtLocked(cursor, at)
+			if dayEnd := localMidnight(cursor.In(s.loc)).AddDate(0, 0, 1); dayEnd.Before(end) {
+				end = dayEnd
+			}
 			intervalSeconds := end.Sub(cursor).Seconds()
+			energyKWh := decimal.NewFromFloat(s.solarMeasuredChargePowerW * intervalSeconds / 3_600_000)
 			gridEnergyKWh := decimal.NewFromFloat(gridPowerW * intervalSeconds / 3_600_000)
 			solarEnergyKWh := decimal.NewFromFloat(solarPowerW * intervalSeconds / 3_600_000)
+			allocation := s.tradeDayAllocationLocked(&s.solarDayAllocations, cursor)
+			allocation.DurationS += int(intervalSeconds)
+			allocation.EnergyKWh = allocation.EnergyKWh.Add(energyKWh)
+			allocation.GridEnergyKWh = allocation.GridEnergyKWh.Add(gridEnergyKWh)
 			if known {
-				s.solarGridCostEUR = s.solarGridCostEUR.Add(price.Mul(gridEnergyKWh))
-				s.solarOpportunityCostEUR = s.solarOpportunityCostEUR.Add(price.Mul(solarEnergyKWh))
+				gridCost := price.Mul(gridEnergyKWh)
+				opportunityCost := price.Mul(solarEnergyKWh)
+				s.solarGridCostEUR = s.solarGridCostEUR.Add(gridCost)
+				s.solarOpportunityCostEUR = s.solarOpportunityCostEUR.Add(opportunityCost)
+				allocation.GridCostEUR = allocation.GridCostEUR.Add(gridCost)
+				allocation.OpportunityCostEUR = allocation.OpportunityCostEUR.Add(opportunityCost)
 			} else {
 				s.solarGridUnpricedWs += gridPowerW * intervalSeconds
 				s.solarOpportunityUnpricedWs += solarPowerW * intervalSeconds
+				allocation.GridUnpricedKWh = allocation.GridUnpricedKWh.Add(gridEnergyKWh)
+				allocation.UnpricedKWh = allocation.UnpricedKWh.Add(solarEnergyKWh)
 			}
 			cursor = end
 		}
@@ -759,6 +938,9 @@ func (s *Service) solarTick(ctx context.Context) {
 	// Battery protection and scheduled priority must not depend on P1 availability.
 	esStatus, err := s.battery.GetESStatus(ctx)
 	if err != nil {
+		s.mu.Lock()
+		s.batteryTelemetryAvailable = false
+		s.mu.Unlock()
 		s.handleSolarStatusFailure(ctx, err)
 		return
 	}
@@ -768,7 +950,6 @@ func (s *Service) solarTick(ctx context.Context) {
 	s.currentTradeLastSOC = batterySOC
 	s.cacheBatteryTelemetryLocked(batterySOC, esStatus.BatteryPower)
 	if s.state == StateSolarCharging {
-		s.solarGridPowerW = min(s.solarGridPowerW, measuredChargePowerW)
 		if batterySOC >= solarChargeUpperSOC {
 			s.solarUpperSOCHold = true
 			s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonBatteryFull)
@@ -776,9 +957,8 @@ func (s *Service) solarTick(ctx context.Context) {
 			return
 		}
 		now := s.now()
-		if s.gridReservedLocked(now, batterySOC) ||
-			(s.currentPlan != nil && s.currentPlan.IsInDischargeWindow(now)) ||
-			!s.solarEconomicalLocked(now, batterySOC) {
+		if s.solarBlockedLocked(now, batterySOC) {
+			s.accumulateSolarEnergyLocked(measuredChargePowerW)
 			s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonYieldWindow)
 			s.mu.Unlock()
 			s.tick(ctx)
@@ -804,6 +984,21 @@ func (s *Service) solarTick(ctx context.Context) {
 		s.solarSurplusSince = time.Time{}
 	}
 	s.solarLastSampleAt = now
+	if s.state == StateSolarCharging && s.solarBlockedLocked(now, batterySOC) {
+		s.accumulateSolarEnergyLocked(measuredChargePowerW)
+		s.solarGridPowerW = min(max(activePowerW, 0), measuredChargePowerW)
+		s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonYieldWindow)
+		s.mu.Unlock()
+		s.tick(ctx)
+		s.mu.Lock()
+		return
+	}
+	if s.state == StateSolarCharging && s.automaticCycleCommit == nil && s.solarCycleRetention == nil {
+		reservation := s.chargeReservationLocked(now, batterySOC)
+		if retainedCycle := s.cycleForSolarRetentionLocked(now, reservation); retainedCycle != nil {
+			s.solarCycleRetention = retainedCycle
+		}
+	}
 
 	switch s.state {
 	case StateIdle:
@@ -840,9 +1035,7 @@ func (s *Service) solarTick(ctx context.Context) {
 
 		// Yield to reserved grid charging, planned discharge, or a cheaper
 		// reserved grid slot that solar can no longer economically replace.
-		if s.gridReservedLocked(now, batterySOC) ||
-			(s.currentPlan != nil && s.currentPlan.IsInDischargeWindow(now)) ||
-			!s.solarEconomicalLocked(now, batterySOC) {
+		if s.solarBlockedLocked(now, batterySOC) {
 			s.solarSurplusSince = time.Time{}
 			return
 		}
@@ -926,16 +1119,23 @@ func (s *Service) solarTick(ctx context.Context) {
 
 			if err != nil {
 				slog.Warn("solar charging: failed to adjust power", "error", err)
-				s.solarControlFailed = true
 				s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonControlFailure)
 			} else {
 				s.solarChargePower = targetPower
-				s.lastPassiveRefresh = s.now()
+				if s.solarBlockedLocked(s.now(), batterySOC) {
+					slog.Info("solar charging: stopping after eligibility changed during power adjustment")
+					s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonYieldWindow)
+				} else {
+					s.lastPassiveRefresh = s.now()
+				}
 			}
 		} else {
 			// Refresh passive mode to prevent timeout
 			if !s.refreshPassiveModeLocked(ctx, -s.solarChargePower) {
 				s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonControlFailure)
+			} else if s.solarBlockedLocked(s.now(), batterySOC) {
+				slog.Info("solar charging: stopping after eligibility changed during refresh")
+				s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonYieldWindow)
 			}
 		}
 
@@ -982,7 +1182,7 @@ func (s *Service) handleSolarStatusFailure(ctx context.Context, telemetryErr err
 		return
 	}
 
-	endSOC := s.currentTradeSOC
+	endSOC := s.currentTradeLastSOC
 	s.mu.Unlock()
 	statusCtx, cancel := context.WithTimeout(ctx, solarStatusFallbackTimeout)
 	status, statusErr := s.battery.GetBatteryStatusContext(statusCtx)
@@ -1012,6 +1212,8 @@ func (s *Service) handleSolarStatusFailure(ctx context.Context, telemetryErr err
 func (s *Service) startSolarChargingLocked(ctx context.Context, powerW int, soc int) {
 	l := slog.With("action", "solar_charge", "power_w", powerW, "soc", soc)
 	l.Info("starting solar charge session")
+	reservation := s.chargeReservationLocked(s.now(), soc)
+	retainedCycle := s.cycleForSolarRetentionLocked(s.now(), reservation)
 
 	// Release lock during network I/O
 	s.mu.Unlock()
@@ -1027,6 +1229,7 @@ func (s *Service) startSolarChargingLocked(ctx context.Context, powerW int, soc 
 		}
 	}
 	s.mu.Lock()
+	eligibilityExpired := err == nil && s.solarBlockedLocked(s.now(), soc)
 
 	if err != nil {
 		if idleErr != nil {
@@ -1043,7 +1246,9 @@ func (s *Service) startSolarChargingLocked(ctx context.Context, powerW int, soc 
 		s.mu.Lock()
 		return
 	}
-
+	if retainedCycle != nil && s.automaticCycleCommit == nil && s.solarCycleRetention == nil {
+		s.solarCycleRetention = retainedCycle
+	}
 	s.state = StateSolarCharging
 	s.currentTradeStart = s.now()
 	s.currentTradeSOC = soc
@@ -1060,22 +1265,27 @@ func (s *Service) startSolarChargingLocked(ctx context.Context, powerW int, soc 
 	s.solarGridCostEUR = decimal.Zero
 	s.solarGridUnpricedWs = 0
 	s.solarOpportunityCostEUR = decimal.Zero
+	s.solarDayAllocations = nil
 	s.cacheBatteryTelemetryLocked(soc, measuredPowerW)
 	s.solarOpportunityUnpricedWs = 0
-	s.solarControlFailed = false
 	s.solarLastUpdate = s.now()
 	s.solarMeasuredChargePowerW = max(measuredPowerW, 0)
 	s.solarSurplusEMA = 0
 	s.solarEMALastSampleAt = time.Time{}
 	s.solarTelemetryFailureSince = time.Time{}
 	s.batteryCooldownUntil = time.Time{}
+	if eligibilityExpired {
+		l.Info("solar charge start cancelled because eligibility changed during battery command")
+		s.stopSolarChargingLocked(ctx, soc, solarStopReasonYieldWindow)
+		return
+	}
 
 	l.Info("solar charge session started", "state", s.state, "measured_battery_power_w", measuredPowerW)
 
 	// Release lock for notification
 	s.mu.Unlock()
 	if s.telegramEnabled() {
-		if err := s.telegram.SendTradeStart(ctx, "Solar charging", 0, soc); err != nil {
+		if err := s.telegram.SendMessage(ctx, fmt.Sprintf("<b>Solar charging started</b>\nSOC: %d%%", soc)); err != nil {
 			l.Warn("failed to send trade notification", "error", err)
 		}
 	}
@@ -1127,12 +1337,14 @@ func (s *Service) stopSolarChargingLocked(ctx context.Context, endSOC int, reaso
 	)
 	l.Info("stopping solar charge session")
 
+	tradeStart := s.currentTradeStart.Truncate(time.Second)
+	tradeDurationS := int(duration.Seconds())
 	trade := Trade{
-		Timestamp:          s.currentTradeStart,
+		Timestamp:          tradeStart,
 		Action:             ActionSolarCharge,
 		PriceEUR:           decimal.Zero,
 		PowerW:             s.solarChargePower,
-		DurationS:          int(duration.Seconds()),
+		DurationS:          tradeDurationS,
 		EnergyKWh:          energyKWh,
 		GridEnergyKWh:      decimal.NewFromFloat(s.solarGridEnergyWs / 3_600_000),
 		GridCostEUR:        s.solarGridCostEUR,
@@ -1140,14 +1352,26 @@ func (s *Service) stopSolarChargingLocked(ctx context.Context, endSOC int, reaso
 		UnpricedKWh:        decimal.NewFromFloat(s.solarOpportunityUnpricedWs / 3_600_000),
 		OpportunityCostEUR: s.solarOpportunityCostEUR,
 		EnergyBasis:        measuredBatteryPowerEnergyBasis,
+		DayAllocations:     completeTradeDayAllocations(s.solarDayAllocations, tradeStart, tradeDurationS, s.loc),
 		StartSOC:           s.currentTradeSOC,
 		EndSOC:             endSOC,
 	}
+	solarEnergyKWh := trade.EnergyKWh.Sub(trade.GridEnergyKWh)
+	if solarEnergyKWh.IsNegative() {
+		solarEnergyKWh = decimal.Zero
+	}
+	solarEnergyF, _ := solarEnergyKWh.Float64()
+	gridEnergyF, _ := trade.GridEnergyKWh.Float64()
+	gridUnpricedF, _ := trade.GridUnpricedKWh.Float64()
+	gridCostF, _ := trade.GridCostEUR.Float64()
+	opportunityUnpricedF, _ := trade.UnpricedKWh.Float64()
+	opportunityCostF, _ := trade.OpportunityCostEUR.Float64()
 
 	// Release lock for I/O
 	s.mu.Unlock()
 	if err := s.recorder.RecordTrade(trade); err != nil {
 		l.Error("failed to record solar trade", "error", err)
+		s.notifyError(ctx, "Failed to persist completed solar charge: "+err.Error())
 	}
 	s.mu.Lock()
 
@@ -1159,41 +1383,256 @@ func (s *Service) stopSolarChargingLocked(ctx context.Context, endSOC int, reaso
 	s.solarTelemetryFailureSince = time.Time{}
 	s.solarEnergyWs = 0
 	s.solarGridPowerW = 0
-	s.solarControlFailed = false
+	s.solarDayAllocations = nil
 	s.solarCooldownUntil = s.now().Add(cooldown)
 	s.solarSurplusEMA = 0
 	s.solarEMALastSampleAt = time.Time{}
 	s.mu.Unlock()
 	if s.telegramEnabled() {
-		if err := s.telegram.SendTradeEnd(ctx, "Solar charging", energyF, 0, endSOC); err != nil {
+		var text strings.Builder
+		fmt.Fprintf(&text,
+			"<b>Solar charging completed</b>\nBattery energy: %.2f kWh\nSolar energy: %.2f kWh\nGrid energy: %.2f kWh\n",
+			energyF, solarEnergyF, gridEnergyF,
+		)
+		if trade.GridUnpricedKWh.IsPositive() {
+			fmt.Fprintf(&text, "Unpriced grid energy: %.2f kWh\nKnown grid cost: %.4f EUR\nTotal grid cost: incomplete\n", gridUnpricedF, gridCostF)
+		} else {
+			fmt.Fprintf(&text, "Grid cost: %.4f EUR\n", gridCostF)
+		}
+		if trade.UnpricedKWh.IsPositive() {
+			fmt.Fprintf(&text, "Unpriced solar energy: %.2f kWh\nKnown forgone export value: %.4f EUR\nTotal forgone export value: incomplete\n", opportunityUnpricedF, opportunityCostF)
+		} else {
+			fmt.Fprintf(&text, "Forgone export value: %.4f EUR\n", opportunityCostF)
+		}
+		fmt.Fprintf(&text, "SOC: %d%%", endSOC)
+		if err := s.telegram.SendMessage(ctx, text.String()); err != nil {
 			l.Warn("failed to send trade notification", "error", err)
 		}
 	}
 	s.mu.Lock()
 }
 
+func sameTradeCycle(a, b *TradeCycle) bool {
+	return a != nil && b != nil &&
+		a.ChargeWindow.Start.Equal(b.ChargeWindow.Start) &&
+		a.ChargeWindow.End.Equal(b.ChargeWindow.End) &&
+		a.ChargeWindow.Price.Equal(b.ChargeWindow.Price) &&
+		a.DischargeWindow.Start.Equal(b.DischargeWindow.Start) &&
+		a.DischargeWindow.End.Equal(b.DischargeWindow.End) &&
+		a.DischargeWindow.Price.Equal(b.DischargeWindow.Price)
+}
+
+func sameWindowPeriod(a, b TimeWindow) bool {
+	return a.Start.Equal(b.Start) && a.End.Equal(b.End)
+}
+
+func retireDischargeWindow(plan *TradingPlan, completed TimeWindow) *TradingPlan {
+	if plan == nil {
+		return nil
+	}
+	retiredChargeWindows := make([]TimeWindow, 0, 1)
+	cycles := make([]TradeCycle, 0, len(plan.Cycles))
+	changed := false
+	for _, cycle := range plan.Cycles {
+		if sameWindowPeriod(cycle.DischargeWindow, completed) {
+			retiredChargeWindows = append(retiredChargeWindows, cycle.ChargeWindow)
+			changed = true
+			continue
+		}
+		cycles = append(cycles, cycle)
+	}
+	dischargeWindows := make([]TimeWindow, 0, len(plan.DischargeWindows))
+	for _, window := range plan.DischargeWindows {
+		if sameWindowPeriod(window, completed) {
+			changed = true
+			continue
+		}
+		dischargeWindows = append(dischargeWindows, window)
+	}
+	if !changed {
+		return plan
+	}
+	chargeWindows := make([]TimeWindow, 0, len(plan.ChargeWindows))
+	for _, window := range plan.ChargeWindows {
+		retired := false
+		for _, completedCharge := range retiredChargeWindows {
+			if sameWindowPeriod(window, completedCharge) {
+				retired = true
+				break
+			}
+		}
+		if !retired {
+			chargeWindows = append(chargeWindows, window)
+		}
+	}
+	updated := *plan
+	updated.Cycles = cycles
+	updated.ChargeWindows = chargeWindows
+	updated.DischargeWindows = dischargeWindows
+	updated.DischargeOnly = len(cycles) == 0 && len(dischargeWindows) > 0
+	updated.IsProfitable = len(cycles) > 0 || updated.DischargeOnly
+	return &updated
+}
+
+func (s *Service) dischargeWindowAtLocked(now time.Time) (TimeWindow, bool) {
+	if s.automaticCycleCommit != nil {
+		window := s.automaticCycleCommit.DischargeWindow
+		return window, !s.automaticCycleCleanupPending && !now.Before(window.Start) && now.Before(window.End)
+	}
+	if s.solarCycleRetention != nil {
+		window := s.solarCycleRetention.DischargeWindow
+		return window, !now.Before(window.Start) && now.Before(window.End)
+	}
+	if s.currentPlan == nil {
+		return TimeWindow{}, false
+	}
+	for _, window := range s.currentPlan.DischargeWindows {
+		if !now.Before(window.Start) && now.Before(window.End) {
+			return window, true
+		}
+	}
+	return TimeWindow{}, false
+}
+
 // startChargingLocked begins a charge session. Caller must hold s.mu.
 func (s *Service) startChargingLocked(ctx context.Context, price decimal.Decimal, soc int) {
+	now := s.now()
+	reservation := s.chargeReservationLocked(now, soc)
+	chargeWindow, reserved := reservation.windowAt(now)
+	if !reserved {
+		slog.Info("charge start cancelled because reservation is no longer active", "soc", soc)
+		return
+	}
+	if chargeWindow.End.Sub(now) <= minimumAutomaticControlWindow {
+		slog.Info("charge start skipped because reservation is too close to ending", "soc", soc, "reservation_end", chargeWindow.End)
+		return
+	}
+
+	var committedCycle *TradeCycle
+	if s.automaticCycleCommit != nil && now.Before(s.automaticCycleCommit.DischargeWindow.End) {
+		if !sameTradeCycle(s.automaticCycleCommit, reservation.pairedCycle) {
+			slog.Warn("charge start cancelled because reservation no longer matches persisted cycle", "soc", soc)
+			return
+		}
+		cycleCopy := *s.automaticCycleCommit
+		committedCycle = &cycleCopy
+	} else if reservation.pairedCycle != nil {
+		cycleCopy := *reservation.pairedCycle
+		committedCycle = &cycleCopy
+	}
+	if committedCycle == nil {
+		slog.Warn("charge start cancelled because no paired cycle is available", "soc", soc)
+		return
+	}
 	priceF, _ := price.Float64()
 	l := slog.With("action", "charge", "price_eur_kwh", priceF, "soc", soc, "power_w", s.cfg.ChargePowerW)
 	l.Info("starting charge session")
+	persistedThisAttempt := !s.automaticCycleCommitDurable || s.automaticCycleCommit == nil
 
-	// Release lock during network I/O
+	// Persist before battery control, then re-check after the filesystem I/O so
+	// an expired reservation cannot issue a physical command.
 	s.mu.Unlock()
-	err := s.battery.ChargeContext(ctx, s.cfg.ChargePowerW, s.cfg.PassiveModeTimeoutS)
-	var measuredPowerW float64
-	var idleErr error
-	if err == nil {
-		measuredPowerW, err = s.waitForBatteryPower(ctx, true, s.cfg.ChargePowerW)
-	}
-	if err != nil {
-		if idleErr = s.idleBattery(ctx); idleErr != nil {
-			l.Warn("failed to return battery to idle after start failure", "error", idleErr)
-		}
+	var err error
+	if persistedThisAttempt {
+		err = s.recorder.SaveAutomaticCycleCommitment(committedCycle)
 	}
 	s.mu.Lock()
+	if err != nil {
+		var clearErr error
+		if persistedThisAttempt {
+			s.mu.Unlock()
+			clearErr = s.recorder.SaveAutomaticCycleCommitment(nil)
+			s.mu.Lock()
+			if clearErr != nil {
+				s.automaticCycleCommit = committedCycle
+				s.automaticCycleCommitDurable = false
+				s.automaticCycleCleanupPending = true
+			} else {
+				s.automaticCycleCommit = nil
+				s.automaticCycleCommitDurable = false
+				s.automaticCycleCleanupPending = false
+			}
+		}
+		errorAt := s.now()
+		elapsed := errorAt.Sub(s.lastCommitmentPersistError)
+		if s.lastCommitmentPersistError.IsZero() || elapsed < 0 || elapsed >= 15*time.Minute {
+			l.Error("failed to persist automatic cycle commitment; charging not attempted", "error", err, "cleanup_error", clearErr)
+			s.lastCommitmentPersistError = errorAt
+		} else {
+			l.Debug("automatic cycle commitment persistence still unavailable; charging not attempted", "error", err)
+		}
+		s.mu.Unlock()
+		s.notifyError(ctx, "Grid charging blocked because its discharge commitment could not be persisted: "+err.Error())
+		s.mu.Lock()
+		return
+	}
+	s.lastCommitmentPersistError = time.Time{}
+	if persistedThisAttempt {
+		s.automaticCycleCommitDurable = true
+	}
+	revalidatedAt := s.now()
+	reservation = s.chargeReservationLocked(revalidatedAt, soc)
+	chargeWindow, reserved = reservation.windowAt(revalidatedAt)
+	if !reserved || !sameTradeCycle(committedCycle, reservation.pairedCycle) ||
+		chargeWindow.End.Sub(revalidatedAt) <= minimumAutomaticControlWindow {
+		if persistedThisAttempt {
+			s.mu.Unlock()
+			clearErr := s.recorder.SaveAutomaticCycleCommitment(nil)
+			s.mu.Lock()
+			if clearErr != nil {
+				s.automaticCycleCommit = committedCycle
+				s.automaticCycleCommitDurable = false
+				s.automaticCycleCleanupPending = true
+				l.Error("failed to clear unstarted cycle commitment", "error", clearErr)
+			} else {
+				s.automaticCycleCommit = nil
+				s.automaticCycleCommitDurable = false
+				s.automaticCycleCleanupPending = false
+			}
+		}
+		l.Info("charge start cancelled because reservation expired before battery command")
+		return
+	}
+	var measuredPowerW float64
+	s.automaticCycleCommit = committedCycle
+	s.automaticCycleCleanupPending = false
+	s.mu.Unlock()
+	commandCtx, cancelCommand := context.WithTimeout(ctx, chargeWindow.End.Sub(revalidatedAt))
+	commandErr := s.battery.ChargeContext(commandCtx, s.cfg.ChargePowerW, s.cfg.PassiveModeTimeoutS)
+	err = commandErr
+	if err == nil {
+		measuredPowerW, err = s.waitForBatteryPower(commandCtx, true, s.cfg.ChargePowerW)
+	}
+	cancelCommand()
+	s.mu.Lock()
+	postCommandAt := s.now()
+	postCommandReservation := s.chargeReservationLocked(postCommandAt, soc)
+	reservationExpired := err == nil && (!postCommandReservation.contains(postCommandAt) ||
+		!sameTradeCycle(committedCycle, postCommandReservation.pairedCycle))
+	var idleErr error
+	if err != nil {
+		s.mu.Unlock()
+		if idleErr = s.idleBattery(ctx); idleErr != nil {
+			l.Warn("failed to return battery to idle after start cancellation", "error", idleErr)
+		}
+		s.mu.Lock()
+	}
 
 	if err != nil {
+		if persistedThisAttempt && errors.Is(commandErr, marstek.ErrControlNotAttempted) {
+			s.mu.Unlock()
+			clearErr := s.recorder.SaveAutomaticCycleCommitment(nil)
+			s.mu.Lock()
+			if clearErr != nil {
+				s.automaticCycleCommitDurable = false
+				s.automaticCycleCleanupPending = true
+				l.Warn("failed to clear commitment after rejected charge command", "error", clearErr)
+			} else {
+				s.automaticCycleCommit = nil
+				s.automaticCycleCommitDurable = false
+				s.automaticCycleCleanupPending = false
+			}
+		}
 		if idleErr != nil {
 			s.state = StateStopping
 			s.lastStopAttempt = s.now()
@@ -1225,6 +1664,11 @@ func (s *Service) startChargingLocked(ctx context.Context, price decimal.Decimal
 		s.lastChargePrice = price // Track the known start price for profitability.
 	}
 	s.batteryCooldownUntil = time.Time{}
+	if reservationExpired {
+		l.Info("charge start cancelled because reservation expired during battery command")
+		s.stopChargingLocked(ctx, soc)
+		return
+	}
 
 	l.Info("charge session started", "state", s.state, "measured_battery_power_w", measuredPowerW)
 
@@ -1266,26 +1710,41 @@ func (s *Service) stopChargingLocked(ctx context.Context, endSOC int) {
 	)
 	l.Info("stopping charge session")
 
+	tradeStart := s.currentTradeStart.Truncate(time.Second)
+	tradeDurationS := int(duration.Seconds())
 	trade := Trade{
-		Timestamp:   s.currentTradeStart,
-		Action:      ActionCharge,
-		PriceEUR:    avgPrice,
-		PowerW:      s.cfg.ChargePowerW,
-		DurationS:   int(duration.Seconds()),
-		EnergyKWh:   energyKWh,
-		UnpricedKWh: decimal.NewFromFloat(s.currentTradeUnpricedWs / 3_600_000),
-		EnergyBasis: measuredBatteryPowerEnergyBasis,
-		StartSOC:    s.currentTradeSOC,
-		EndSOC:      endSOC,
+		Timestamp:      tradeStart,
+		Action:         ActionCharge,
+		PriceEUR:       avgPrice,
+		PowerW:         s.cfg.ChargePowerW,
+		DurationS:      tradeDurationS,
+		EnergyKWh:      energyKWh,
+		UnpricedKWh:    decimal.NewFromFloat(s.currentTradeUnpricedWs / 3_600_000),
+		EnergyBasis:    measuredBatteryPowerEnergyBasis,
+		DayAllocations: completeTradeDayAllocations(s.currentTradeDayAllocations, tradeStart, tradeDurationS, s.loc),
+		StartSOC:       s.currentTradeSOC,
+		EndSOC:         endSOC,
 	}
-
+	pricedEnergyF, _ := decimal.NewFromFloat(s.currentTradePricedEnergyWs / 3_600_000).Float64()
+	unpricedEnergyF, _ := trade.UnpricedKWh.Float64()
+	knownCostF, _ := s.currentTradeCostEUR.Float64()
 	// Release lock for I/O
 	s.mu.Unlock()
 	if err := s.recorder.RecordTrade(trade); err != nil {
 		l.Error("failed to record trade", "error", err)
+		s.notifyError(ctx, "Failed to persist completed charge: "+err.Error())
 	}
 	if s.telegramEnabled() {
-		if err := s.telegram.SendTradeEnd(ctx, "Charging", energyF, avgPriceF, endSOC); err != nil {
+		var err error
+		if trade.UnpricedKWh.IsPositive() {
+			err = s.telegram.SendMessage(ctx, fmt.Sprintf(
+				"<b>Charging completed</b>\nEnergy: %.2f kWh\nPriced energy: %.2f kWh\nUnpriced energy: %.2f kWh\nKnown cost: %.4f EUR\nTotal cost: incomplete\nSOC: %d%%",
+				energyF, pricedEnergyF, unpricedEnergyF, knownCostF, endSOC,
+			))
+		} else {
+			err = s.telegram.SendTradeEnd(ctx, "Charging", energyF, avgPriceF, endSOC)
+		}
+		if err != nil {
 			l.Warn("failed to send trade notification", "error", err)
 		}
 	}
@@ -1293,26 +1752,44 @@ func (s *Service) stopChargingLocked(ctx context.Context, endSOC int) {
 }
 
 // startDischargingLocked begins a scheduled or manual discharge session. Caller must hold s.mu.
-func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Decimal, soc, powerW int, targetState State) {
+func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Decimal, currentPriceKnown bool, soc, powerW int, targetState State) {
+	automatic := targetState == StateDischarging
+	var dischargeWindow TimeWindow
+	if automatic {
+		var active bool
+		dischargeWindow, active = s.dischargeWindowAtLocked(s.now())
+		if !active || dischargeWindow.End.Sub(s.now()) <= minimumAutomaticControlWindow {
+			slog.Info("automatic discharge start cancelled because its window is no longer safely active", "soc", soc)
+			return
+		}
+	}
 	priceF, _ := price.Float64()
 	lastChargeF, _ := s.lastChargePrice.Float64()
-	l := slog.With("action", "discharge", "price_eur_kwh", priceF, "soc", soc, "power_w", powerW, "last_charge_price", lastChargeF, "target_state", targetState)
+	l := slog.With("action", "discharge", "price_eur_kwh", priceF, "price_known", currentPriceKnown, "soc", soc, "power_w", powerW, "last_charge_price", lastChargeF, "target_state", targetState)
 	l.Info("starting discharge session")
 
 	// Release lock during network I/O
 	s.mu.Unlock()
-	err := s.battery.DischargeContext(ctx, powerW, s.cfg.PassiveModeTimeoutS)
+	controlCtx := ctx
+	cancelControl := func() {}
+	if automatic {
+		controlCtx, cancelControl = context.WithTimeout(ctx, dischargeWindow.End.Sub(s.now()))
+	}
+	err := s.battery.DischargeContext(controlCtx, powerW, s.cfg.PassiveModeTimeoutS)
 	var measuredPowerW float64
 	var idleErr error
 	if err == nil {
-		measuredPowerW, err = s.waitForBatteryPower(ctx, false, powerW)
+		measuredPowerW, err = s.waitForBatteryPower(controlCtx, false, powerW)
 	}
+	cancelControl()
 	if err != nil {
 		if idleErr = s.idleBattery(ctx); idleErr != nil {
 			l.Warn("failed to return battery to idle after start failure", "error", idleErr)
 		}
 	}
 	s.mu.Lock()
+	_, dischargeStillActive := s.dischargeWindowAtLocked(s.now())
+	windowExpired := err == nil && automatic && !dischargeStillActive
 
 	if err != nil {
 		if idleErr != nil {
@@ -1333,7 +1810,6 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 		s.mu.Lock()
 		return
 	}
-
 	s.state = targetState
 	s.cacheBatteryTelemetryLocked(soc, measuredPowerW)
 	s.currentTradeStart = s.now()
@@ -1348,8 +1824,16 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 	} else {
 		s.manualOverrideUntil = time.Time{}
 	}
+	if windowExpired {
+		l.Info("automatic discharge start cancelled because its window expired during battery command")
+		s.stopDischargingLocked(ctx, soc)
+		return
+	}
+	notificationPrice, notificationPriceKnown := s.currentPriceLocked(s.currentTradeStart)
+	notificationPriceF, _ := notificationPrice.Float64()
 
-	l.Info("discharge session started", "state", s.state, "measured_battery_power_w", measuredPowerW)
+	l.Info("discharge session started", "state", s.state, "measured_battery_power_w", measuredPowerW,
+		"session_price_eur_kwh", notificationPriceF, "session_price_known", notificationPriceKnown)
 
 	notificationAction := "Discharging"
 	if targetState == StateManualDischarging {
@@ -1358,7 +1842,17 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 	// Release lock for notification
 	s.mu.Unlock()
 	if s.telegramEnabled() {
-		if err := s.telegram.SendTradeStart(ctx, notificationAction, priceF, soc); err != nil {
+		var err error
+		if !notificationPriceKnown {
+			description := "manual discharge"
+			if automatic {
+				description = "retained discharge"
+			}
+			err = s.telegram.SendMessage(ctx, fmt.Sprintf("Started %s at %d%% SOC; current tariff unavailable and energy will be recorded as unpriced.", description, soc))
+		} else {
+			err = s.telegram.SendTradeStart(ctx, notificationAction, notificationPriceF, soc)
+		}
+		if err != nil {
 			l.Warn("failed to send trade notification", "error", err)
 		}
 	}
@@ -1369,6 +1863,11 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 	previousState := s.state
 	tradePowerW := s.currentTradePowerW
+	var uncommittedSessionWindow TimeWindow
+	hasUncommittedSessionWindow := false
+	if previousState == StateDischarging && s.automaticCycleCommit == nil && s.solarCycleRetention == nil {
+		uncommittedSessionWindow, hasUncommittedSessionWindow = s.dischargeWindowAtLocked(s.currentTradeStart)
+	}
 	if !s.transitionToIdleLocked(ctx, endSOC) {
 		return
 	}
@@ -1391,25 +1890,97 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 	)
 	l.Info("stopping discharge session")
 
+	tradeStart := s.currentTradeStart.Truncate(time.Second)
+	tradeDurationS := int(duration.Seconds())
 	trade := Trade{
-		Timestamp:   s.currentTradeStart,
-		Action:      ActionDischarge,
-		PriceEUR:    avgPrice,
-		PowerW:      tradePowerW,
-		DurationS:   int(duration.Seconds()),
-		EnergyKWh:   energyKWh,
-		UnpricedKWh: decimal.NewFromFloat(s.currentTradeUnpricedWs / 3_600_000),
-		EnergyBasis: measuredBatteryPowerEnergyBasis,
-		StartSOC:    s.currentTradeSOC,
-		EndSOC:      endSOC,
+		Timestamp:      tradeStart,
+		Action:         ActionDischarge,
+		PriceEUR:       avgPrice,
+		PowerW:         tradePowerW,
+		DurationS:      tradeDurationS,
+		EnergyKWh:      energyKWh,
+		UnpricedKWh:    decimal.NewFromFloat(s.currentTradeUnpricedWs / 3_600_000),
+		EnergyBasis:    measuredBatteryPowerEnergyBasis,
+		DayAllocations: completeTradeDayAllocations(s.currentTradeDayAllocations, tradeStart, tradeDurationS, s.loc),
+		StartSOC:       s.currentTradeSOC,
+		EndSOC:         endSOC,
+	}
+	pricedEnergyF, _ := decimal.NewFromFloat(s.currentTradePricedEnergyWs / 3_600_000).Float64()
+	unpricedEnergyF, _ := trade.UnpricedKWh.Float64()
+	knownValueF, _ := s.currentTradeCostEUR.Float64()
+	committedCycle := s.automaticCycleCommit
+	hadAutomaticCycleCommit := committedCycle != nil
+	if committedCycle == nil {
+		committedCycle = s.solarCycleRetention
+	}
+	var completedWindow TimeWindow
+	hasAutomaticWindow := false
+	if committedCycle != nil {
+		completedWindow = committedCycle.DischargeWindow
+		hasAutomaticWindow = previousState == StateDischarging || previousState == StateManualDischarging
+	} else if previousState == StateDischarging {
+		completedWindow, hasAutomaticWindow = uncommittedSessionWindow, hasUncommittedSessionWindow
+	}
+	completedAutomaticCycle := hasAutomaticWindow &&
+		(!stopTime.Before(completedWindow.End) || endSOC <= s.cfg.MinSOCPercent())
+	retirements := append([]TimeWindow(nil), s.retiredDischargeWindows...)
+	if completedAutomaticCycle {
+		retiredKnown := false
+		for _, window := range retirements {
+			if sameWindowPeriod(window, completedWindow) {
+				retiredKnown = true
+				break
+			}
+		}
+		if !retiredKnown {
+			retirements = append(retirements, completedWindow)
+		}
 	}
 
 	// Release lock for I/O
 	s.mu.Unlock()
 	if err := s.recorder.RecordTrade(trade); err != nil {
 		l.Error("failed to record trade", "error", err)
+		s.notifyError(ctx, "Failed to persist completed discharge: "+err.Error())
+	}
+	var retirementErr, clearCommitmentErr error
+	if completedAutomaticCycle {
+		retirementErr = s.recorder.SaveRetiredDischargeWindows(retirements)
+	}
+	if retirementErr == nil && completedAutomaticCycle && hadAutomaticCycleCommit {
+		clearCommitmentErr = s.recorder.SaveAutomaticCycleCommitment(nil)
 	}
 	s.mu.Lock()
+	notifyCompletionPersistenceFailure := false
+	if completedAutomaticCycle {
+		s.retiredDischargeWindows = retirements
+		s.retiredDischargeWindowsDirty = retirementErr != nil
+		s.currentPlan = retireDischargeWindow(s.currentPlan, completedWindow)
+		s.pendingPlan = retireDischargeWindow(s.pendingPlan, completedWindow)
+	}
+	completionPersistenceErr := retirementErr
+	if completionPersistenceErr == nil {
+		completionPersistenceErr = clearCommitmentErr
+	}
+	if completionPersistenceErr != nil {
+		l.Warn("failed to persist completed automatic cycle retirement", "error", completionPersistenceErr)
+		s.lastCommitmentClearWarning = s.now()
+		if hadAutomaticCycleCommit {
+			s.automaticCycleCommitDurable = false
+			s.automaticCycleCleanupPending = true
+		}
+		notifyCompletionPersistenceFailure = true
+	} else if completedAutomaticCycle {
+		s.lastCommitmentClearWarning = time.Time{}
+		s.automaticCycleCommit = nil
+		s.automaticCycleCommitDurable = false
+		s.automaticCycleCleanupPending = false
+		s.solarCycleRetention = nil
+		if s.pendingPlan != nil {
+			s.currentPlan = s.pendingPlan
+			s.pendingPlan = nil
+		}
+	}
 
 	notificationAction := "Discharging"
 	if previousState == StateManualDischarging {
@@ -1418,8 +1989,20 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 	s.manualOverrideUntil = time.Time{}
 	s.currentTradePowerW = 0
 	s.mu.Unlock()
+	if notifyCompletionPersistenceFailure {
+		s.notifyError(ctx, "Failed to persist completed automatic cycle retirement: "+completionPersistenceErr.Error())
+	}
 	if s.telegramEnabled() {
-		if err := s.telegram.SendTradeEnd(ctx, notificationAction, energyF, priceF, endSOC); err != nil {
+		var err error
+		if trade.UnpricedKWh.IsPositive() {
+			err = s.telegram.SendMessage(ctx, fmt.Sprintf(
+				"<b>%s completed</b>\nEnergy: %.2f kWh\nPriced energy: %.2f kWh\nUnpriced energy: %.2f kWh\nKnown value: %.4f EUR\nTotal value: incomplete\nSOC: %d%%",
+				notificationAction, energyF, pricedEnergyF, unpricedEnergyF, knownValueF, endSOC,
+			))
+		} else {
+			err = s.telegram.SendTradeEnd(ctx, notificationAction, energyF, priceF, endSOC)
+		}
+		if err != nil {
 			l.Warn("failed to send trade notification", "error", err)
 		}
 	}
@@ -1458,7 +2041,7 @@ func (s *Service) transitionToIdleLocked(ctx context.Context, soc int) bool {
 	s.stopPending = false
 	s.lastStopAttempt = time.Time{}
 	s.lastStopLinkDown = false
-	if s.pendingPlan != nil && !s.automaticCycleCommittedLocked() {
+	if s.pendingPlan != nil && s.automaticCycleCommit == nil && s.solarCycleRetention == nil {
 		s.currentPlan = s.pendingPlan
 		s.pendingPlan = nil
 	}
@@ -1511,6 +2094,8 @@ func (s *Service) retryStopping(ctx context.Context) bool {
 	endSOC := s.currentTradeLastSOC
 	if err == nil {
 		endSOC = status.SOC
+	} else {
+		s.batteryTelemetryAvailable = false
 	}
 
 	if s.state != StateStopping && !s.stopPending {
@@ -1532,7 +2117,11 @@ func (s *Service) retryStopping(ctx context.Context) bool {
 }
 
 func (s *Service) stopBatteryOnShutdown() error {
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), batteryShutdownTimeout)
+	timeout := s.batteryShutdownTimeout
+	if timeout <= 0 {
+		timeout = batteryShutdownTimeout
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	for {
@@ -1570,6 +2159,66 @@ func (s *Service) stopBatteryOnShutdown() error {
 		case <-timer.C:
 		}
 	}
+}
+
+func (s *Service) shutdown() error {
+	stopErr := s.stopBatteryOnShutdown()
+	tradeFlushErr := s.recorder.FlushTrades()
+	retirementFlushErr := s.flushRetiredDischargeWindows()
+	if tradeFlushErr != nil {
+		slog.Error("failed to flush trade history during shutdown", "error", tradeFlushErr)
+	}
+	if retirementFlushErr != nil {
+		slog.Error("failed to flush discharge retirements during shutdown", "error", retirementFlushErr)
+	}
+	var persistenceErr error
+	switch {
+	case tradeFlushErr != nil && retirementFlushErr != nil:
+		persistenceErr = fmt.Errorf("flush trade history: %v; flush discharge retirements: %w", tradeFlushErr, retirementFlushErr)
+	case tradeFlushErr != nil:
+		persistenceErr = fmt.Errorf("flush trade history: %w", tradeFlushErr)
+	case retirementFlushErr != nil:
+		persistenceErr = fmt.Errorf("flush discharge retirements: %w", retirementFlushErr)
+	}
+	if stopErr != nil {
+		slog.Error("failed to stop battery during shutdown", "error", stopErr)
+		if persistenceErr != nil {
+			return fmt.Errorf("stop battery during shutdown: %v; persistence: %w", stopErr, persistenceErr)
+		}
+		return fmt.Errorf("stop battery during shutdown: %w", stopErr)
+	}
+	return persistenceErr
+}
+
+func (s *Service) retryTradePersistence(ctx context.Context) {
+	if s.recorder == nil {
+		return
+	}
+	if err := s.recorder.FlushTrades(); err != nil {
+		slog.Warn("failed to retry trade persistence", "error", err)
+		s.notifyError(ctx, "Failed to persist completed trade history: "+err.Error())
+	}
+	if err := s.flushRetiredDischargeWindows(); err != nil {
+		slog.Warn("failed to retry discharge retirement persistence", "error", err)
+		s.notifyError(ctx, "Failed to persist completed discharge retirement: "+err.Error())
+	}
+}
+
+func (s *Service) flushRetiredDischargeWindows() error {
+	s.mu.RLock()
+	dirty := s.retiredDischargeWindowsDirty
+	retirements := append([]TimeWindow(nil), s.retiredDischargeWindows...)
+	s.mu.RUnlock()
+	if !dirty {
+		return nil
+	}
+	if err := s.recorder.SaveRetiredDischargeWindows(retirements); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.retiredDischargeWindowsDirty = false
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *Service) idleBattery(ctx context.Context) error {
@@ -1623,7 +2272,6 @@ func (s *Service) checkPriceFetch(ctx context.Context) {
 	if !haveToday && len(s.tomorrowPrices) > 0 && localMidnight(s.tomorrowPrices[0].Time).Equal(today) {
 		s.todayPrices = s.tomorrowPrices
 		s.tomorrowPrices = nil
-		s.lastMidnightSwap = now
 		haveToday = true
 	}
 	if haveToday {
@@ -1681,17 +2329,62 @@ func (s *Service) automaticCycleCommittedLocked() bool {
 	if s.state == StateCharging || s.state == StateDischarging {
 		return true
 	}
-	// A charged battery can be idle between the paired windows, including
-	// across midnight. Keep its discharge commitment until that window ends.
-	if s.currentPlan != nil {
-		now := s.now()
-		for _, cycle := range s.currentPlan.Cycles {
-			if !now.Before(cycle.ChargeWindow.Start) && now.Before(cycle.DischargeWindow.End) {
-				return true
-			}
-		}
+	// A persisted pointer remains authoritative until its file is successfully
+	// cleared, even after the window expires.
+	if s.automaticCycleCommit != nil {
+		return true
+	}
+	if s.solarCycleRetention != nil && s.now().Before(s.solarCycleRetention.DischargeWindow.End) {
+		return true
 	}
 	return false
+}
+
+// clearExpiredAutomaticCycleCommitmentLocked removes an elapsed pairing from
+// both durable and live state. Caller must hold s.mu.
+func (s *Service) clearExpiredAutomaticCycleCommitmentLocked(ctx context.Context, now time.Time) {
+	if s.solarCycleRetention != nil && !now.Before(s.solarCycleRetention.DischargeWindow.End) {
+		s.solarCycleRetention = nil
+	}
+	if s.automaticCycleCommit == nil || (!s.automaticCycleCleanupPending && now.Before(s.automaticCycleCommit.DischargeWindow.End)) {
+		if s.automaticCycleCommit == nil && s.solarCycleRetention == nil && s.pendingPlan != nil {
+			s.currentPlan = s.pendingPlan
+			s.pendingPlan = nil
+		}
+		return
+	}
+	retirements := append([]TimeWindow(nil), s.retiredDischargeWindows...)
+	s.mu.Unlock()
+	err := s.recorder.SaveRetiredDischargeWindows(retirements)
+	retirementSaved := err == nil
+	if retirementSaved {
+		err = s.recorder.SaveAutomaticCycleCommitment(nil)
+	}
+	s.mu.Lock()
+	if retirementSaved {
+		s.retiredDischargeWindowsDirty = false
+	}
+	if err != nil {
+		s.automaticCycleCommitDurable = false
+		s.automaticCycleCleanupPending = true
+		elapsed := now.Sub(s.lastCommitmentClearWarning)
+		if s.lastCommitmentClearWarning.IsZero() || elapsed < 0 || elapsed >= 15*time.Minute {
+			slog.Warn("failed to persist retirement or clear expired automatic cycle commitment", "error", err)
+			s.lastCommitmentClearWarning = now
+			s.mu.Unlock()
+			s.notifyError(ctx, "Failed to persist retirement or clear expired automatic cycle commitment: "+err.Error())
+			s.mu.Lock()
+		}
+		return
+	}
+	s.lastCommitmentClearWarning = time.Time{}
+	s.automaticCycleCommit = nil
+	s.automaticCycleCommitDurable = false
+	s.automaticCycleCleanupPending = false
+	if s.state != StateCharging && s.state != StateDischarging && s.solarCycleRetention == nil && s.pendingPlan != nil {
+		s.currentPlan = s.pendingPlan
+		s.pendingPlan = nil
+	}
 }
 
 // refreshCurrentPlanLocked preserves a started cycle through its discharge end,
@@ -1701,13 +2394,97 @@ func (s *Service) refreshCurrentPlanLocked(now time.Time) *TradingPlan {
 	// evening discharge, even when the battery is already full. This also
 	// reconstructs today's discharge schedule after a service restart.
 	plan := AnalyzePrices(s.futurePriceHorizonLocked(localMidnight(now)), s.analyzerConfig())
+	for _, window := range s.retiredDischargeWindows {
+		plan = retireDischargeWindow(plan, window)
+	}
+	if s.automaticCycleCleanupPending && s.automaticCycleCommit != nil {
+		plan = retireDischargeWindow(plan, s.automaticCycleCommit.DischargeWindow)
+	}
 	if s.automaticCycleCommittedLocked() {
 		s.pendingPlan = plan
-		return plan
+		return s.currentPlan
 	}
 	s.currentPlan = plan
 	s.pendingPlan = nil
 	return plan
+}
+
+func (s *Service) restoreAutomaticCycleCommitment() error {
+	cycle, err := s.recorder.LoadAutomaticCycleCommitment()
+	if err != nil {
+		return err
+	}
+	if cycle == nil {
+		return nil
+	}
+	now := s.now()
+	if !cycle.ChargeWindow.Start.Before(cycle.ChargeWindow.End) ||
+		cycle.ChargeWindow.End.After(cycle.DischargeWindow.Start) ||
+		!cycle.DischargeWindow.Start.Before(cycle.DischargeWindow.End) ||
+		cycle.DischargeWindow.End.After(now.Add(automaticCycleCommitmentMaxFuture)) {
+		return fmt.Errorf("persisted automatic cycle commitment %s has invalid or implausible windows", automaticCycleCommitmentFile)
+	}
+	for _, retired := range s.retiredDischargeWindows {
+		if !sameWindowPeriod(retired, cycle.DischargeWindow) {
+			continue
+		}
+		if err := s.recorder.SaveAutomaticCycleCommitment(nil); err != nil {
+			s.mu.Lock()
+			s.automaticCycleCommit = cycle
+			s.automaticCycleCommitDurable = false
+			s.automaticCycleCleanupPending = true
+			s.mu.Unlock()
+			slog.Warn("retired automatic cycle commitment cleanup deferred", "error", err)
+		}
+		return nil
+	}
+	if !now.Before(cycle.DischargeWindow.End) {
+		if err := s.recorder.SaveAutomaticCycleCommitment(nil); err != nil {
+			// Keep retryable fail-closed state instead of taking the whole service
+			// offline for a transient deletion failure.
+			s.mu.Lock()
+			s.automaticCycleCommit = cycle
+			s.automaticCycleCommitDurable = false
+			s.automaticCycleCleanupPending = true
+			s.mu.Unlock()
+			slog.Warn("expired automatic cycle commitment cleanup deferred", "error", err)
+		}
+		return nil
+	}
+	profit := cycle.DischargeWindow.Price.
+		Mul(decimal.NewFromFloat(s.cfg.BatteryEfficiency)).
+		Sub(cycle.ChargeWindow.Price)
+	minProfit := decimal.NewFromFloat(s.cfg.MinPriceSpread)
+	chargeEligible := profit.IsPositive() && !profit.LessThan(minProfit)
+	planCycle := *cycle
+	planCycle.Profit = profit
+	plan := &TradingPlan{
+		Date:             localMidnight(cycle.ChargeWindow.Start.In(s.loc)),
+		DischargeWindows: []TimeWindow{cycle.DischargeWindow},
+		MinPrice:         cycle.ChargeWindow.Price,
+		MaxPrice:         cycle.DischargeWindow.Price,
+		Spread:           cycle.DischargeWindow.Price.Sub(cycle.ChargeWindow.Price),
+		IsProfitable:     true,
+		DischargeOnly:    !chargeEligible,
+	}
+	if chargeEligible {
+		plan.ChargeWindows = []TimeWindow{cycle.ChargeWindow}
+		plan.Cycles = []TradeCycle{planCycle}
+	} else {
+		slog.Warn(
+			"restored cycle retained for discharge but blocked from further grid charging",
+			"expected_profit_eur_kwh", profit,
+			"min_expected_profit_eur_kwh", minProfit,
+		)
+	}
+	s.mu.Lock()
+	s.automaticCycleCommit = cycle
+	s.automaticCycleCommitDurable = true
+	s.automaticCycleCleanupPending = false
+	s.currentPlan = plan
+	s.mu.Unlock()
+	slog.Info("restored committed automatic cycle", "discharge_end", cycle.DischargeWindow.End)
+	return nil
 }
 
 // fetchTodayPrices fetches today's prices from NordPool.
@@ -1721,6 +2498,11 @@ func (s *Service) fetchTodayPrices(ctx context.Context) error {
 	s.mu.Lock()
 	s.todayPrices = prices // full day remains available for price settlement
 	plan := s.refreshCurrentPlanLocked(now)
+	candidatePlan := plan
+	planRetained := s.pendingPlan != nil && plan != nil && plan == s.currentPlan
+	if s.pendingPlan != nil {
+		candidatePlan = s.pendingPlan
+	}
 	futurePrices := len(s.futurePriceHorizonLocked(localMidnight(now)))
 	slotsTotal := len(s.todayPrices) + len(s.tomorrowPrices)
 	s.mu.Unlock()
@@ -1730,14 +2512,20 @@ func (s *Service) fetchTodayPrices(ctx context.Context) error {
 		"slots_total", slotsTotal,
 		"slots_analyzed", futurePrices,
 	)
-	l.Info(
-		"fetched prices",
-		"price_min_eur_kwh", plan.MinPrice,
-		"price_max_eur_kwh", plan.MaxPrice,
-	)
+	if candidatePlan != nil {
+		l.Info(
+			"fetched prices and analyzed candidate plan",
+			"candidate_price_min_eur_kwh", candidatePlan.MinPrice,
+			"candidate_price_max_eur_kwh", candidatePlan.MaxPrice,
+			"executable_plan_available", plan != nil,
+			"executable_plan_retained", planRetained,
+		)
+	}
 
 	// Log and notify the executable horizon, including the following day.
-	s.logAndNotifyTradingPlan(ctx, l, plan, "horizon", slotsTotal, futurePrices)
+	if plan != nil {
+		s.logAndNotifyTradingPlan(ctx, l, plan, "horizon", slotsTotal, futurePrices, planRetained)
+	}
 
 	return nil
 }
@@ -1758,6 +2546,11 @@ func (s *Service) fetchTomorrowPrices(ctx context.Context) error {
 	s.mu.Lock()
 	s.tomorrowPrices = prices
 	plan := s.refreshCurrentPlanLocked(now)
+	candidatePlan := plan
+	planRetained := s.pendingPlan != nil && plan != nil && plan == s.currentPlan
+	if s.pendingPlan != nil {
+		candidatePlan = s.pendingPlan
+	}
 	futurePrices := len(s.futurePriceHorizonLocked(localMidnight(now)))
 	slotsTotal := len(s.todayPrices) + len(s.tomorrowPrices)
 	s.mu.Unlock()
@@ -1767,31 +2560,40 @@ func (s *Service) fetchTomorrowPrices(ctx context.Context) error {
 		"slots_total", slotsTotal,
 		"slots_analyzed", futurePrices,
 	)
-	l.Info(
-		"fetched prices",
-		"price_min_eur_kwh", plan.MinPrice,
-		"price_max_eur_kwh", plan.MaxPrice,
-	)
+	if candidatePlan != nil {
+		l.Info(
+			"fetched prices and analyzed candidate plan",
+			"candidate_price_min_eur_kwh", candidatePlan.MinPrice,
+			"candidate_price_max_eur_kwh", candidatePlan.MaxPrice,
+			"executable_plan_available", plan != nil,
+			"executable_plan_retained", planRetained,
+		)
+	}
 
 	// Re-notify with the combined executable horizon once tomorrow publishes.
-	s.logAndNotifyTradingPlan(ctx, l, plan, "horizon", slotsTotal, futurePrices)
+	if plan != nil {
+		s.logAndNotifyTradingPlan(ctx, l, plan, "horizon", slotsTotal, futurePrices, planRetained)
+	}
 
 	return nil
 }
 
 // logAndNotifyTradingPlan logs the trading plan and sends a Telegram notification.
-func (s *Service) logAndNotifyTradingPlan(ctx context.Context, l *slog.Logger, plan *TradingPlan, day string, slotsTotal, slotsAnalyzed int) {
-	// Calculate break-even spread needed to overcome efficiency loss
-	efficiency := decimal.NewFromFloat(s.cfg.BatteryEfficiency)
-	breakEvenDischarge := plan.MinPrice.Div(efficiency)
-	minProfitableSpread := breakEvenDischarge.Sub(plan.MinPrice)
-
-	if !plan.IsProfitable {
+func (s *Service) logAndNotifyTradingPlan(ctx context.Context, l *slog.Logger, plan *TradingPlan, day string, slotsTotal, slotsAnalyzed int, planRetained bool) {
+	windowFormat := "Mon 02 Jan 15:04"
+	if plan.DischargeOnly && len(plan.DischargeWindows) > 0 {
+		window := plan.DischargeWindows[0]
+		l.Info(
+			"restored discharge obligation retained; grid charging disabled",
+			"discharge_start", window.Start.Format(windowFormat),
+			"discharge_end", window.End.Format(windowFormat),
+			"discharge_avg_eur_kwh", window.Price,
+		)
+	} else if !plan.IsProfitable {
 		l.Info(
 			"no profitable charge→discharge sequence found",
-			"reason", "window-averaged prices don't meet spread/efficiency requirements",
-			"min_spread_for_efficiency", minProfitableSpread,
-			"min_spread_configured", s.cfg.MinPriceSpread,
+			"reason", "no eligible sequence meets the configured expected-profit minimum over the available horizon",
+			"min_expected_profit_eur_kwh", s.cfg.MinPriceSpread,
 			"battery_efficiency", s.cfg.BatteryEfficiency,
 		)
 	} else {
@@ -1800,11 +2602,11 @@ func (s *Service) logAndNotifyTradingPlan(ctx context.Context, l *slog.Logger, p
 			l.Info(
 				"profitable cycle found",
 				"cycle", i+1,
-				"charge_start", c.ChargeWindow.Start.Format("15:04"),
-				"charge_end", c.ChargeWindow.End.Format("15:04"),
+				"charge_start", c.ChargeWindow.Start.Format(windowFormat),
+				"charge_end", c.ChargeWindow.End.Format(windowFormat),
 				"charge_avg_eur_kwh", c.ChargeWindow.Price,
-				"discharge_start", c.DischargeWindow.Start.Format("15:04"),
-				"discharge_end", c.DischargeWindow.End.Format("15:04"),
+				"discharge_start", c.DischargeWindow.Start.Format(windowFormat),
+				"discharge_end", c.DischargeWindow.End.Format(windowFormat),
 				"discharge_avg_eur_kwh", c.DischargeWindow.Price,
 				"expected_profit_eur_kwh", c.Profit,
 			)
@@ -1817,27 +2619,35 @@ func (s *Service) logAndNotifyTradingPlan(ctx context.Context, l *slog.Logger, p
 	}
 
 	// Build notification data (convert decimal to float64 at Telegram API boundary).
-	minProfitableSpreadF, _ := minProfitableSpread.Float64()
 	data := telegram.TradingPlanData{
-		Day:                    day,
-		Date:                   plan.Date,
-		SlotsTotal:             slotsTotal,
-		SlotsAnalyzed:          slotsAnalyzed,
-		PriceMin:               plan.MinPrice.InexactFloat64(),
-		PriceMax:               plan.MaxPrice.InexactFloat64(),
-		IsProfitable:           plan.IsProfitable,
-		Reason:                 "Window-averaged prices don't meet spread/efficiency requirements",
-		MinSpreadForEfficiency: minProfitableSpreadF,
-		MinSpreadConfigured:    s.cfg.MinPriceSpread,
-		BatteryEfficiency:      s.cfg.BatteryEfficiency,
+		Day:               day,
+		Date:              plan.Date,
+		SlotsTotal:        slotsTotal,
+		SlotsAnalyzed:     slotsAnalyzed,
+		PriceMin:          plan.MinPrice.InexactFloat64(),
+		PriceMax:          plan.MaxPrice.InexactFloat64(),
+		IsProfitable:      plan.IsProfitable,
+		MinExpectedProfit: s.cfg.MinPriceSpread,
+		BatteryEfficiency: s.cfg.BatteryEfficiency,
+		PlanRetained:      planRetained,
+		DischargeOnly:     plan.DischargeOnly,
+	}
+	if !plan.IsProfitable {
+		data.Reason = "No eligible sequence meets the configured expected-profit minimum over the available horizon"
+	}
+	if plan.DischargeOnly && len(plan.DischargeWindows) > 0 {
+		window := plan.DischargeWindows[0]
+		data.DischargeStart = window.Start.Format(windowFormat)
+		data.DischargeEnd = window.End.Format(windowFormat)
+		data.DischargePrice = window.Price.InexactFloat64()
 	}
 	for _, c := range plan.Cycles {
 		data.Cycles = append(data.Cycles, telegram.TradingPlanCycle{
-			ChargeStart:    c.ChargeWindow.Start.Format("15:04"),
-			ChargeEnd:      c.ChargeWindow.End.Format("15:04"),
+			ChargeStart:    c.ChargeWindow.Start.Format(windowFormat),
+			ChargeEnd:      c.ChargeWindow.End.Format(windowFormat),
 			ChargePrice:    c.ChargeWindow.Price.InexactFloat64(),
-			DischargeStart: c.DischargeWindow.Start.Format("15:04"),
-			DischargeEnd:   c.DischargeWindow.End.Format("15:04"),
+			DischargeStart: c.DischargeWindow.Start.Format(windowFormat),
+			DischargeEnd:   c.DischargeWindow.End.Format(windowFormat),
 			DischargePrice: c.DischargeWindow.Price.InexactFloat64(),
 			ProfitPerKWh:   c.Profit.InexactFloat64(),
 		})
@@ -1861,16 +2671,40 @@ func (s *Service) checkDailySummary(ctx context.Context) {
 	if target.IsZero() || localMidnight(s.lastDailySummary).Equal(target) {
 		return
 	}
+	targetEnd := target.AddDate(0, 0, 1)
+	s.mu.RLock()
+	activeSessionForTarget := s.state != StateIdle && !s.currentTradeStart.IsZero() && s.currentTradeStart.Before(targetEnd)
+	s.mu.RUnlock()
+	if activeSessionForTarget {
+		return
+	}
+	if now.Before(s.nextDailySummaryAttempt) {
+		return
+	}
+	if err := s.recorder.FlushTrades(); err != nil {
+		slog.Warn("daily summary deferred until trade history is durable", "error", err)
+		retryDelay := dailySummaryRetryCooldown
+		if now.Hour() == 23 && now.Minute() == 59 {
+			retryDelay = time.Minute
+		}
+		s.nextDailySummaryAttempt = now.Add(retryDelay)
+		s.notifyError(ctx, "Daily summary deferred because trade history is not durable: "+err.Error())
+		return
+	}
 
 	targetDate := target.In(s.loc).Format("2006-01-02")
 	summary := DailySummary{Date: targetDate, Trades: []Trade{}}
-	for _, day := range s.recorder.GetHistory().Days {
+	history := s.recorder.GetHistory()
+	totalPnLIncomplete := false
+	for _, day := range history.Days {
+		if day.CashFlowUnpricedKWh.IsPositive() {
+			totalPnLIncomplete = true
+		}
 		if day.Date == targetDate {
 			summary = day
-			break
 		}
 	}
-	totalPnL := s.recorder.GetTotalPnL()
+	totalPnL := history.TotalPnL
 
 	pnlF, _ := summary.PnLEUR.Float64()
 	chargedF, _ := summary.ChargedKWh.Float64()
@@ -1881,29 +2715,39 @@ func (s *Service) checkDailySummary(ctx context.Context) {
 	avgDischargeF, _ := summary.AvgDischargePrice.Float64()
 	maxDischargeF, _ := summary.MaxDischargePrice.Float64()
 	solarChargedF, _ := summary.SolarChargedKWh.Float64()
+	unpricedF, _ := summary.CashFlowUnpricedKWh.Float64()
 
 	summaryData := telegram.DailySummaryData{
-		Date:              target,
-		PnLEUR:            pnlF,
-		ChargedKWh:        chargedF,
-		DischargedKWh:     dischargedF,
-		ChargeCycles:      summary.ChargeCycles,
-		DischargeCycles:   summary.DischargeCycles,
-		SolarChargedKWh:   solarChargedF,
-		SolarChargeCycles: summary.SolarChargeCycles,
-		AvgChargePrice:    avgChargeF,
-		MinChargePrice:    minChargeF,
-		AvgDischargePrice: avgDischargeF,
-		MaxDischargePrice: maxDischargeF,
-		TotalPnLEUR:       totalPnLF,
+		Date:               target,
+		PnLEUR:             pnlF,
+		ChargedKWh:         chargedF,
+		DischargedKWh:      dischargedF,
+		ChargeCycles:       summary.ChargeCycles,
+		DischargeCycles:    summary.DischargeCycles,
+		SolarChargedKWh:    solarChargedF,
+		SolarChargeCycles:  summary.SolarChargeCycles,
+		AvgChargePrice:     avgChargeF,
+		MinChargePrice:     minChargeF,
+		AvgDischargePrice:  avgDischargeF,
+		MaxDischargePrice:  maxDischargeF,
+		TotalPnLEUR:        totalPnLF,
+		UnpricedKWh:        unpricedF,
+		PnLIncomplete:      summary.CashFlowUnpricedKWh.IsPositive(),
+		TotalPnLIncomplete: totalPnLIncomplete,
 	}
 
 	if s.telegramEnabled() {
 		if err := s.telegram.SendDailySummaryFull(ctx, summaryData); err != nil {
 			slog.Warn("failed to send daily summary", "date", targetDate, "error", err)
+			retryDelay := dailySummaryRetryCooldown
+			if now.Hour() == 23 && now.Minute() == 59 {
+				retryDelay = time.Minute
+			}
+			s.nextDailySummaryAttempt = now.Add(retryDelay)
 			return
 		}
 	}
+	s.nextDailySummaryAttempt = time.Time{}
 	s.lastDailySummary = target
 }
 
@@ -1919,14 +2763,14 @@ func batteryFailureCooldown(err error) time.Duration {
 // batteryFailureMessage leads with the actionable cause when the link is down.
 func batteryFailureMessage(prefix string, err error) string {
 	if errors.Is(err, marstek.ErrLinkDown) {
-		return "Battery RS485 link is down — telemetry is frozen and control writes are dropped. Power-cycle the ESPHome dongle (or configure ESPHOME_RESTART_BUTTON so this happens automatically). (" + prefix + ": " + err.Error() + ")"
+		return "Battery RS485 link is down; telemetry is frozen and new control requests may not reach the battery. The last accepted operation can remain active. Power-cycle the ESPHome dongle (or configure ESPHOME_RESTART_BUTTON so this happens automatically). (" + prefix + ": " + err.Error() + ")"
 	}
 	return prefix + ": " + err.Error()
 }
 
 // checkLinkDuringSession detects a frozen RS485 link while the battery is running.
-// The battery keeps executing the last accepted command, so a dropped stop drains it
-// silently. Must be called WITHOUT s.mu held: it performs network I/O.
+// The battery can keep executing the last accepted command, so an unconfirmed stop
+// may drain it silently. Must be called WITHOUT s.mu held: it performs network I/O.
 func (s *Service) checkLinkDuringSession(ctx context.Context) {
 	lc, ok := s.battery.(LinkChecker)
 	if !ok {
@@ -1981,7 +2825,7 @@ func (s *Service) checkLinkDuringSession(ctx context.Context) {
 
 	msg := fmt.Sprintf(
 		"Battery RS485 link is down: telemetry frozen while %s at %d W (%s). "+
-			"The battery keeps running and cannot be stopped until the link is back — "+
+			"The last accepted operation may still be active, and new stop requests may not reach the battery until the link is back; "+
 			"power-cycle the ESPHome dongle now.", verb, powerW, err.Error(),
 	)
 	s.notifyLinkDown(ctx, msg)
@@ -2084,9 +2928,15 @@ func (s *Service) handleTelegramCommands(ctx context.Context) {
 	}
 	commands, err := s.telegram.PollCommands(ctx)
 	if err != nil {
-		slog.Debug("failed to poll telegram commands", "error", err)
+		now := s.now()
+		elapsed := now.Sub(s.lastTelegramPollWarning)
+		if s.lastTelegramPollWarning.IsZero() || elapsed < 0 || elapsed >= 15*time.Minute {
+			slog.Warn("failed to poll telegram commands; bot commands are unavailable", "error", err)
+			s.lastTelegramPollWarning = now
+		}
 		return
 	}
+	s.lastTelegramPollWarning = time.Time{}
 
 	var controlCommand string
 	var controlArgs []string
@@ -2138,15 +2988,13 @@ func (s *Service) handleManualDischargeCommand(ctx context.Context, args []strin
 
 	batStatus, err := s.battery.GetBatteryStatusContext(ctx)
 	if err != nil {
+		s.mu.Lock()
+		s.batteryTelemetryAvailable = false
+		s.mu.Unlock()
 		s.sendTelegramCommandResponse(ctx, "Manual discharge not started: battery status is unavailable.")
 		return
 	}
 	minSOC := s.cfg.MinSOCPercent()
-
-	now := s.now()
-	s.mu.RLock()
-	currentPrice, _ := s.currentPriceLocked(now)
-	s.mu.RUnlock()
 
 	s.mu.Lock()
 	stoppedPreviousOperation := false
@@ -2174,6 +3022,7 @@ func (s *Service) handleManualDischargeCommand(ctx context.Context, args []strin
 		s.sendTelegramCommandResponse(ctx, "Manual discharge not started: the previous battery operation could not be stopped.")
 		return
 	}
+	now := s.now()
 	if now.Before(s.batteryCooldownUntil) {
 		retryAt := s.batteryCooldownUntil.In(s.loc).Format("15:04 MST")
 		s.mu.Unlock()
@@ -2185,6 +3034,7 @@ func (s *Service) handleManualDischargeCommand(ctx context.Context, args []strin
 		batStatus, err = s.battery.GetBatteryStatusContext(ctx)
 		s.mu.Lock()
 		if err != nil {
+			s.batteryTelemetryAvailable = false
 			s.mu.Unlock()
 			s.sendTelegramCommandResponse(ctx, "Manual discharge not started: fresh battery status is unavailable after stopping the previous operation.")
 			return
@@ -2206,7 +3056,8 @@ func (s *Service) handleManualDischargeCommand(ctx context.Context, args []strin
 		return
 	}
 
-	s.startDischargingLocked(ctx, currentPrice, batStatus.SOC, powerW, StateManualDischarging)
+	currentPrice, currentPriceKnown := s.currentPriceLocked(s.now())
+	s.startDischargingLocked(ctx, currentPrice, currentPriceKnown, batStatus.SOC, powerW, StateManualDischarging)
 	started := s.state == StateManualDischarging
 	stopPending := s.state == StateStopping
 	overrideUntil := s.manualOverrideUntil
@@ -2254,6 +3105,10 @@ func (s *Service) handleAutoCommand(ctx context.Context) {
 	endSOC := fallbackSOC
 	if batStatus, err := s.battery.GetBatteryStatusContext(ctx); err == nil {
 		endSOC = batStatus.SOC
+	} else {
+		s.mu.Lock()
+		s.batteryTelemetryAvailable = false
+		s.mu.Unlock()
 	}
 
 	s.mu.Lock()
@@ -2289,20 +3144,28 @@ func (s *Service) sendTelegramStatus(ctx context.Context) {
 	}
 	status := s.GetCurrentStatus(ctx)
 	summary := s.recorder.GetTodaySummary()
-	totalPnL := s.recorder.GetTotalPnL()
+	history := s.recorder.GetHistory()
+	totalPnL := history.TotalPnL
+	totalPnLIncomplete := false
+	for _, day := range history.Days {
+		totalPnLIncomplete = totalPnLIncomplete || day.CashFlowUnpricedKWh.IsPositive()
+	}
 
 	todayPnLF, _ := summary.PnLEUR.Float64()
 	totalPnLF, _ := totalPnL.Float64()
 
 	data := telegram.StatusData{
-		State:            string(status.State),
-		BatteryAvailable: status.BatteryAvailable,
-		BatterySOC:       status.BatterySOC,
-		BatteryPowerW:    status.BatteryPowerW,
-		CurrentPrice:     status.CurrentPrice,
-		NextAction:       status.NextAction,
-		TodayPnL:         todayPnLF,
-		TotalPnL:         totalPnLF,
+		State:              string(status.State),
+		BatteryAvailable:   status.BatteryAvailable,
+		BatterySOC:         status.BatterySOC,
+		BatteryPowerW:      status.BatteryPowerW,
+		CurrentPrice:       status.CurrentPrice,
+		CurrentPriceKnown:  status.CurrentPriceKnown,
+		NextAction:         status.NextAction,
+		TodayPnL:           todayPnLF,
+		TotalPnL:           totalPnLF,
+		TodayPnLIncomplete: summary.CashFlowUnpricedKWh.IsPositive(),
+		TotalPnLIncomplete: totalPnLIncomplete,
 	}
 
 	if err := s.telegram.SendStatus(ctx, data); err != nil {
@@ -2325,24 +3188,30 @@ func (s *Service) GetRecorder() *Recorder {
 // ChargeReservationStatus exposes the current grid-charge reservation without
 // leaking the internal planning type through the status API.
 type ChargeReservationStatus struct {
-	Deadline    time.Time    `json:"deadline,omitempty"`
-	RequiredKWh float64      `json:"required_input_kwh"`
-	ReservedKWh float64      `json:"reserved_input_kwh"`
-	Feasible    bool         `json:"feasible"`
-	Windows     []TimeWindow `json:"windows"`
+	Deadline           time.Time    `json:"deadline,omitempty"`
+	RequiredKWh        float64      `json:"required_input_kwh"`
+	ReservedKWh        float64      `json:"reserved_input_kwh"`
+	Feasible           bool         `json:"feasible"`
+	LimitedByEconomics bool         `json:"limited_by_economics"`
+	Windows            []TimeWindow `json:"windows"`
 }
 
 // CurrentStatus contains all current state info.
 type CurrentStatus struct {
-	State             State                    `json:"state"`
-	BatteryAvailable  bool                     `json:"battery_available"`
-	BatterySOC        int                      `json:"battery_soc"`
-	BatteryPowerW     float64                  `json:"battery_power_w"`
-	BatteryObservedAt time.Time                `json:"battery_observed_at,omitempty"`
-	CurrentPrice      float64                  `json:"current_price_eur_kwh"`
-	CurrentPriceKnown bool                     `json:"current_price_known"`
-	ChargeReservation *ChargeReservationStatus `json:"charge_reservation,omitempty"`
-	NextAction        string                   `json:"next_action,omitempty"`
+	State                        State                    `json:"state"`
+	BatteryAvailable             bool                     `json:"battery_available"`
+	BatterySOC                   int                      `json:"battery_soc"`
+	BatteryPowerW                float64                  `json:"battery_power_w"`
+	BatteryObservedAt            time.Time                `json:"battery_observed_at,omitempty"`
+	CurrentPrice                 float64                  `json:"current_price_eur_kwh"`
+	CurrentPriceKnown            bool                     `json:"current_price_known"`
+	ChargeReservation            *ChargeReservationStatus `json:"charge_reservation,omitempty"`
+	PlanPending                  bool                     `json:"plan_pending"`
+	PlanDischargeOnly            bool                     `json:"plan_discharge_only"`
+	CommitmentType               string                   `json:"commitment_type,omitempty"`
+	CommitmentDurable            bool                     `json:"commitment_durable"`
+	CommitmentDischargeWindowEnd *time.Time               `json:"commitment_discharge_window_end,omitempty"`
+	NextAction                   string                   `json:"next_action,omitempty"`
 }
 
 // GetCurrentStatus returns cached control-loop telemetry and current trading
@@ -2360,15 +3229,31 @@ func (s *Service) GetCurrentStatus(ctx context.Context) CurrentStatus {
 		BatterySOC:        s.batteryTelemetrySOC,
 		BatteryPowerW:     s.batteryTelemetryPowerW,
 		BatteryObservedAt: s.batteryTelemetryUpdatedAt,
+		PlanPending:       s.pendingPlan != nil,
 	}
+	if s.currentPlan != nil {
+		status.PlanDischargeOnly = s.currentPlan.DischargeOnly
+	}
+	if s.automaticCycleCommit != nil {
+		end := s.automaticCycleCommit.DischargeWindow.End
+		status.CommitmentType = "grid"
+		status.CommitmentDurable = s.automaticCycleCommitDurable
+		status.CommitmentDischargeWindowEnd = &end
+	} else if s.solarCycleRetention != nil {
+		end := s.solarCycleRetention.DischargeWindow.End
+		status.CommitmentType = "solar"
+		status.CommitmentDischargeWindowEnd = &end
+	}
+	var reservation chargingReservation
 	if status.BatteryAvailable {
-		reservation := s.chargeReservationLocked(now, status.BatterySOC)
+		reservation = s.chargeReservationLocked(now, status.BatterySOC)
 		status.ChargeReservation = &ChargeReservationStatus{
-			Deadline:    reservation.Deadline,
-			RequiredKWh: reservation.RequiredKWh,
-			ReservedKWh: reservation.ReservedKWh,
-			Feasible:    reservation.Feasible,
-			Windows:     reservation.Windows,
+			Deadline:           reservation.Deadline,
+			RequiredKWh:        reservation.RequiredKWh,
+			ReservedKWh:        reservation.ReservedKWh,
+			Feasible:           reservation.Feasible,
+			LimitedByEconomics: reservation.LimitedByEconomics,
+			Windows:            reservation.Windows,
 		}
 	}
 
@@ -2379,21 +3264,35 @@ func (s *Service) GetCurrentStatus(ctx context.Context) CurrentStatus {
 	}
 
 	// Determine next action.
+	commitmentCleanupPending := s.automaticCycleCommit != nil &&
+		(s.automaticCycleCleanupPending || !now.Before(s.automaticCycleCommit.DischargeWindow.End))
 	if s.state == StateManualDischarging {
 		status.NextAction = fmt.Sprintf(
 			"manual override until %s; /auto to resume",
 			s.manualOverrideUntil.In(s.loc).Format("15:04"),
 		)
+		if commitmentCleanupPending {
+			status.NextAction += "; automatic cycle commitment cleanup pending"
+		}
+	} else if commitmentCleanupPending {
+		status.NextAction = "automatic cycle commitment cleanup pending"
 	} else if s.currentPlan != nil && s.currentPlan.IsProfitable {
-		if s.currentPlan.IsInChargeWindow(now) {
-			status.NextAction = "in charge window"
-		} else if s.currentPlan.IsInDischargeWindow(now) {
+		inReservedWindow := reservation.contains(now)
+		if inReservedWindow {
+			status.NextAction = "in reserved charge window"
+		} else if status.BatteryAvailable && reservation.currentPriceTooHigh && !reservation.Feasible {
+			status.NextAction = "current charge slice skipped: expected profit below configured minimum"
+		} else if _, active := s.dischargeWindowAtLocked(now); active {
 			status.NextAction = "in discharge window"
+		} else if s.currentPlan.IsInChargeWindow(now) && !status.BatteryAvailable {
+			status.NextAction = "charge reservation unavailable: battery telemetry unavailable"
+		} else if status.BatteryAvailable && len(reservation.Windows) > 0 {
+			status.NextAction = "waiting for reserved charge window"
 		} else {
 			status.NextAction = "waiting for next window"
 		}
 	} else {
-		status.NextAction = "no profitable trades today"
+		status.NextAction = "no profitable trades in the current horizon"
 	}
 	return status
 }

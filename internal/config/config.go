@@ -32,7 +32,7 @@ type Config struct {
 	SupplierFeeEURPerKWh decimal.Decimal `env:"SUPPLIER_FEE_EUR_PER_KWH" envDefault:"0.02"`
 
 	// Trading
-	MinPriceSpread     float64 `env:"MIN_PRICE_SPREAD" envDefault:"0.05"`
+	MinPriceSpread     float64 `env:"MIN_PRICE_SPREAD" envDefault:"0.05"` // Historical name: minimum expected profit after efficiency loss.
 	BatteryEfficiency  float64 `env:"BATTERY_EFFICIENCY" envDefault:"0.90"`
 	BatteryCapacityKWh float64 `env:"BATTERY_CAPACITY_KWH" envDefault:"5.12"`
 	BatteryMinSOC      float64 `env:"BATTERY_MIN_SOC" envDefault:"0.11"`
@@ -69,6 +69,9 @@ func Load() (*Config, error) {
 
 // validate checks that config values are within expected bounds.
 func (c *Config) validate() error {
+	if c.DataDir == "" {
+		return fmt.Errorf("DATA_DIR is required for automatic cycle commitment persistence")
+	}
 	if c.NordPoolCurrency != "EUR" {
 		return fmt.Errorf("NORDPOOL_CURRENCY must be EUR when all-in pricing is enabled, got %q", c.NordPoolCurrency)
 	}

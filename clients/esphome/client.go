@@ -196,11 +196,11 @@ func (c *Client) ChargeContext(ctx context.Context, powerW int, _ int) error {
 	defer cancel()
 
 	if err := c.ensureRS485ControlMode(ctx); err != nil {
-		return c.classifyControlFailure(ctx, fmt.Errorf("enable RS485 control mode: %w", err))
+		return fmt.Errorf("%w: %w", marstek.ErrControlNotAttempted, c.classifyControlFailure(ctx, fmt.Errorf("enable RS485 control mode: %w", err)))
 	}
 
 	if err := c.setNumber(ctx, numberChargepower, float64(powerW)); err != nil {
-		return c.classifyControlFailure(ctx, fmt.Errorf("set charge power: %w", err))
+		return fmt.Errorf("%w: %w", marstek.ErrControlNotAttempted, c.classifyControlFailure(ctx, fmt.Errorf("set charge power: %w", err)))
 	}
 	if err := c.setSelectConfirmed(ctx, selectForceMode, "charge"); err != nil {
 		return c.classifyControlFailure(ctx, fmt.Errorf("set charge mode: %w", err))
@@ -220,11 +220,11 @@ func (c *Client) DischargeContext(ctx context.Context, powerW int, _ int) error 
 	defer cancel()
 
 	if err := c.ensureRS485ControlMode(ctx); err != nil {
-		return c.classifyControlFailure(ctx, fmt.Errorf("enable RS485 control mode: %w", err))
+		return fmt.Errorf("%w: %w", marstek.ErrControlNotAttempted, c.classifyControlFailure(ctx, fmt.Errorf("enable RS485 control mode: %w", err)))
 	}
 
 	if err := c.setNumber(ctx, numberDischargePower, float64(powerW)); err != nil {
-		return c.classifyControlFailure(ctx, fmt.Errorf("set discharge power: %w", err))
+		return fmt.Errorf("%w: %w", marstek.ErrControlNotAttempted, c.classifyControlFailure(ctx, fmt.Errorf("set discharge power: %w", err)))
 	}
 	if err := c.setSelectConfirmed(ctx, selectForceMode, "discharge"); err != nil {
 		return c.classifyControlFailure(ctx, fmt.Errorf("set discharge mode: %w", err))
@@ -337,7 +337,7 @@ func (c *Client) getSensorFloatContext(ctx context.Context, path string) (float6
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return 0, fmt.Errorf("GET %s: status %d: %s", path, resp.StatusCode, string(body))
+		return 0, fmt.Errorf("GET %s: status %d: %s", path, resp.StatusCode, responseBodyMessage(body))
 	}
 
 	var sensor sensorResponse
@@ -615,7 +615,7 @@ func (c *Client) probeLinkDown(ctx context.Context) bool {
 
 // classifyControlFailure upgrades a control failure to ErrLinkDown when telemetry
 // proves the RS485 link is dead. The link probe detects only complete freezes; it
-// cannot confirm or reject an individual optimistic number write.
+// cannot confirm or reject an individual optimistic control write.
 func (c *Client) classifyControlFailure(ctx context.Context, err error) error {
 	if err == nil || ctx.Err() != nil {
 		return err
@@ -627,7 +627,7 @@ func (c *Client) classifyControlFailure(ctx context.Context, err error) error {
 		return err
 	}
 	c.markLinkDown()
-	return fmt.Errorf("%w: telemetry frozen and control writes dropped: %w", marstek.ErrLinkDown, err)
+	return fmt.Errorf("%w: telemetry frozen and control outcome unknown: %w", marstek.ErrLinkDown, err)
 }
 
 // getTextSensor retrieves a text sensor value.
@@ -640,7 +640,7 @@ func (c *Client) getTextSensor(path string) (string, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("GET %s: status %d: %s", path, resp.StatusCode, string(body))
+		return "", fmt.Errorf("GET %s: status %d: %s", path, resp.StatusCode, responseBodyMessage(body))
 	}
 
 	var sensor textSensorResponse
@@ -672,7 +672,7 @@ func (c *Client) setNumber(ctx context.Context, path string, value float64) erro
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("POST %s: status %d: %s", path, resp.StatusCode, string(body))
+		return fmt.Errorf("POST %s: status %d: %s", path, resp.StatusCode, responseBodyMessage(body))
 	}
 
 	return nil
@@ -693,7 +693,7 @@ func (c *Client) setSelect(ctx context.Context, path string, option string) erro
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("POST %s: status %d: %s", path, resp.StatusCode, string(body))
+		return fmt.Errorf("POST %s: status %d: %s", path, resp.StatusCode, responseBodyMessage(body))
 	}
 
 	return nil
@@ -701,7 +701,7 @@ func (c *Client) setSelect(ctx context.Context, path string, option string) erro
 
 func (c *Client) ensureRS485ControlMode(ctx context.Context) error {
 	if since, down := c.linkDown(); down {
-		return fmt.Errorf("%w for %s", marstek.ErrLinkDown, c.now().Sub(since).Round(time.Second))
+		return fmt.Errorf("%w: %w for %s", marstek.ErrControlNotAttempted, marstek.ErrLinkDown, c.now().Sub(since).Round(time.Second))
 	}
 	return c.setSelectConfirmed(ctx, selectRS485ControlMode, "enable")
 }
@@ -778,7 +778,7 @@ func (c *Client) getControlValue(ctx context.Context, path string) (string, erro
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("GET %s: status %d: %s", path, resp.StatusCode, string(body))
+		return "", fmt.Errorf("GET %s: status %d: %s", path, resp.StatusCode, responseBodyMessage(body))
 	}
 
 	var entity controlResponse
@@ -793,6 +793,10 @@ func (c *Client) getControlValue(ctx context.Context, path string) (string, erro
 		return strings.TrimSpace(string(entity.Value)), nil
 	}
 	return entity.State, nil
+}
+
+func responseBodyMessage(body []byte) string {
+	return strings.Join(strings.Fields(string(body)), " ")
 }
 
 func (c *Client) redactedTransportError(action string, err error) error {

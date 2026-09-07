@@ -59,7 +59,7 @@ handler/                 # HTTP health/metrics/status
 Copy `.env.example` to `.env`. Key settings:
 - `ESPHOME_URL`: required ESPHome device URL
 - `HOMEWIZARD_P1_URL`: P1 meter URL (optional; empty = disabled, `auto` = opt-in discovery)
-- `MIN_PRICE_SPREAD`: Minimum EUR/kWh spread to trigger trading
+- `MIN_PRICE_SPREAD`: Minimum expected profit in EUR/kWh after efficiency loss (historical name)
 - `BATTERY_EFFICIENCY`: Round-trip efficiency (default 0.90)
 - `CHARGE_POWER_W` / `DISCHARGE_POWER_W`: Power rates in watts
 - `TZ`: Timezone for scheduling (default Europe/Amsterdam)
@@ -114,7 +114,7 @@ Copy `.env.example` to `.env`. Key settings:
 - No auto-timeout on charge/discharge - service's refresh loop re-sends commands
 - Entity names use URL encoding (spaces as `%20`, Unicode division slash as `%E2%81%84`)
 - Passive mode refresh is verify-first: read the reported mode/power back and re-write only on mismatch (no Modbus writes otherwise)
-- Select-write retries are spaced 5 s / 15 s because the select value only updates on the next Modbus poll
+- Select writes retry once after 15 s because the select value only updates on the next Modbus poll
 - `CheckLink` staleness check runs every tick while a session is active (charging, discharging, manual discharging, solar charging)
 
 ### Legacy UDP Protocol (Marstek)
@@ -125,11 +125,12 @@ Copy `.env.example` to `.env`. Key settings:
 
 ## Trading Algorithm
 
-The analyzer (`service/analyzer.go`) selects globally optimal non-overlapping charge→discharge cycles over the known today/tomorrow horizon, subject to spread, efficiency, and cycle limits. Active automatic cycles retain their plan while refreshed plans are staged.
+The analyzer (`service/analyzer.go`) selects globally optimal non-overlapping charge→discharge cycles over the known today/tomorrow horizon, subject to expected profit after efficiency loss and cycle limits. Active automatic cycles retain their plan while refreshed plans are staged; a grid charge persists and revalidates its paired cycle before deadline-bounded battery control so the commitment survives restart without authorizing a different cycle. Restored cycles that fail the current profit floor retain only their discharge obligation.
 
 Execution (`service/service.go`, `service/charging_reservations.go`):
-- Reserve the cheapest remaining known grid slots to reach 100% by the next cheap-window deadline, recalculating from actual SOC with zero future solar forecast.
-- Solar replaces reserved grid energy only when its forgone export value is no greater than the marginal reservation price. Import/export use the same tariff.
+- Reserve the cheapest remaining known grid slots to reach 100% by the next cheap-window deadline, recalculating from actual SOC with zero future solar forecast. Exclude every grid slice that would individually violate the configured expected-profit floor.
+- Do not start or refresh automatic control in the final minute of its window; bind ESPHome control and battery-power verification to the active window deadline.
+- Solar replaces reserved grid energy only when its forgone export value is no greater than the marginal reservation price. If economics makes the reservation infeasible, solar must still satisfy the paired cycle's per-slice expected-profit ceiling; that ceiling remains active between the charge deadline and paired discharge. Import/export use the same tariff.
 - Measured taper reduces available delivery capacity; expose infeasibility and attempt best effort rather than guaranteeing 100%.
 - `lastChargePrice` is restored for information only, never a discharge gate.
 

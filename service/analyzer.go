@@ -37,9 +37,9 @@ type cycleChoice struct {
 
 // TimeWindow represents a time window for charging or discharging.
 type TimeWindow struct {
-	Start time.Time
-	End   time.Time
-	Price decimal.Decimal // Average price in this window
+	Start time.Time       `json:"start"`
+	End   time.Time       `json:"end"`
+	Price decimal.Decimal `json:"price"` // Average price in this window
 }
 
 // TradeCycle represents a paired charge and discharge window.
@@ -59,12 +59,13 @@ type TradingPlan struct {
 	MaxPrice         decimal.Decimal
 	Spread           decimal.Decimal // MaxPrice - MinPrice
 	IsProfitable     bool            // At least one profitable cycle exists
+	DischargeOnly    bool            // Restored commitment may discharge but cannot resume grid charging
 }
 
 // AnalyzerConfig contains parameters for price analysis.
 type AnalyzerConfig struct {
 	Efficiency         float64 // Battery round-trip efficiency (0.0-1.0)
-	MinPriceSpread     float64 // Minimum EUR/kWh spread to trigger trading
+	MinPriceSpread     float64 // Minimum expected profit in EUR/kWh after efficiency loss
 	BatteryCapacityKWh float64 // Battery capacity in kWh
 	BatteryMinSOC      float64 // Minimum SOC (0.0-1.0), e.g., 0.11 for 11%
 	ChargePowerW       int     // Charge power in watts
@@ -124,7 +125,7 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 	}
 
 	efficiency := decimal.NewFromFloat(cfg.Efficiency)
-	minSpread := decimal.NewFromFloat(cfg.MinPriceSpread)
+	minProfit := decimal.NewFromFloat(cfg.MinPriceSpread)
 
 	// Determine max cycles (default to 2 if not configured).
 	maxCycles := cfg.MaxCyclesPerDay
@@ -137,7 +138,7 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 		chargeWindowSize,
 		dischargeWindowSize,
 		efficiency,
-		minSpread,
+		minProfit,
 		maxCycles,
 	)
 
@@ -162,7 +163,7 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 
 // selectOptimalCycles uses dynamic programming to maximize total profit from up
 // to maxCycles chronological, non-overlapping charge/discharge pairs.
-func selectOptimalCycles(prices []priceSlot, chargeWindowSize, dischargeWindowSize int, efficiency, minSpread decimal.Decimal, maxCycles int) []TradeCycle {
+func selectOptimalCycles(prices []priceSlot, chargeWindowSize, dischargeWindowSize int, efficiency, minProfit decimal.Decimal, maxCycles int) []TradeCycle {
 	maxCycles = min(maxCycles, len(prices)/(chargeWindowSize+dischargeWindowSize))
 	if maxCycles == 0 {
 		return nil
@@ -182,18 +183,17 @@ func selectOptimalCycles(prices []priceSlot, chargeWindowSize, dischargeWindowSi
 			bestProfit := profits[cycleCount][chargeStart+1]
 			if chargeStart+chargeWindowSize <= len(prices) && chargeAverages[chargeStart].valid {
 				chargeAverage := chargeAverages[chargeStart].price
-				breakEvenPrice := chargeAverage.Div(efficiency)
 				for dischargeStart := chargeStart + chargeWindowSize; dischargeStart+dischargeWindowSize <= len(prices); dischargeStart++ {
 					if !dischargeAverages[dischargeStart].valid {
 						continue
 					}
 
 					dischargeAverage := dischargeAverages[dischargeStart].price
-					if dischargeAverage.LessThanOrEqual(breakEvenPrice) || dischargeAverage.Sub(chargeAverage).LessThan(minSpread) {
+					profit := dischargeAverage.Mul(efficiency).Sub(chargeAverage)
+					if !profit.IsPositive() || profit.LessThan(minProfit) {
 						continue
 					}
 
-					profit := dischargeAverage.Mul(efficiency).Sub(chargeAverage)
 					next := dischargeStart + dischargeWindowSize
 					totalProfit := profit.Add(profits[cycleCount-1][next])
 					if !totalProfit.GreaterThan(bestProfit) {

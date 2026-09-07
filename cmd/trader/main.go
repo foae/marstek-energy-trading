@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -26,6 +27,10 @@ import (
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	var envFileInvalid bool
 	if err := godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		// Do not include the parser error: it can quote a credential-bearing line.
@@ -36,15 +41,13 @@ func main() {
 	// Parse configuration
 	cfg, err := config.Load()
 	if err != nil {
-		if envFileInvalid {
-			emergencyURL := os.Getenv("ESPHOME_URL")
-			if emergencyURL == "" {
-				emergencyURL = emergencyESPHomeURL(".env")
-			}
-			reconcileBatteryAfterEnvFailure(emergencyURL)
+		emergencyURL := os.Getenv("ESPHOME_URL")
+		if emergencyURL == "" {
+			emergencyURL = emergencyESPHomeURL(".env")
 		}
+		reconcileBatteryAfterConfigFailure(emergencyURL)
 		slog.Error("failed to load config", "error", err)
-		os.Exit(1)
+		return 1
 	}
 
 	// Setup structured logging
@@ -65,7 +68,7 @@ func main() {
 		"service", cfg.ServiceName,
 		"listen_addr", cfg.HTTPListenAddr,
 		"nordpool_area", cfg.NordPoolArea,
-		"min_spread", cfg.MinPriceSpread,
+		"min_expected_profit_eur_kwh", cfg.MinPriceSpread,
 		"efficiency", cfg.BatteryEfficiency,
 		"energy_tax_eur_kwh", cfg.EnergyTaxEURPerKWh,
 		"vat_rate", cfg.VATRate,
@@ -89,8 +92,8 @@ func main() {
 	esphomeClient.SetRestartButton(cfg.ESPHomeRestartButton)
 	slog.Info("using ESPHome battery backend", "min_soc", minSOC, "bridge_restart", esphomeClient.RestartAvailable())
 	if envFileInvalid {
-		reconcileBatteryAfterEnvFailure(cfg.ESPHomeURL)
-		os.Exit(1)
+		reconcileBatteryAfterConfigFailure(cfg.ESPHomeURL)
+		return 1
 	}
 	p1URL := cfg.HomeWizardP1URL
 	if p1URL == "auto" {
@@ -158,6 +161,7 @@ func main() {
 	defer stop()
 	// WaitGroup for graceful shutdown
 	var wg sync.WaitGroup
+	var fatalError atomic.Bool
 
 	// Start HTTP server
 	wg.Add(1)
@@ -166,6 +170,7 @@ func main() {
 		slog.Info("HTTP server listening", "addr", cfg.HTTPListenAddr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("HTTP server error", "error", err)
+			fatalError.Store(true)
 			stop()
 		}
 	}()
@@ -176,6 +181,7 @@ func main() {
 		defer wg.Done()
 		if err := tradingSvc.Start(ctx); err != nil && err != context.Canceled {
 			slog.Error("trading service error", "error", err)
+			fatalError.Store(true)
 			stop()
 		}
 	}()
@@ -190,18 +196,23 @@ func main() {
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		slog.Error("server shutdown error", "error", err)
+		fatalError.Store(true)
 	}
 
 	// Wait for all goroutines to complete
 	wg.Wait()
 
 	slog.Info("shutdown complete")
+	if fatalError.Load() {
+		return 1
+	}
+	return 0
 }
 
-func reconcileBatteryAfterEnvFailure(rawURL string) {
+func reconcileBatteryAfterConfigFailure(rawURL string) {
 	rawURL = safeEmergencyESPHomeURL(rawURL)
 	if rawURL == "" {
-		slog.Error("cannot identify a safe ESPHome endpoint for emergency stop after .env load failure")
+		slog.Error("cannot identify a safe ESPHome endpoint for emergency stop after configuration failure")
 		return
 	}
 	client := esphome.New(rawURL, 11)
@@ -209,10 +220,10 @@ func reconcileBatteryAfterEnvFailure(rawURL string) {
 	err := client.IdleContext(stopCtx)
 	cancel()
 	if err != nil {
-		slog.Error("failed to confirm battery stop after .env load failure", "error", err)
+		slog.Error("failed to confirm battery stop after configuration failure", "error", err)
 		return
 	}
-	slog.Info("battery stop confirmed after .env load failure")
+	slog.Info("battery stop confirmed after configuration failure")
 }
 
 // emergencyESPHomeURL extracts only the battery endpoint from a malformed

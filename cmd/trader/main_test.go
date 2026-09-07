@@ -6,6 +6,13 @@ import (
 	"testing"
 )
 
+func TestRunReturnsFailureForInvalidConfig(t *testing.T) {
+	t.Setenv("ESPHOME_URL", "")
+	if got := run(); got != 1 {
+		t.Fatalf("run() exit code = %d, want 1", got)
+	}
+}
+
 func TestEmergencyESPHomeURLExtractsSafeEndpointFromMalformedFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".env")
 	contents := "BATTERY_MIN_SOC=0.30\nESPHOME_URL=http://battery-bridge.local\nBROKEN=\"unterminated\n"

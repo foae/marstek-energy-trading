@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"net/http"
@@ -20,16 +21,19 @@ const (
 	setMyCommandsAPI     = "https://api.telegram.org/bot%s/setMyCommands"
 	commandMaxAge        = 30 * time.Second
 	updateOffsetFileMode = 0o600
+	messageTextLimit     = 4096
 )
 
 // Client is a Telegram bot client.
 type Client struct {
-	botToken     string
-	chatID       string
-	statePath    string
-	httpClient   *http.Client
-	enabled      bool
-	lastUpdateID int64
+	botToken        string
+	chatID          string
+	statePath       string
+	httpClient      *http.Client
+	enabled         bool
+	lastUpdateID    int64
+	syncDirectoryFn func(string) error
+	pendingDirSyncs []string
 }
 
 // New creates a new Telegram client.
@@ -206,19 +210,22 @@ func (c *Client) SendError(ctx context.Context, errMsg string) error {
 
 // DailySummaryData contains all data for the daily summary notification.
 type DailySummaryData struct {
-	Date              time.Time
-	PnLEUR            float64
-	ChargedKWh        float64
-	DischargedKWh     float64
-	ChargeCycles      int
-	DischargeCycles   int
-	SolarChargedKWh   float64
-	SolarChargeCycles int
-	AvgChargePrice    float64
-	AvgDischargePrice float64
-	MinChargePrice    float64
-	MaxDischargePrice float64
-	TotalPnLEUR       float64 // cumulative P&L
+	Date               time.Time
+	PnLEUR             float64
+	ChargedKWh         float64
+	DischargedKWh      float64
+	ChargeCycles       int
+	DischargeCycles    int
+	SolarChargedKWh    float64
+	SolarChargeCycles  int
+	AvgChargePrice     float64
+	AvgDischargePrice  float64
+	MinChargePrice     float64
+	MaxDischargePrice  float64
+	TotalPnLEUR        float64 // cumulative P&L
+	UnpricedKWh        float64
+	PnLIncomplete      bool
+	TotalPnLIncomplete bool
 }
 
 // SendDailySummary sends a daily P&L summary (simple version for backward compatibility).
@@ -247,37 +254,52 @@ func (c *Client) SendDailySummaryFull(ctx context.Context, data DailySummaryData
 	if data.TotalPnLEUR > 0 {
 		totalSign = "+"
 	}
+	dailyPnLLabel := "Today's P&L"
+	if data.PnLIncomplete {
+		dailyPnLLabel = "Today's known cash flow"
+	}
+	totalPnLLabel := "Cumulative P&L"
+	if data.TotalPnLIncomplete {
+		totalPnLLabel = "Cumulative known cash flow"
+	}
 
 	var text string
-	if data.ChargeCycles == 0 && data.DischargeCycles == 0 && data.SolarChargeCycles == 0 {
+	if data.ChargeCycles == 0 && data.DischargeCycles == 0 && data.SolarChargeCycles == 0 &&
+		data.ChargedKWh == 0 && data.DischargedKWh == 0 && data.SolarChargedKWh == 0 && data.PnLEUR == 0 && data.UnpricedKWh == 0 {
 		text = fmt.Sprintf(
 			"%s <b>Daily Summary - %s</b>\n\n"+
 				"No trades today.\n\n"+
-				"💰 <b>Cumulative P&L:</b> %s%.4f EUR",
+				"💰 <b>%s:</b> %s%.4f EUR",
 			pnlEmoji,
 			data.Date.Format("02 Jan 2006"),
+			totalPnLLabel,
 			totalSign, data.TotalPnLEUR,
 		)
-	} else if data.ChargeCycles == 0 && data.DischargeCycles == 0 {
-		// Solar-only day: no grid trades but solar energy was captured
+	} else if data.ChargeCycles == 0 && data.DischargeCycles == 0 && data.SolarChargedKWh > 0 {
+		// Solar-only sessions can still import priced grid energy while settling.
 		text = fmt.Sprintf(
 			"%s <b>Daily Summary - %s</b>\n\n"+
 				"☀️ <b>Solar charged:</b> %.2f kWh (%d sessions)\n\n"+
-				"💰 <b>Cumulative P&L:</b> %s%.4f EUR",
+				"💰 <b>%s:</b> %s%.4f EUR\n\n"+
+				"📊 <b>%s:</b> %s%.4f EUR",
 			pnlEmoji,
 			data.Date.Format("02 Jan 2006"),
 			data.SolarChargedKWh, data.SolarChargeCycles,
+			dailyPnLLabel,
+			pnlSign, data.PnLEUR,
+			totalPnLLabel,
 			totalSign, data.TotalPnLEUR,
 		)
 	} else {
 		text = fmt.Sprintf(
 			"%s <b>Daily Summary - %s</b>\n\n"+
-				"💰 <b>Today's P&L:</b> %s%.4f EUR\n\n"+
+				"💰 <b>%s:</b> %s%.4f EUR\n\n"+
 				"🔋 <b>Charged:</b> %.2f kWh (%d cycles)\n"+
 				"   Avg price: %.4f EUR/kWh\n"+
 				"   Best price: %.4f EUR/kWh\n",
 			pnlEmoji,
 			data.Date.Format("02 Jan 2006"),
+			dailyPnLLabel,
 			pnlSign, data.PnLEUR,
 			data.ChargedKWh, data.ChargeCycles,
 			data.AvgChargePrice,
@@ -295,12 +317,16 @@ func (c *Client) SendDailySummaryFull(ctx context.Context, data DailySummaryData
 			"\n⚡ <b>Discharged:</b> %.2f kWh (%d cycles)\n"+
 				"   Avg price: %.4f EUR/kWh\n"+
 				"   Best price: %.4f EUR/kWh\n\n"+
-				"📊 <b>Cumulative P&L:</b> %s%.4f EUR",
+				"📊 <b>%s:</b> %s%.4f EUR",
 			data.DischargedKWh, data.DischargeCycles,
 			data.AvgDischargePrice,
 			data.MaxDischargePrice,
+			totalPnLLabel,
 			totalSign, data.TotalPnLEUR,
 		)
+	}
+	if data.UnpricedKWh > 0 {
+		text += fmt.Sprintf("\n\n⚠️ %.2f kWh could not be priced; cash-flow totals are incomplete.", data.UnpricedKWh)
 	}
 
 	return c.SendMessage(ctx, text)
@@ -314,14 +340,17 @@ func (c *Client) SendStartup(ctx context.Context, serviceName string) error {
 
 // StatusData contains current status for the /status command.
 type StatusData struct {
-	State            string
-	BatteryAvailable bool
-	BatterySOC       int
-	BatteryPowerW    float64
-	CurrentPrice     float64
-	NextAction       string
-	TodayPnL         float64
-	TotalPnL         float64
+	State              string
+	BatteryAvailable   bool
+	BatterySOC         int
+	BatteryPowerW      float64
+	CurrentPrice       float64
+	CurrentPriceKnown  bool
+	NextAction         string
+	TodayPnL           float64
+	TotalPnL           float64
+	TodayPnLIncomplete bool
+	TotalPnLIncomplete bool
 }
 
 // SendStatus sends the current status.
@@ -341,23 +370,37 @@ func (c *Client) SendStatus(ctx context.Context, data StatusData) error {
 		batterySOC = fmt.Sprintf("%d%%", data.BatterySOC)
 		batteryPower = fmt.Sprintf("%.0f W", data.BatteryPowerW)
 	}
+	price := "unavailable"
+	if data.CurrentPriceKnown {
+		price = fmt.Sprintf("%.4f EUR/kWh", data.CurrentPrice)
+	}
+	todayPnLLabel := "Today P&L"
+	if data.TodayPnLIncomplete {
+		todayPnLLabel = "Today's known cash flow"
+	}
+	totalPnLLabel := "Total P&L"
+	if data.TotalPnLIncomplete {
+		totalPnLLabel = "Total known cash flow"
+	}
 
 	text := fmt.Sprintf(
 		"%s <b>Current Status</b>\n\n"+
 			"<b>State:</b> %s\n"+
 			"<b>Battery:</b> %s\n"+
 			"<b>Battery power:</b> %s\n"+
-			"<b>Price:</b> %.4f EUR/kWh\n"+
+			"<b>Price:</b> %s\n"+
 			"<b>Next:</b> %s\n\n"+
-			"<b>Today P&L:</b> %.4f EUR\n"+
-			"<b>Total P&L:</b> %.4f EUR",
+			"<b>%s:</b> %.4f EUR\n"+
+			"<b>%s:</b> %.4f EUR",
 		stateEmoji,
 		data.State,
 		batterySOC,
 		batteryPower,
-		data.CurrentPrice,
+		price,
 		data.NextAction,
+		todayPnLLabel,
 		data.TodayPnL,
+		totalPnLLabel,
 		data.TotalPnL,
 	)
 	return c.SendMessage(ctx, text)
@@ -407,19 +450,22 @@ type TradingPlanCycle struct {
 
 // TradingPlanData contains data for trading plan notifications.
 type TradingPlanData struct {
-	Day           string // "today" or "tomorrow"
-	Date          time.Time
-	SlotsTotal    int
-	SlotsAnalyzed int
-	PriceMin      float64
-	PriceMax      float64
-	IsProfitable  bool
-	Cycles        []TradingPlanCycle
-	// For non-profitable plans
-	Reason                 string
-	MinSpreadForEfficiency float64
-	MinSpreadConfigured    float64
-	BatteryEfficiency      float64
+	Day               string // Planning-horizon label, currently "horizon".
+	Date              time.Time
+	SlotsTotal        int
+	SlotsAnalyzed     int
+	PriceMin          float64
+	PriceMax          float64
+	IsProfitable      bool
+	Cycles            []TradingPlanCycle
+	Reason            string // Only shown when the plan is not profitable.
+	MinExpectedProfit float64
+	BatteryEfficiency float64
+	PlanRetained      bool
+	DischargeOnly     bool
+	DischargeStart    string
+	DischargeEnd      string
+	DischargePrice    float64
 }
 
 // SendTradingPlan sends a trading plan notification.
@@ -428,40 +474,62 @@ func (c *Client) SendTradingPlan(ctx context.Context, data TradingPlanData) erro
 
 	dateStr := data.Date.Format("02 Jan 2006")
 	dayLabel := "📅"
-	if data.Day == "tomorrow" {
-		dayLabel = "🔮"
-	}
 
-	if !data.IsProfitable {
+	if data.DischargeOnly {
+		text = fmt.Sprintf(
+			"%s <b>Retained Discharge Obligation - %s</b>\n"+
+				"<i>%s</i>\n\n"+
+				"Grid charging is disabled under the current profitability floor.\n\n"+
+				"Discharge: %s - %s @ %.4f EUR/kWh\n"+
+				"Configured minimum net profit: %.4f EUR/kWh\n"+
+				"Battery efficiency: %.1f%%",
+			dayLabel, data.Day, dateStr,
+			data.DischargeStart, data.DischargeEnd, data.DischargePrice,
+			data.MinExpectedProfit, data.BatteryEfficiency*100,
+		)
+		if data.PlanRetained {
+			text += "\n\n<i>Active committed-cycle plan retained; refreshed plan pending.</i>"
+		}
+	} else if !data.IsProfitable {
 		text = fmt.Sprintf(
 			"%s <b>Trading Plan - %s</b>\n"+
 				"<i>%s</i>\n\n"+
 				"❌ <b>No profitable opportunities</b>\n\n"+
-				"Price range: %.4f - %.4f EUR/kWh\n"+
+				"Plan prices: %.4f - %.4f EUR/kWh\n"+
 				"Slots analyzed: %d of %d\n\n"+
 				"<i>%s</i>\n"+
-				"Min spread needed: %.4f EUR/kWh\n"+
-				"Configured min spread: %.4f EUR/kWh",
+				"Configured minimum net profit: %.4f EUR/kWh\n"+
+				"Battery efficiency: %.1f%%",
 			dayLabel, data.Day, dateStr,
 			data.PriceMin, data.PriceMax,
 			data.SlotsAnalyzed, data.SlotsTotal,
 			data.Reason,
-			data.MinSpreadForEfficiency,
-			data.MinSpreadConfigured,
+			data.MinExpectedProfit,
+			data.BatteryEfficiency*100,
 		)
+		if data.PlanRetained {
+			text += "\n\n<i>Active committed-cycle plan retained; refreshed plan pending.</i>"
+		}
 	} else {
 		text = fmt.Sprintf(
 			"%s <b>Trading Plan - %s</b>\n"+
 				"<i>%s</i>\n\n"+
 				"✅ <b>%d profitable cycle(s) found</b>\n\n"+
-				"Price range: %.4f - %.4f EUR/kWh\n",
+				"Plan prices: %.4f - %.4f EUR/kWh\n"+
+				"Configured minimum net profit: %.4f EUR/kWh\n"+
+				"Battery efficiency: %.1f%%\n",
 			dayLabel, data.Day, dateStr,
 			len(data.Cycles),
 			data.PriceMin, data.PriceMax,
+			data.MinExpectedProfit,
+			data.BatteryEfficiency*100,
 		)
+		if data.PlanRetained {
+			text += "\n\n<i>Active committed-cycle plan retained; refreshed plan pending.</i>"
+		}
 
 		for i, cycle := range data.Cycles {
-			text += fmt.Sprintf(
+			cycleText := fmt.Sprintf(
 				"\n<b>Cycle %d:</b>\n"+
 					"🔋 Charge: %s - %s @ %.4f EUR/kWh\n"+
 					"⚡ Discharge: %s - %s @ %.4f EUR/kWh\n"+
@@ -471,9 +539,23 @@ func (c *Client) SendTradingPlan(ctx context.Context, data TradingPlanData) erro
 				cycle.DischargeStart, cycle.DischargeEnd, cycle.DischargePrice,
 				cycle.ProfitPerKWh,
 			)
+			if i == len(data.Cycles)-1 && len(text)+len(cycleText) <= messageTextLimit {
+				text += cycleText
+				continue
+			}
+			remaining := len(data.Cycles) - i
+			cycleLabel := "cycles"
+			if remaining == 1 {
+				cycleLabel = "cycle"
+			}
+			omittedText := fmt.Sprintf("\n<i>%d %s omitted from this message.</i>", remaining, cycleLabel)
+			if len(text)+len(cycleText)+len(omittedText) > messageTextLimit {
+				text += omittedText
+				break
+			}
+			text += cycleText
 		}
 	}
-
 	return c.SendMessage(ctx, text)
 }
 
@@ -548,16 +630,91 @@ func (c *Client) redactedError(action string, err error) error {
 }
 
 func (c *Client) persistLastUpdateID(updateID int64) error {
-	if err := os.MkdirAll(filepath.Dir(c.statePath), 0o755); err != nil {
+	stateDir := filepath.Dir(c.statePath)
+	if err := c.flushPendingDirectorySyncs(); err != nil {
+		return err
+	}
+	var missing []string
+	for path := filepath.Clean(stateDir); path != "."; path = filepath.Dir(path) {
+		info, err := os.Stat(path)
+		if err == nil {
+			if !info.IsDir() {
+				return fmt.Errorf("create Telegram state directory: %s is not a directory", path)
+			}
+			break
+		}
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect Telegram state directory %s: %w", path, err)
+		}
+		missing = append(missing, path)
+		if filepath.Dir(path) == path {
+			break
+		}
+	}
+	for i := len(missing) - 1; i >= 0; i-- {
+		c.pendingDirSyncs = append(c.pendingDirSyncs, filepath.Dir(missing[i]))
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return fmt.Errorf("create Telegram state directory: %w", err)
 	}
+	if stateDir != "." && filepath.Dir(stateDir) != stateDir {
+		if err := os.Chmod(stateDir, 0o700); err != nil {
+			return fmt.Errorf("protect Telegram state directory: %w", err)
+		}
+	}
+	if err := c.flushPendingDirectorySyncs(); err != nil {
+		return err
+	}
 	tmpPath := c.statePath + ".tmp"
-	if err := os.WriteFile(tmpPath, []byte(strconv.FormatInt(updateID, 10)+"\n"), updateOffsetFileMode); err != nil {
-		return fmt.Errorf("write Telegram update offset: %w", err)
+	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, updateOffsetFileMode)
+	if err != nil {
+		return fmt.Errorf("open Telegram update offset: %w", err)
+	}
+	if err := file.Chmod(updateOffsetFileMode); err != nil {
+		_ = file.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("protect Telegram update offset: %w", err)
+	}
+	_, writeErr := file.WriteString(strconv.FormatInt(updateID, 10) + "\n")
+	if writeErr == nil {
+		writeErr = file.Sync()
+	}
+	if err := errors.Join(writeErr, file.Close()); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("persist Telegram update offset contents: %w", err)
 	}
 	if err := os.Rename(tmpPath, c.statePath); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("persist Telegram update offset: %w", err)
 	}
+	if err := c.syncDirectory(stateDir); err != nil {
+		return fmt.Errorf("sync Telegram state directory: %w", err)
+	}
 	return nil
+}
+
+func (c *Client) flushPendingDirectorySyncs() error {
+	for len(c.pendingDirSyncs) > 0 {
+		path := c.pendingDirSyncs[0]
+		if err := c.syncDirectory(path); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				c.pendingDirSyncs = c.pendingDirSyncs[1:]
+				continue
+			}
+			return fmt.Errorf("publish Telegram state directory through %s: %w", path, err)
+		}
+		c.pendingDirSyncs = c.pendingDirSyncs[1:]
+	}
+	return nil
+}
+
+func (c *Client) syncDirectory(path string) error {
+	if c.syncDirectoryFn != nil {
+		return c.syncDirectoryFn(path)
+	}
+	dir, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open directory %s for sync: %w", path, err)
+	}
+	return errors.Join(dir.Sync(), dir.Close())
 }

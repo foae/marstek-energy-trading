@@ -87,7 +87,12 @@ var (
 
 	traderPnL = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "energy_trader_pnl_eur_total",
-		Help: "Total profit and loss in EUR",
+		Help: "Known total cash flow in EUR; consult energy_trader_cash_flow_unpriced_energy_kwh for completeness",
+	})
+
+	unpricedCashFlowEnergy = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "energy_trader_cash_flow_unpriced_energy_kwh",
+		Help: "Cumulative grid charge and discharge energy excluded from known cash flow because its tariff was unavailable",
 	})
 )
 
@@ -95,6 +100,7 @@ func init() {
 	prometheus.MustRegister(batterySOC)
 	prometheus.MustRegister(traderState)
 	prometheus.MustRegister(traderPnL)
+	prometheus.MustRegister(unpricedCashFlowEnergy)
 }
 
 // metricsHandler returns the Prometheus metrics handler.
@@ -119,8 +125,9 @@ func (h *Handler) updateMetrics(ctx context.Context) {
 
 	recorder := h.svc.GetRecorder()
 	if recorder != nil {
-		pnl, _ := recorder.GetTotalPnL().Float64()
+		pnl, unpricedKWh := historyMetricValues(recorder.GetHistory())
 		traderPnL.Set(pnl)
+		unpricedCashFlowEnergy.Set(unpricedKWh)
 	}
 
 	// Update battery SOC from current status
@@ -130,4 +137,14 @@ func (h *Handler) updateMetrics(ctx context.Context) {
 	} else {
 		batterySOC.Set(math.NaN())
 	}
+}
+
+func historyMetricValues(history service.History) (float64, float64) {
+	pnl, _ := history.TotalPnL.Float64()
+	unpricedKWh := 0.0
+	for _, day := range history.Days {
+		value, _ := day.CashFlowUnpricedKWh.Float64()
+		unpricedKWh += value
+	}
+	return pnl, unpricedKWh
 }

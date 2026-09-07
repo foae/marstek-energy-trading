@@ -1,8 +1,10 @@
 package service
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -444,6 +446,348 @@ func TestSaveTrades_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestAutomaticCycleCommitmentRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC)
+	cycle := &TradeCycle{
+		ChargeWindow:    TimeWindow{Start: now, End: now.Add(time.Hour), Price: decimal.NewFromFloat(.10)},
+		DischargeWindow: TimeWindow{Start: now.Add(2 * time.Hour), End: now.Add(3 * time.Hour), Price: decimal.NewFromFloat(.30)},
+		Profit:          decimal.NewFromFloat(.17),
+	}
+	r := NewRecorder(dir, .90, time.UTC)
+	if err := r.SaveAutomaticCycleCommitment(cycle); err != nil {
+		t.Fatalf("save commitment: %v", err)
+	}
+
+	loaded, err := NewRecorder(dir, .90, time.UTC).LoadAutomaticCycleCommitment()
+	if err != nil {
+		t.Fatalf("load commitment: %v", err)
+	}
+	if loaded == nil || !loaded.DischargeWindow.End.Equal(cycle.DischargeWindow.End) ||
+		!loaded.DischargeWindow.Price.Equal(cycle.DischargeWindow.Price) {
+		t.Fatalf("loaded commitment = %+v, want %+v", loaded, cycle)
+	}
+	if err := r.SaveAutomaticCycleCommitment(nil); err != nil {
+		t.Fatalf("clear commitment: %v", err)
+	}
+	loaded, err = r.LoadAutomaticCycleCommitment()
+	if err != nil || loaded != nil {
+		t.Fatalf("commitment after clear = %+v, error = %v", loaded, err)
+	}
+}
+
+func TestAutomaticCycleCommitmentClearRetrySyncsAbsentDeletion(t *testing.T) {
+	dir := t.TempDir()
+	r := NewRecorder(dir, .90, time.UTC)
+	now := time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC)
+	cycle := &TradeCycle{
+		ChargeWindow:    TimeWindow{Start: now, End: now.Add(time.Hour)},
+		DischargeWindow: TimeWindow{Start: now.Add(2 * time.Hour), End: now.Add(3 * time.Hour)},
+	}
+	if err := r.SaveAutomaticCycleCommitment(cycle); err != nil {
+		t.Fatalf("save commitment: %v", err)
+	}
+
+	syncCalls := 0
+	r.syncDirectoryFn = func(string) error {
+		syncCalls++
+		if syncCalls == 1 {
+			return errors.New("injected directory sync failure")
+		}
+		return nil
+	}
+	if err := r.SaveAutomaticCycleCommitment(nil); err == nil {
+		t.Fatal("first clear unexpectedly ignored directory sync failure")
+	}
+	if err := r.SaveAutomaticCycleCommitment(nil); err != nil {
+		t.Fatalf("retry clear with already-absent file: %v", err)
+	}
+	if syncCalls != 2 {
+		t.Fatalf("directory sync calls = %d, want retry after absent deletion", syncCalls)
+	}
+}
+
+func TestFlushTradesRetriesFailedRecordPersistence(t *testing.T) {
+	dir := t.TempDir()
+	r := NewRecorder(dir, .90, time.UTC)
+	syncCalls := 0
+	r.syncDirectoryFn = func(string) error {
+		syncCalls++
+		if syncCalls == 1 {
+			return errors.New("injected directory sync failure")
+		}
+		return nil
+	}
+	trade := Trade{
+		Timestamp: time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC),
+		Action:    ActionCharge,
+		EnergyKWh: decimal.RequireFromString("0.5"),
+	}
+	if err := r.RecordTrade(trade); err == nil {
+		t.Fatal("RecordTrade() error = nil, want injected persistence failure")
+	}
+	if err := r.FlushTrades(); err != nil {
+		t.Fatalf("FlushTrades() retry error = %v", err)
+	}
+
+	reloaded := NewRecorder(dir, .90, time.UTC)
+	if err := reloaded.LoadTrades(); err != nil {
+		t.Fatalf("LoadTrades() error = %v", err)
+	}
+	history := reloaded.GetHistory()
+	if len(history.Days) != 1 || len(history.Days[0].Trades) != 1 || !history.Days[0].Trades[0].EnergyKWh.Equal(trade.EnergyKWh) {
+		t.Fatalf("flushed trade history = %+v", history)
+	}
+}
+
+func TestRecordTradeRejectsInconsistentDayAllocations(t *testing.T) {
+	r := NewRecorder("", .90, time.UTC)
+	err := r.RecordTrade(Trade{
+		Timestamp: time.Date(2024, 1, 15, 23, 30, 0, 0, time.UTC),
+		Action:    ActionCharge,
+		PriceEUR:  decimal.RequireFromString("0.10"),
+		DurationS: 60,
+		EnergyKWh: decimal.NewFromInt(1),
+		DayAllocations: []TradeDayAllocation{{
+			Timestamp:      time.Date(2024, 1, 15, 23, 30, 0, 0, time.UTC),
+			DurationS:      60,
+			EnergyKWh:      decimal.NewFromInt(2),
+			PricedValueEUR: decimal.RequireFromString("0.20"),
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "do not match aggregate") {
+		t.Fatalf("RecordTrade() error = %v, want inconsistent allocation rejection", err)
+	}
+	if history := r.GetHistory(); len(history.Days) != 0 {
+		t.Fatalf("invalid trade mutated history: %+v", history)
+	}
+
+	for _, test := range []struct {
+		name  string
+		trade Trade
+	}{
+		{
+			name: "zero duration",
+			trade: Trade{
+				Timestamp: time.Date(2024, 1, 15, 23, 30, 0, 0, time.UTC), Action: ActionCharge,
+				PriceEUR: decimal.RequireFromString("0.10"), DurationS: 60, EnergyKWh: decimal.NewFromInt(1),
+				DayAllocations: []TradeDayAllocation{{Timestamp: time.Date(2024, 1, 15, 23, 30, 0, 0, time.UTC), EnergyKWh: decimal.NewFromInt(1), PricedValueEUR: decimal.RequireFromString("0.10")}},
+			},
+		},
+		{
+			name: "partial duration coverage",
+			trade: Trade{
+				Timestamp: time.Date(2024, 1, 15, 23, 30, 0, 0, time.UTC), Action: ActionCharge,
+				PriceEUR: decimal.RequireFromString("0.10"), DurationS: 60, EnergyKWh: decimal.NewFromInt(1),
+				DayAllocations: []TradeDayAllocation{{Timestamp: time.Date(2024, 1, 15, 23, 30, 0, 0, time.UTC), DurationS: 30, EnergyKWh: decimal.NewFromInt(1), PricedValueEUR: decimal.RequireFromString("0.10")}},
+			},
+		},
+		{
+			name: "overlapping intervals",
+			trade: Trade{
+				Timestamp: time.Date(2024, 1, 15, 23, 30, 0, 0, time.UTC), Action: ActionCharge,
+				PriceEUR: decimal.RequireFromString("0.10"), DurationS: 60, EnergyKWh: decimal.NewFromInt(1),
+				DayAllocations: []TradeDayAllocation{
+					{Timestamp: time.Date(2024, 1, 15, 23, 30, 0, 0, time.UTC), DurationS: 40, EnergyKWh: decimal.RequireFromString("0.5"), PricedValueEUR: decimal.RequireFromString("0.05")},
+					{Timestamp: time.Date(2024, 1, 15, 23, 30, 20, 0, time.UTC), DurationS: 40, EnergyKWh: decimal.RequireFromString("0.5"), PricedValueEUR: decimal.RequireFromString("0.05")},
+				},
+			},
+		},
+		{
+			name: "overlapping solar components",
+			trade: Trade{
+				Timestamp: time.Date(2024, 1, 15, 23, 30, 0, 0, time.UTC), Action: ActionSolarCharge, DurationS: 60,
+				EnergyKWh: decimal.NewFromInt(1), GridEnergyKWh: decimal.RequireFromString("0.8"), GridUnpricedKWh: decimal.RequireFromString("0.8"), UnpricedKWh: decimal.RequireFromString("0.5"),
+				DayAllocations: []TradeDayAllocation{{Timestamp: time.Date(2024, 1, 15, 23, 30, 0, 0, time.UTC), DurationS: 60, EnergyKWh: decimal.NewFromInt(1), GridEnergyKWh: decimal.RequireFromString("0.8"), GridUnpricedKWh: decimal.RequireFromString("0.8"), UnpricedKWh: decimal.RequireFromString("0.5")}},
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := NewRecorder("", .90, time.UTC).RecordTrade(test.trade); err == nil {
+				t.Fatal("RecordTrade() error = nil, want invalid allocation rejection")
+			}
+		})
+	}
+}
+
+func TestRetiredDischargeWindowsRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	windows := []TimeWindow{{
+		Start: time.Date(2024, 1, 15, 18, 0, 0, 0, time.UTC),
+		End:   time.Date(2024, 1, 15, 19, 0, 0, 0, time.UTC),
+		Price: decimal.RequireFromString("0.30"),
+	}}
+	if err := NewRecorder(dir, .90, time.UTC).SaveRetiredDischargeWindows(windows); err != nil {
+		t.Fatalf("SaveRetiredDischargeWindows() error = %v", err)
+	}
+	loaded, err := NewRecorder(dir, .90, time.UTC).LoadRetiredDischargeWindows()
+	if err != nil {
+		t.Fatalf("LoadRetiredDischargeWindows() error = %v", err)
+	}
+	if len(loaded) != 1 || !sameWindowPeriod(loaded[0], windows[0]) || !loaded[0].Price.Equal(windows[0].Price) {
+		t.Fatalf("loaded retired windows = %+v, want %+v", loaded, windows)
+	}
+}
+
+func TestAutomaticCycleCommitmentClearRecreatesMissingDataDirectory(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "nested", "data")
+	r := NewRecorder(dataDir, .90, time.UTC)
+	if err := os.RemoveAll(dataDir); err != nil {
+		t.Fatalf("remove data directory: %v", err)
+	}
+
+	if err := r.SaveAutomaticCycleCommitment(nil); err != nil {
+		t.Fatalf("clear commitment with missing data directory: %v", err)
+	}
+	if info, err := os.Stat(dataDir); err != nil || !info.IsDir() {
+		t.Fatalf("recreated data directory info = %+v, error = %v", info, err)
+	}
+}
+
+func TestAutomaticCycleCommitmentPublishesNewDataDirectoryParents(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "nested", "data")
+	r := NewRecorder(dataDir, .90, time.UTC)
+	now := time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC)
+	var synced []string
+	r.syncDirectoryFn = func(path string) error {
+		synced = append(synced, filepath.Clean(path))
+		return nil
+	}
+	cycle := &TradeCycle{
+		ChargeWindow:    TimeWindow{Start: now, End: now.Add(time.Hour)},
+		DischargeWindow: TimeWindow{Start: now.Add(2 * time.Hour), End: now.Add(3 * time.Hour)},
+	}
+	if err := r.SaveAutomaticCycleCommitment(cycle); err != nil {
+		t.Fatalf("save commitment: %v", err)
+	}
+	want := []string{root, filepath.Join(root, "nested"), dataDir}
+	if len(synced) != len(want) {
+		t.Fatalf("synced directories = %v, want %v", synced, want)
+	}
+	for i := range want {
+		if synced[i] != filepath.Clean(want[i]) {
+			t.Fatalf("synced directories = %v, want %v", synced, want)
+		}
+	}
+}
+
+func TestAutomaticCycleCommitmentRetriesFailedParentDirectorySync(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "nested", "data")
+	r := NewRecorder(dataDir, .90, time.UTC)
+	now := time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC)
+	cycle := &TradeCycle{
+		ChargeWindow:    TimeWindow{Start: now, End: now.Add(time.Hour)},
+		DischargeWindow: TimeWindow{Start: now.Add(2 * time.Hour), End: now.Add(3 * time.Hour)},
+	}
+	var synced []string
+	r.syncDirectoryFn = func(path string) error {
+		synced = append(synced, filepath.Clean(path))
+		if len(synced) == 1 {
+			return errors.New("injected parent sync failure")
+		}
+		return nil
+	}
+
+	if err := r.SaveAutomaticCycleCommitment(cycle); err == nil {
+		t.Fatal("first save unexpectedly ignored parent-directory sync failure")
+	}
+	if err := r.SaveAutomaticCycleCommitment(cycle); err != nil {
+		t.Fatalf("retry save: %v", err)
+	}
+	want := []string{root, root, filepath.Join(root, "nested"), dataDir}
+	if len(synced) != len(want) {
+		t.Fatalf("synced directories = %v, want %v", synced, want)
+	}
+	for i := range want {
+		if synced[i] != filepath.Clean(want[i]) {
+			t.Fatalf("synced directories = %v, want %v", synced, want)
+		}
+	}
+}
+
+func TestLoadTradesPublishesFreshDataDirectoryParents(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "nested", "data")
+	r := NewRecorder(dataDir, .90, time.UTC)
+	var synced []string
+	r.syncDirectoryFn = func(path string) error {
+		synced = append(synced, filepath.Clean(path))
+		return nil
+	}
+
+	if err := r.LoadTrades(); err != nil {
+		t.Fatalf("LoadTrades() error = %v", err)
+	}
+	want := []string{root, filepath.Join(root, "nested"), dataDir}
+	if len(synced) != len(want) {
+		t.Fatalf("synced directories = %v, want %v", synced, want)
+	}
+	for i := range want {
+		if synced[i] != filepath.Clean(want[i]) {
+			t.Fatalf("synced directories = %v, want %v", synced, want)
+		}
+	}
+}
+
+func TestAutomaticCycleCommitmentRetriesAfterPartialDirectoryCreation(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "nested", "data")
+	r := NewRecorder(dataDir, .90, time.UTC)
+	mkdirCalls := 0
+	r.mkdirAllFn = func(path string, mode os.FileMode) error {
+		mkdirCalls++
+		if mkdirCalls == 1 {
+			if err := os.MkdirAll(filepath.Dir(path), mode); err != nil {
+				return err
+			}
+			return errors.New("injected partial mkdir failure")
+		}
+		return os.MkdirAll(path, mode)
+	}
+	var synced []string
+	r.syncDirectoryFn = func(path string) error {
+		synced = append(synced, filepath.Clean(path))
+		return nil
+	}
+	now := time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC)
+	cycle := &TradeCycle{
+		ChargeWindow:    TimeWindow{Start: now, End: now.Add(time.Hour)},
+		DischargeWindow: TimeWindow{Start: now.Add(2 * time.Hour), End: now.Add(3 * time.Hour)},
+	}
+
+	if err := r.SaveAutomaticCycleCommitment(cycle); err == nil {
+		t.Fatal("first save unexpectedly ignored partial directory creation failure")
+	}
+	if err := r.SaveAutomaticCycleCommitment(cycle); err != nil {
+		t.Fatalf("retry save: %v", err)
+	}
+	want := []string{root, filepath.Join(root, "nested"), filepath.Join(root, "nested"), dataDir}
+	if len(synced) != len(want) {
+		t.Fatalf("synced directories = %v, want %v", synced, want)
+	}
+	for i := range want {
+		if synced[i] != filepath.Clean(want[i]) {
+			t.Fatalf("synced directories = %v, want %v", synced, want)
+		}
+	}
+}
+
+func TestAutomaticCycleCommitmentLoadErrorNamesFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, automaticCycleCommitmentFile)
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+		t.Fatalf("write corrupt commitment: %v", err)
+	}
+
+	_, err := NewRecorder(dir, .90, time.UTC).LoadAutomaticCycleCommitment()
+	if err == nil || !strings.Contains(err.Error(), path) {
+		t.Fatalf("load error = %v, want path %s", err, path)
+	}
+}
+
 func TestGetHistory_SolarGridAccountingPersists(t *testing.T) {
 	dir := t.TempDir()
 	r := NewRecorder(dir, 0.90, time.UTC)
@@ -625,6 +969,9 @@ func TestGetHistory_ExcludesUnpricedEnergyFromCashFlow(t *testing.T) {
 	if !day.UnpricedKWh.Equal(decimal.NewFromFloat(2.1)) {
 		t.Errorf("UnpricedKWh = %s, want 2.1", day.UnpricedKWh)
 	}
+	if !day.CashFlowUnpricedKWh.Equal(decimal.NewFromFloat(1.6)) {
+		t.Errorf("CashFlowUnpricedKWh = %s, want 1.6", day.CashFlowUnpricedKWh)
+	}
 	if !day.SolarOpportunityCostEUR.Equal(decimal.NewFromFloat(0.18)) {
 		t.Errorf("SolarOpportunityCostEUR = %s, want 0.18", day.SolarOpportunityCostEUR)
 	}
@@ -687,5 +1034,37 @@ func TestGetHistory_SplitsCrossMidnightTradeByLocalDay(t *testing.T) {
 	}
 	if !r.GetTotalPnL().Equal(decimal.NewFromFloat(-0.15)) {
 		t.Errorf("GetTotalPnL() = %s, want -0.15", r.GetTotalPnL())
+	}
+}
+
+func TestGetHistoryUsesExactCrossMidnightDayAllocations(t *testing.T) {
+	loc := time.UTC
+	start := time.Date(2024, 1, 15, 23, 30, 0, 0, loc)
+	r := NewRecorder("", .90, loc)
+	if err := r.RecordTrade(Trade{
+		Timestamp: start,
+		Action:    ActionCharge,
+		PriceEUR:  decimal.RequireFromString("0.20"),
+		DurationS: 3600,
+		EnergyKWh: decimal.RequireFromString("2"),
+		DayAllocations: []TradeDayAllocation{
+			{Timestamp: start, DurationS: 1800, EnergyKWh: decimal.NewFromInt(1), PricedValueEUR: decimal.RequireFromString("0.10")},
+			{Timestamp: start.Add(30 * time.Minute), DurationS: 1800, EnergyKWh: decimal.NewFromInt(1), PricedValueEUR: decimal.RequireFromString("0.30")},
+		},
+	}); err != nil {
+		t.Fatalf("RecordTrade() error = %v", err)
+	}
+
+	history := r.GetHistory()
+	if len(history.Days) != 2 {
+		t.Fatalf("history days = %+v", history.Days)
+	}
+	if !history.Days[0].PnLEUR.Equal(decimal.RequireFromString("-0.30")) ||
+		!history.Days[1].PnLEUR.Equal(decimal.RequireFromString("-0.10")) {
+		t.Fatalf("daily cash flow = [%s %s], want [-0.30 -0.10]", history.Days[0].PnLEUR, history.Days[1].PnLEUR)
+	}
+	if !history.Days[0].AvgChargePrice.Equal(decimal.RequireFromString("0.30")) ||
+		!history.Days[1].AvgChargePrice.Equal(decimal.RequireFromString("0.10")) {
+		t.Fatalf("daily prices = [%s %s], want [0.30 0.10]", history.Days[0].AvgChargePrice, history.Days[1].AvgChargePrice)
 	}
 }

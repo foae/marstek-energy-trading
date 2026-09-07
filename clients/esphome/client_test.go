@@ -62,7 +62,7 @@ func newControlTestServer(t *testing.T, failOption string, initialRSMode ...stri
 
 		calledPaths = append(calledPaths, r.URL.String())
 		if failOption != "" && r.URL.Query().Get("option") == failOption {
-			http.Error(w, failOption+" failed", http.StatusInternalServerError)
+			http.Error(w, failOption+" failed\nretry pending", http.StatusInternalServerError)
 			return
 		}
 		entityPath := strings.TrimSuffix(r.URL.Path, "/set")
@@ -270,6 +270,24 @@ func TestCharge(t *testing.T) {
 	}
 }
 
+func TestChargeFailureBeforeForceModeReportsControlNotAttempted(t *testing.T) {
+	server, calledPathsPtr := newControlTestServer(t, "enable")
+	defer server.Close()
+
+	err := New(server.URL, 11).Charge(2500, 300)
+	if !errors.Is(err, marstek.ErrControlNotAttempted) {
+		t.Fatalf("Charge() error = %v, want ErrControlNotAttempted", err)
+	}
+	if strings.Contains(err.Error(), "\n") {
+		t.Fatalf("operator-facing control error contains a newline: %q", err)
+	}
+	for _, path := range *calledPathsPtr {
+		if strings.Contains(path, "option=charge") {
+			t.Fatalf("failed precondition still issued force-mode write: %v", *calledPathsPtr)
+		}
+	}
+}
+
 func TestChargeDoesNotRewriteEnabledRS485Mode(t *testing.T) {
 	server, calledPathsPtr := newControlTestServer(t, "", "enable")
 	defer server.Close()
@@ -433,8 +451,12 @@ func TestChargeRetriesUnconfirmedSelectWrite(t *testing.T) {
 }
 
 func TestChargeContext_CancelsControlConfirmation(t *testing.T) {
+	chargeModeWrites := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
+			if strings.TrimSuffix(r.URL.Path, "/set") == "/select/Forcible Charge⁄Discharge" && r.URL.Query().Get("option") == "charge" {
+				chargeModeWrites++
+			}
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -447,6 +469,9 @@ func TestChargeContext_CancelsControlConfirmation(t *testing.T) {
 	err := New(server.URL, 11).ChargeContext(ctx, 500, 300)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("ChargeContext() error = %v, want context deadline exceeded", err)
+	}
+	if chargeModeWrites != 0 {
+		t.Fatalf("charge mode writes after control deadline = %d, want 0", chargeModeWrites)
 	}
 }
 
@@ -729,6 +754,9 @@ func TestControlFailureWithFrozenTelemetryReportsLinkDown(t *testing.T) {
 	if !errors.Is(err, marstek.ErrLinkDown) {
 		t.Fatalf("ChargeContext() error = %v, want ErrLinkDown", err)
 	}
+	if errors.Is(err, marstek.ErrControlNotAttempted) {
+		t.Fatalf("ChargeContext() error = %v, command was attempted before link-down classification", err)
+	}
 }
 
 func TestControlFailureWithLiveTelemetryIsNotLinkDown(t *testing.T) {
@@ -803,6 +831,9 @@ func TestLinkDownVerdictFailsFastAndClearsOnTelemetryChange(t *testing.T) {
 	err := client.ChargeContext(context.Background(), 500, 300)
 	if !errors.Is(err, marstek.ErrLinkDown) {
 		t.Fatalf("ChargeContext() error = %v, want ErrLinkDown", err)
+	}
+	if !errors.Is(err, marstek.ErrControlNotAttempted) {
+		t.Fatalf("ChargeContext() error = %v, want ErrControlNotAttempted", err)
 	}
 	mu.Lock()
 	postsAfter := posts
@@ -1025,6 +1056,39 @@ func TestRefreshPassiveModeContext(t *testing.T) {
 				t.Fatalf("battery target not restored: %v", tt.values)
 			}
 		})
+	}
+}
+
+func TestRefreshPassiveModeContextCancellationPreventsControlWrite(t *testing.T) {
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			posts++
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/number/Forcible Charge Power" {
+			<-r.Context().Done()
+			return
+		}
+		value := "enable"
+		if r.URL.Path == "/select/Forcible Charge⁄Discharge" {
+			value = "charge"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"value": value, "state": value})
+	}))
+	defer server.Close()
+
+	client := New(server.URL, 11)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := client.RefreshPassiveModeContext(ctx, -2200, 300)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("RefreshPassiveModeContext() error = %v, want deadline exceeded", err)
+	}
+	if posts != 0 {
+		t.Fatalf("control writes after cancellation = %d, want 0", posts)
 	}
 }
 

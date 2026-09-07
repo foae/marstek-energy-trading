@@ -66,15 +66,15 @@ A Go service that performs energy price arbitrage using a Marstek Venus E batter
    ```
    Example: 4.56 kWh at 2500W = 8 slots (2 hours).
 
-3. **Evaluate all chronological candidate pairs.** Each charge window must end before its discharge window begins. A pair is eligible only when `discharge_avg > charge_avg / efficiency` and `discharge_avg - charge_avg >= MIN_PRICE_SPREAD`.
+3. **Evaluate all chronological candidate pairs.** Each charge window must end before its discharge window begins. Expected profit per input kWh is `discharge_avg * efficiency - charge_avg`. A pair is eligible only when that result is positive and at least `MIN_PRICE_SPREAD`.
 
 4. **Select the global plan.** Dynamic programming maximizes the summed expected profit of up to `MAX_CYCLES_PER_DAY` non-overlapping chronological pairs. It is not a bottom/top-quartile heuristic and does not greedily select one cycle before considering later cycles.
 
 ### SOC-aware grid reservations
 
-For the next unfinished charge cycle, the service derives a deadline from its charge-window end and calculates the grid input needed to reach 100% from current SOC, including a conservative charging-efficiency estimate. It considers eligible 15-minute price slices from the known today and tomorrow tariff sets after the prior planned discharge and through that deadline, then reserves the cheapest slices first. It forecasts no future solar: any solar already reflected in measured SOC reduces the reservation. After a grid charge has run for 30 seconds, any lower observed charging power becomes the deliverability limit. When the available time cannot fill the requirement, all available slices are reserved and the service charges best-effort; the reservation is marked infeasible.
+For the next unfinished charge cycle, the service derives a deadline from its charge-window end and calculates the grid input needed to reach 100% from current SOC, including a conservative charging-efficiency estimate. It considers eligible 15-minute price slices from the known today and tomorrow tariff sets after the prior planned discharge and through that deadline, then reserves the cheapest slices first. It forecasts no future solar: any solar already reflected in measured SOC reduces the reservation. After a grid charge has run for 30 seconds, any lower observed charging power becomes the deliverability limit. A grid slice is excluded when its individual price would reduce expected profit against the paired discharge average below `MIN_PRICE_SPREAD`. Automatic control does not start or refresh in the final minute of a reserved window, reserving a bounded interval for ESPHome confirmation and battery-power verification before the tariff boundary. When delivery capacity, time, or that economic bound prevents a full charge, the service reserves an eligible best-effort subset and marks the reservation infeasible.
 
-For a feasible reservation, solar begins only if its current all-in export opportunity cost is no greater than the marginal (highest-priced) selected grid slice. Otherwise the service exports the expensive solar now and retains the cheaper grid reservation. If there is no charge deadline or the deadline is infeasible, it captures solar surplus regardless; a feasible reservation with no known current tariff does not start solar.
+For a feasible reservation, solar begins only if its current all-in export opportunity cost is no greater than the marginal (highest-priced) selected grid slice. Otherwise the service exports the expensive solar now and retains the cheaper grid reservation. If economic exclusions cause the reservation shortfall, solar must still satisfy the same per-slice expected-profit ceiling; that ceiling remains active between the charge deadline and paired discharge. Infeasibility caused by time or taper even with all slices available permits solar capture regardless. With no deadline and no pending paired discharge, solar is captured. A feasible or economics-limited reservation with no known current tariff does not start solar.
 
 ### Execution accounting and discharge
 
@@ -91,13 +91,13 @@ When a HomeWizard P1 meter is configured, the service detects grid export (solar
 3. **Charging**: Battery charges at the detected surplus power (clamped to `CHARGE_POWER_W`). Power is dynamically adjusted with a 50W deadband to avoid flapping.
 4. **P1 feedback compensation**: During charging, `effectiveSurplus = measuredSurplus + measuredBatteryChargePower`; an EMA (alpha 0.05) smooths the result. Measured rather than requested battery power avoids treating an unachieved command as available surplus.
 5. **Ramp-up cooldown**: After starting or adjusting charge power, a 5-second cooldown prevents re-adjustment while the battery ramps to the new target (~3s). This avoids a positive feedback spiral where transient over-estimation of effective surplus causes the target power to spiral upward.
-6. **Low-surplus, economic choice, and failures**: EMA below `max(SOLAR_MIN_SURPLUS_W / 4, 75W)` starts a 60-second grace requesting 75W; recovery immediately clears it. Grace expiry stops charging. Surplus-loss sessions under ten minutes get a five-minute cooldown; three consecutive marginal sessions get fifteen minutes. Longer sessions and legitimate stops reset the streak and use sixty seconds. Battery-full, active-reservation, and discharge-window checks precede P1 reads. For a feasible reservation, solar starts only when the current export opportunity cost is no greater than the marginal reserved grid price; otherwise expensive solar is exported and cheaper grid energy remains reserved. With no deadline or an infeasible reservation, solar capture continues. Failed adjustments and repeated telemetry failure request a confirmed stop; an unconfirmed stop retains the session and is retried.
+6. **Low-surplus, economic choice, and failures**: EMA below `max(SOLAR_MIN_SURPLUS_W / 4, 75W)` starts a 60-second grace requesting 75W; recovery immediately clears it. Grace expiry stops charging. Surplus-loss sessions under ten minutes get a five-minute cooldown; three consecutive marginal sessions get fifteen minutes. Longer sessions and legitimate stops reset the streak and use sixty seconds. Battery-full, active-reservation, and discharge-window checks precede P1 reads. For a feasible reservation, solar starts only when the current export opportunity cost is no greater than the marginal reserved grid price; otherwise expensive solar is exported and cheaper grid energy remains reserved. An economics-limited reservation still applies the paired cycle's per-slice price ceiling to solar, including after the charge deadline while its discharge remains pending; infeasibility caused only by time or taper permits solar capture regardless. Failed adjustments and repeated telemetry failure request a confirmed stop; an unconfirmed stop retains the session and is retried.
 7. **Scheduled priority**: An active grid reservation or discharge window stops solar charging before its scheduled action begins. Solar does not start during either, then can resume once the window ends if the economic rule permits it.
 8. **Recording**: `solar_charge` records measured battery energy, separate estimated grid energy/cost, and solar opportunity cost. Grid input is `min(measuredBatteryChargePower, max(netGridImport, 0))`, integrated between samples. Solar energy is the remainder. Known rate slots price grid cost and the forgone-export opportunity cost; unavailable rates are explicitly unpriced. Legacy records without split fields remain all-solar.
 
-### Configurable Spread Threshold
+### Configurable Profit Threshold
 
-Candidate cycles execute only when their raw average-price spread meets `MIN_PRICE_SPREAD` (default: 0.05 EUR/kWh) and their efficiency-adjusted spread is profitable.
+Candidate cycles execute only when their expected profit after the configured round-trip efficiency loss meets `MIN_PRICE_SPREAD` (default: 0.05 EUR/kWh). The environment variable retains its historical name but no longer represents the raw average-price spread.
 
 ### Example Daily Pattern
 
@@ -136,6 +136,7 @@ Stop intent is retained until an authoritative stop confirmation. The service ke
 ### Data Persistence
 - File-based JSON storage in `DATA_DIR`
 - `trades.json` - trade history
+- `automatic-cycle-commitment.json` - the discharge pairing for grid energy already purchased
 - Uses `decimal` library for monetary precision
 
 ### Logging
@@ -150,7 +151,7 @@ Stop intent is retained until an authoritative stop confirmation. The service ke
 |----------|-------------|
 | `GET /health` | Liveness probe, returns "ok" |
 | `GET /metrics` | Prometheus metrics |
-| `GET /status` | Current state + full history (JSON) |
+| `GET /status` | Current state, reservation, commitment/pending-plan state, and full history (JSON) |
 
 ### Status Response
 
@@ -158,8 +159,16 @@ Stop intent is retained until an authoritative stop confirmation. The service ke
 {
   "current": {
     "state": "idle",
+    "battery_available": true,
     "battery_soc": 75,
+    "battery_power_w": 0,
     "current_price_eur_kwh": 0.0854,
+    "current_price_known": true,
+    "plan_pending": false,
+    "plan_discharge_only": false,
+    "commitment_type": "grid",
+    "commitment_durable": true,
+    "commitment_discharge_window_end": "2026-02-02T19:00:00+01:00",
     "next_action": "waiting for next window"
   },
   "history": {
@@ -191,10 +200,10 @@ Stop intent is retained until an authoritative stop confirmation. The service ke
 | Startup | "energy-trader started" |
 | Trade start | "Charging started at 0.08 EUR/kWh (SOC: 45%)" |
 | Trade end | "Charging completed. Energy: 2.5 kWh" |
-| Solar charge start | "Solar charging started at 0.0000 EUR/kWh (SOC: 60%)" |
-| Solar charge end | "Solar charging completed. Energy: 1.2 kWh" |
+| Solar charge start | Solar charging state and starting SOC |
+| Solar charge end | Battery, solar, and grid energy with known costs and explicit incomplete-value disclosure |
 | Error | "Battery unreachable" |
-| Daily summary (23:59) | P&L, charged/discharged kWh, solar kWh, cycles, cumulative P&L |
+| Daily summary (23:59) | P&L, charged/discharged kWh, solar kWh, cycles, cumulative P&L, and unpriced-energy disclosure when cash flow is incomplete |
 
 ### Commands (Inbound)
 
@@ -202,7 +211,7 @@ Commands are accepted only from the configured private `TELEGRAM_CHAT_ID`; group
 
 | Command | Response |
 |---------|----------|
-| `/status` | Current state, battery SOC, price, next action, P&L |
+| `/status` | Current state, battery SOC, available/unavailable current price, next action, and complete or known-only cash flow |
 | `/discharge` | Start manual discharge at `DISCHARGE_POWER_W` |
 | `/discharge 800` | Start manual discharge at a chosen power from 800-2500 W |
 | `/auto` | Stop manual discharge and return control to automatic trading and solar charging |
@@ -236,7 +245,7 @@ Load from `.env` file with fallback to environment variables.
 | `TZ` | `Europe/Amsterdam` | Timezone |
 | `NORDPOOL_AREA` | `NL` | Price area code |
 | `NORDPOOL_CURRENCY` | `EUR` | Currency |
-| `MIN_PRICE_SPREAD` | `0.05` | Min spread to trade (EUR/kWh) |
+| `MIN_PRICE_SPREAD` | `0.05` | Minimum expected profit after efficiency loss (EUR/kWh; historical name) |
 | `BATTERY_EFFICIENCY` | `0.90` | Round-trip efficiency |
 | `BATTERY_CAPACITY_KWH` | `5.12` | Battery capacity (kWh) |
 | `BATTERY_MIN_SOC` | `0.11` | Minimum SOC (0.0-1.0) |
@@ -304,7 +313,7 @@ make docker-build   # Build Docker image
 - The ESPHome backend has no battery-side command expiry. A process, host, network, or bridge failure can leave the last forced command active until the battery's BMS intervenes or control is restored.
 - Startup and graceful shutdown attempt a confirmed stop, but abrupt termination cannot guarantee one. Container shutdown must allow at least 95 seconds.
 - The HTTP API, ESPHome API, and HomeWizard local API have no authentication in this design and must remain on trusted networks. Status and metrics reveal household and financial data.
-- Active plans and partial active-session energy are not persisted. Restart reconstruction does not prove that an earlier paired charge completed.
+- The paired cycle for purchased grid energy is persisted before issuing a charge command and restored after restart. Partial active-session energy measurements are not persisted, so abrupt termination can still under-report a session.
 - Import and export use one symmetric configured tariff. P&L is operational cash-flow estimation, not inventory-matched profit or revenue-grade metering.
 - The repository does not provide the ESPHome firmware configuration or an independent hardware watchdog.
 

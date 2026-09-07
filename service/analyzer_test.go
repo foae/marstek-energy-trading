@@ -1,6 +1,8 @@
 package service
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -8,6 +10,19 @@ import (
 
 	"github.com/foae/marstek-energy-trading/clients/nordpool"
 )
+
+func TestTimeWindowJSONUsesStatusAPINames(t *testing.T) {
+	encoded, err := json.Marshal(TimeWindow{})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	text := string(encoded)
+	for _, name := range []string{`"start"`, `"end"`, `"price"`} {
+		if !strings.Contains(text, name) {
+			t.Errorf("TimeWindow JSON %s does not contain %s", text, name)
+		}
+	}
+}
 
 func decimalEqual(a decimal.Decimal, b float64) bool {
 	return a.Equal(decimal.NewFromFloat(b))
@@ -260,7 +275,7 @@ func TestAnalyzePrices_EfficiencyCheck(t *testing.T) {
 		chargePrice    float64
 		dischargePrice float64
 		efficiency     float64
-		minSpread      float64
+		minProfit      float64
 		wantProfitable bool
 	}{
 		{
@@ -268,7 +283,7 @@ func TestAnalyzePrices_EfficiencyCheck(t *testing.T) {
 			chargePrice:    0.05,
 			dischargePrice: 0.15,
 			efficiency:     0.90,
-			minSpread:      0.05,
+			minProfit:      0.05,
 			wantProfitable: true,
 		},
 		{
@@ -276,15 +291,15 @@ func TestAnalyzePrices_EfficiencyCheck(t *testing.T) {
 			chargePrice:    0.10,
 			dischargePrice: 0.11, // breakeven = 0.10/0.90 = 0.111
 			efficiency:     0.90,
-			minSpread:      0.01,
+			minProfit:      0.01,
 			wantProfitable: false,
 		},
 		{
-			name:           "not profitable - spread below threshold",
+			name:           "not profitable - net profit below threshold",
 			chargePrice:    0.10,
 			dischargePrice: 0.13,
 			efficiency:     0.90,
-			minSpread:      0.05, // spread is only 0.03
+			minProfit:      0.05, // Net profit is only 0.017 EUR/kWh.
 			wantProfitable: false,
 		},
 	}
@@ -308,7 +323,7 @@ func TestAnalyzePrices_EfficiencyCheck(t *testing.T) {
 			prices := makePrices(baseTime, values...)
 			cfg := AnalyzerConfig{
 				Efficiency:         tt.efficiency,
-				MinPriceSpread:     tt.minSpread,
+				MinPriceSpread:     tt.minProfit,
 				BatteryCapacityKWh: 5.12,
 				BatteryMinSOC:      0.11,
 				ChargePowerW:       2500,
@@ -322,6 +337,44 @@ func TestAnalyzePrices_EfficiencyCheck(t *testing.T) {
 					tt.wantProfitable, plan.IsProfitable, len(plan.Cycles))
 			}
 		})
+	}
+}
+
+func TestAnalyzePrices_MinimumProfitAppliedAfterEfficiencyLoss(t *testing.T) {
+	baseTime := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+	prices := makePrices(baseTime, 0.3103905888888889, 0.3957802888888889)
+	cfg := smallWindowConfig()
+	cfg.MaxCyclesPerDay = 1
+	cfg.MinPriceSpread = 0.05
+
+	plan := AnalyzePrices(prices, cfg)
+	if plan.IsProfitable {
+		t.Fatalf("expected net profit below 0.05 to be rejected, got cycles=%+v", plan.Cycles)
+	}
+
+	cfg.MinPriceSpread = 0.045
+	plan = AnalyzePrices(prices, cfg)
+	if !plan.IsProfitable || len(plan.Cycles) != 1 {
+		t.Fatalf("expected net profit above 0.045 to be accepted, got cycles=%+v", plan.Cycles)
+	}
+	wantProfit := decimal.RequireFromString("0.04581167111111111")
+	if !plan.Cycles[0].Profit.Equal(wantProfit) {
+		t.Fatalf("profit = %s, want %s", plan.Cycles[0].Profit, wantProfit)
+	}
+
+	boundaryPrices := makePrices(baseTime, 0.10, 0.20)
+	cfg.Efficiency = 0.75
+	cfg.MinPriceSpread = 0.05
+	plan = AnalyzePrices(boundaryPrices, cfg)
+	if !plan.IsProfitable {
+		t.Fatal("expected profit equal to the minimum to be accepted")
+	}
+
+	cfg.MinPriceSpread = 0
+	cfg.Efficiency = 0.5
+	plan = AnalyzePrices(makePrices(baseTime, 0.10, 0.20), cfg)
+	if plan.IsProfitable {
+		t.Fatal("expected exact break-even to be rejected at a zero minimum")
 	}
 }
 

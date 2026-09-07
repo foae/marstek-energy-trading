@@ -64,6 +64,7 @@ func TestLocation_EmptyTimezone(t *testing.T) {
 
 func validConfig() Config {
 	return Config{
+		DataDir:             "./data",
 		TZ:                  "Europe/Amsterdam",
 		ESPHomeURL:          "http://192.168.1.50",
 		NordPoolCurrency:    "EUR",
@@ -76,6 +77,14 @@ func validConfig() Config {
 		DischargePowerW:     2500,
 		PassiveModeTimeoutS: 300,
 		SolarMinSurplusW:    100,
+	}
+}
+
+func TestValidate_RequiresDataDir(t *testing.T) {
+	cfg := validConfig()
+	cfg.DataDir = ""
+	if err := cfg.validate(); err == nil {
+		t.Fatal("validate() error = nil, want required DATA_DIR error")
 	}
 }
 

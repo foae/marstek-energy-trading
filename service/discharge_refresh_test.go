@@ -38,6 +38,7 @@ func TestIdleChargedCycleSurvivesMidnightRefresh(t *testing.T) {
 	battery := NewMockBattery(99)
 	prices := makePrices(base, 0.05, 0.40, 0.35)
 	svc := newTestService(testConfigSmallBattery(), battery, prices, now)
+	svc.automaticCycleCommit = &svc.currentPlan.Cycles[0]
 	svc.todayPrices = prices[:1]
 	svc.tomorrowPrices = prices[1:]
 	svc.nowFunc = func() time.Time { return now }

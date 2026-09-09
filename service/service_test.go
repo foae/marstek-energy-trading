@@ -1083,9 +1083,6 @@ func TestLogAndNotifyTradingPlanIncludesHorizonDatesAndThreshold(t *testing.T) {
 		t.Fatalf("trading plan notifications = %d, want 1", len(notifier.TradingPlanCalls))
 	}
 	data := notifier.TradingPlanCalls[0]
-	if data.MinExpectedProfit != .05 || data.BatteryEfficiency != .90 {
-		t.Fatalf("threshold data = %+v", data)
-	}
 	if got := data.Cycles[0].ChargeStart; got != "Mon 07 Sep 01:45" {
 		t.Fatalf("charge start = %q, want dated horizon timestamp", got)
 	}

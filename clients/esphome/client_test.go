@@ -634,6 +634,78 @@ func TestGetESStatus(t *testing.T) {
 	}
 }
 
+func TestGetACSample(t *testing.T) {
+	testCases := []struct {
+		name        string
+		rawAC       float64
+		wantACPower float64
+	}{
+		{name: "charge", rawAC: -2192, wantACPower: 2192},
+		{name: "discharge", rawAC: 1750, wantACPower: -1750},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case strings.Contains(r.URL.Path, "State Of Charge"):
+					w.Write([]byte(`{"value":80}`))
+				case strings.Contains(r.URL.Path, "AC Power"):
+					_, _ = fmt.Fprintf(w, `{"value":%v}`, tc.rawAC)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			client := New(server.URL, 11)
+			soc, power, err := client.GetACSample(context.Background())
+			if err != nil {
+				t.Fatalf("GetACSample() error = %v", err)
+			}
+			if soc != 80 {
+				t.Errorf("SOC = %d, want 80", soc)
+			}
+			if power != tc.wantACPower {
+				t.Errorf("AC power = %v, want %v", power, tc.wantACPower)
+			}
+		})
+	}
+}
+
+func TestGetACSample_RequiresValidACPower(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response string
+		status   int
+	}{
+		{name: "unavailable", status: http.StatusInternalServerError},
+		{name: "invalid", response: `{"value":"not-a-number"}`, status: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case strings.Contains(r.URL.Path, "State Of Charge"):
+					w.Write([]byte(`{"value":80}`))
+				case strings.Contains(r.URL.Path, "AC Power"):
+					w.WriteHeader(tc.status)
+					_, _ = w.Write([]byte(tc.response))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			client := New(server.URL, 11)
+			if _, _, err := client.GetACSample(context.Background()); err == nil {
+				t.Fatal("GetACSample() error = nil, want AC power error")
+			}
+		})
+	}
+}
+
 func TestGetESStatus_RequiresBatteryPower(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "State Of Charge") {

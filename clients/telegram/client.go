@@ -208,6 +208,24 @@ func (c *Client) SendError(ctx context.Context, errMsg string) error {
 	return c.SendMessage(ctx, text)
 }
 
+// EfficiencyData contains measured operational AC round-trip efficiency data.
+type EfficiencyData struct {
+	Percent     *float64
+	Cycles      int
+	WindowHours float64
+}
+
+func renderMeasuredEfficiency(data EfficiencyData) string {
+	const label = "<b>Measured AC round-trip efficiency:</b>"
+	if data.Percent == nil {
+		return label + " unavailable (waiting for valid measurement; includes standby)"
+	}
+	return fmt.Sprintf(
+		"%s %.1f%% (%d accepted windows, %.1f measurement hours; includes standby)",
+		label, *data.Percent, data.Cycles, data.WindowHours,
+	)
+}
+
 // DailySummaryData contains all data for the daily summary notification.
 type DailySummaryData struct {
 	Date               time.Time
@@ -226,6 +244,7 @@ type DailySummaryData struct {
 	UnpricedKWh        float64
 	PnLIncomplete      bool
 	TotalPnLIncomplete bool
+	MeasuredEfficiency EfficiencyData
 }
 
 // SendDailySummary sends a daily P&L summary (simple version for backward compatibility).
@@ -328,6 +347,7 @@ func (c *Client) SendDailySummaryFull(ctx context.Context, data DailySummaryData
 	if data.UnpricedKWh > 0 {
 		text += fmt.Sprintf("\n\n⚠️ %.2f kWh could not be priced; cash-flow totals are incomplete.", data.UnpricedKWh)
 	}
+	text += "\n\n" + renderMeasuredEfficiency(data.MeasuredEfficiency)
 
 	return c.SendMessage(ctx, text)
 }
@@ -351,6 +371,7 @@ type StatusData struct {
 	TotalPnL           float64
 	TodayPnLIncomplete bool
 	TotalPnLIncomplete bool
+	MeasuredEfficiency EfficiencyData
 }
 
 // SendStatus sends the current status.
@@ -403,6 +424,8 @@ func (c *Client) SendStatus(ctx context.Context, data StatusData) error {
 		totalPnLLabel,
 		data.TotalPnL,
 	)
+	text += "\n\n" + renderMeasuredEfficiency(data.MeasuredEfficiency)
+
 	return c.SendMessage(ctx, text)
 }
 
@@ -450,27 +473,28 @@ type TradingPlanCycle struct {
 
 // TradingPlanData contains data for trading plan notifications.
 type TradingPlanData struct {
-	Day               string // Planning-horizon label, currently "horizon".
-	Date              time.Time
-	SlotsTotal        int
-	SlotsAnalyzed     int
-	PriceMin          float64
-	PriceMax          float64
-	IsProfitable      bool
-	Cycles            []TradingPlanCycle
-	Reason            string // Only shown when the plan is not profitable.
-	MinExpectedProfit float64
-	BatteryEfficiency float64
-	PlanRetained      bool
-	DischargeOnly     bool
-	DischargeStart    string
-	DischargeEnd      string
-	DischargePrice    float64
+	Day                string // Planning-horizon label, currently "horizon".
+	Date               time.Time
+	SlotsTotal         int
+	SlotsAnalyzed      int
+	PriceMin           float64
+	PriceMax           float64
+	IsProfitable       bool
+	Cycles             []TradingPlanCycle
+	Reason             string // Only shown when the plan is not profitable.
+	MinExpectedProfit  float64
+	MeasuredEfficiency EfficiencyData
+	PlanRetained       bool
+	DischargeOnly      bool
+	DischargeStart     string
+	DischargeEnd       string
+	DischargePrice     float64
 }
 
 // SendTradingPlan sends a trading plan notification.
 func (c *Client) SendTradingPlan(ctx context.Context, data TradingPlanData) error {
 	var text string
+	efficiencyText := "\n\n" + renderMeasuredEfficiency(data.MeasuredEfficiency)
 
 	dateStr := data.Date.Format("02 Jan 2006")
 	dayLabel := "📅"
@@ -481,11 +505,10 @@ func (c *Client) SendTradingPlan(ctx context.Context, data TradingPlanData) erro
 				"<i>%s</i>\n\n"+
 				"Grid charging is disabled under the current profitability floor.\n\n"+
 				"Discharge: %s - %s @ %.4f EUR/kWh\n"+
-				"Configured minimum net profit: %.4f EUR/kWh\n"+
-				"Battery efficiency: %.1f%%",
+				"Configured minimum net profit: %.4f EUR/kWh",
 			dayLabel, data.Day, dateStr,
 			data.DischargeStart, data.DischargeEnd, data.DischargePrice,
-			data.MinExpectedProfit, data.BatteryEfficiency*100,
+			data.MinExpectedProfit,
 		)
 		if data.PlanRetained {
 			text += "\n\n<i>Active committed-cycle plan retained; refreshed plan pending.</i>"
@@ -498,14 +521,12 @@ func (c *Client) SendTradingPlan(ctx context.Context, data TradingPlanData) erro
 				"Plan prices: %.4f - %.4f EUR/kWh\n"+
 				"Slots analyzed: %d of %d\n\n"+
 				"<i>%s</i>\n"+
-				"Configured minimum net profit: %.4f EUR/kWh\n"+
-				"Battery efficiency: %.1f%%",
+				"Configured minimum net profit: %.4f EUR/kWh",
 			dayLabel, data.Day, dateStr,
 			data.PriceMin, data.PriceMax,
 			data.SlotsAnalyzed, data.SlotsTotal,
 			data.Reason,
 			data.MinExpectedProfit,
-			data.BatteryEfficiency*100,
 		)
 		if data.PlanRetained {
 			text += "\n\n<i>Active committed-cycle plan retained; refreshed plan pending.</i>"
@@ -516,13 +537,11 @@ func (c *Client) SendTradingPlan(ctx context.Context, data TradingPlanData) erro
 				"<i>%s</i>\n\n"+
 				"✅ <b>%d profitable cycle(s) found</b>\n\n"+
 				"Plan prices: %.4f - %.4f EUR/kWh\n"+
-				"Configured minimum net profit: %.4f EUR/kWh\n"+
-				"Battery efficiency: %.1f%%\n",
+				"Configured minimum net profit: %.4f EUR/kWh\n",
 			dayLabel, data.Day, dateStr,
 			len(data.Cycles),
 			data.PriceMin, data.PriceMax,
 			data.MinExpectedProfit,
-			data.BatteryEfficiency*100,
 		)
 		if data.PlanRetained {
 			text += "\n\n<i>Active committed-cycle plan retained; refreshed plan pending.</i>"
@@ -539,7 +558,7 @@ func (c *Client) SendTradingPlan(ctx context.Context, data TradingPlanData) erro
 				cycle.DischargeStart, cycle.DischargeEnd, cycle.DischargePrice,
 				cycle.ProfitPerKWh,
 			)
-			if i == len(data.Cycles)-1 && len(text)+len(cycleText) <= messageTextLimit {
+			if i == len(data.Cycles)-1 && len(text)+len(cycleText)+len(efficiencyText) <= messageTextLimit {
 				text += cycleText
 				continue
 			}
@@ -549,13 +568,16 @@ func (c *Client) SendTradingPlan(ctx context.Context, data TradingPlanData) erro
 				cycleLabel = "cycle"
 			}
 			omittedText := fmt.Sprintf("\n<i>%d %s omitted from this message.</i>", remaining, cycleLabel)
-			if len(text)+len(cycleText)+len(omittedText) > messageTextLimit {
-				text += omittedText
+			if len(text)+len(cycleText)+len(omittedText)+len(efficiencyText) > messageTextLimit {
+				if len(text)+len(omittedText)+len(efficiencyText) <= messageTextLimit {
+					text += omittedText
+				}
 				break
 			}
 			text += cycleText
 		}
 	}
+	text += efficiencyText
 	return c.SendMessage(ctx, text)
 }
 

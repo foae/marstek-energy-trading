@@ -47,6 +47,7 @@ const (
 	sensorSOC          = "/sensor/Battery%20State%20Of%20Charge"
 	sensorTemperature  = "/sensor/Internal%20Temperature"
 	sensorBatteryPower = "/sensor/Battery%20Power"
+	sensorACPower      = "/sensor/AC%20Power"
 	sensorACVoltage    = "/sensor/AC%20Voltage"
 	// Pack voltage/current averages are the fastest-moving battery-sourced values.
 	sensorBatteryVoltageAvg = "/sensor/Battery%20Voltage%20%28Average%29"
@@ -182,6 +183,24 @@ func (c *Client) GetESStatus(ctx context.Context) (*marstek.ESStatus, error) {
 // GetBatteryPower returns the signed battery power: positive charging, negative discharging.
 func (c *Client) GetBatteryPower(ctx context.Context) (float64, error) {
 	return c.getSensorFloatContext(ctx, sensorBatteryPower)
+}
+
+// GetACSample returns the current SOC and normalized AC power: positive charging, negative discharging.
+func (c *Client) GetACSample(ctx context.Context) (int, float64, error) {
+	soc, err := c.getSensorFloatContext(ctx, sensorSOC)
+	if err != nil {
+		return 0, 0, fmt.Errorf("get SOC: %w", err)
+	}
+	socInt, err := socAsInt(soc)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	power, err := c.getSensorFloatContext(ctx, sensorACPower)
+	if err != nil {
+		return 0, 0, fmt.Errorf("get AC power: %w", err)
+	}
+	return socInt, -power, nil
 }
 
 // Charge starts charging at the specified power (watts).

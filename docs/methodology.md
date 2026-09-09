@@ -42,6 +42,16 @@ Energy is integrated from measured battery-power samples. New cross-midnight rec
 
 Serialized session bounds are rounded outward to whole seconds so both sides of a fractional-second midnight crossing remain representable. Energy and tariff allocations still use the exact measured interval, not the rounded duration.
 
+## Measured Efficiency
+
+Telegram plans, daily summaries and status messages report measured operational AC round-trip efficiency, not the configured planning assumption. Logs, `/status` (`measured_efficiency`) and Prometheus (`energy_trader_measured_efficiency_percent`, with accepted/rejected window counts) expose the same aggregate. Until a valid window completes, the percentage is unavailable (`null` in JSON, `NaN` in Prometheus).
+
+An independent read-only worker samples ESPHome SOC and AC power every five seconds, including solar charging and standby. It integrates AC input and output between opposite crossings of the same integer-SOC boundary, approximating each crossing at the sample midpoint. A window must rise at least 20 SOC points and consume at least 0.5 kWh before returning to its starting boundary. The reported percentage is total accepted AC output divided by total accepted AC input, multiplied by 100; windows are energy-weighted, not averaged percentages.
+
+Failed reads, detected stale telemetry, gaps longer than 30 seconds, skipped SOC levels and backwards timestamps discard incomplete windows. Windows exceeding 72 hours or producing more output than input are rejected. Completed aggregates persist atomically in `measured-efficiency.json`; incomplete windows never bridge a restart. This remains a sampled operational estimate, not calibrated metering: integer SOC, sensor publication delay and undetected telemetry faults limit accuracy.
+
+`BATTERY_EFFICIENCY` remains the separate configured planning assumption and is not automatically adjusted. Existing trade-energy accounting and solar compensation still use ESPHome's DC battery-power measurement; their historical records are not used to calculate this AC efficiency. Consequently, existing cash-flow energy estimates do not include AC conversion losses.
+
 ## Solar Charging
 
 Solar charging is enabled only when `HOMEWIZARD_P1_URL` is an explicit meter URL or `auto`.

@@ -87,14 +87,15 @@ const manualOverrideMaxDuration = 2 * time.Hour
 
 // Service is the main trading engine.
 type Service struct {
-	cfg      *config.Config
-	nordpool PriceProvider
-	battery  BatteryController
-	meter    MeterReader
-	telegram Notifier
-	recorder *Recorder
-	loc      *time.Location   // timezone location
-	nowFunc  func() time.Time // clock function for testing
+	cfg        *config.Config
+	nordpool   PriceProvider
+	battery    BatteryController
+	meter      MeterReader
+	telegram   Notifier
+	recorder   *Recorder
+	efficiency *efficiencyTracker
+	loc        *time.Location   // timezone location
+	nowFunc    func() time.Time // clock function for testing
 
 	mu                           sync.RWMutex
 	errorNotifyMu                sync.Mutex
@@ -232,15 +233,16 @@ func New(
 	recorder *Recorder,
 ) *Service {
 	return &Service{
-		cfg:      cfg,
-		nordpool: nordpoolClient,
-		battery:  batteryClient,
-		meter:    meterClient,
-		telegram: telegramClient,
-		recorder: recorder,
-		state:    StateIdle,
-		loc:      cfg.Location(),
-		nowFunc:  time.Now,
+		cfg:        cfg,
+		nordpool:   nordpoolClient,
+		battery:    batteryClient,
+		meter:      meterClient,
+		telegram:   telegramClient,
+		recorder:   recorder,
+		efficiency: newEfficiencyTracker(),
+		state:      StateIdle,
+		loc:        cfg.Location(),
+		nowFunc:    time.Now,
 	}
 }
 
@@ -525,6 +527,9 @@ func (s *Service) Start(ctx context.Context) error {
 	} else {
 		slog.Info("battery discovered", "device", device.Device)
 	}
+
+	stopEfficiencyTracking := s.startEfficiencyTracking(ctx)
+	defer stopEfficiencyTracking()
 
 	// Fetch initial prices
 	if err := s.fetchTodayPrices(ctx); err != nil {
@@ -2653,6 +2658,7 @@ func (s *Service) fetchTomorrowPrices(ctx context.Context) error {
 // logAndNotifyTradingPlan logs the trading plan and sends a Telegram notification.
 func (s *Service) logAndNotifyTradingPlan(ctx context.Context, l *slog.Logger, plan *TradingPlan, day string, slotsTotal, slotsAnalyzed int, planRetained bool) {
 	windowFormat := "Mon 02 Jan 15:04"
+	l = l.With("measured_efficiency", s.measuredEfficiencySummary())
 	if plan.DischargeOnly && len(plan.DischargeWindows) > 0 {
 		window := plan.DischargeWindows[0]
 		l.Info(
@@ -2666,7 +2672,7 @@ func (s *Service) logAndNotifyTradingPlan(ctx context.Context, l *slog.Logger, p
 			"no profitable charge→discharge sequence found",
 			"reason", "no eligible sequence meets the configured expected-profit minimum over the available horizon",
 			"min_expected_profit_eur_kwh", s.cfg.MinPriceSpread,
-			"battery_efficiency", s.cfg.BatteryEfficiency,
+			"configured_planning_efficiency", s.cfg.BatteryEfficiency,
 		)
 	} else {
 		// Log each profitable cycle
@@ -2692,17 +2698,17 @@ func (s *Service) logAndNotifyTradingPlan(ctx context.Context, l *slog.Logger, p
 
 	// Build notification data (convert decimal to float64 at Telegram API boundary).
 	data := telegram.TradingPlanData{
-		Day:               day,
-		Date:              plan.Date,
-		SlotsTotal:        slotsTotal,
-		SlotsAnalyzed:     slotsAnalyzed,
-		PriceMin:          plan.MinPrice.InexactFloat64(),
-		PriceMax:          plan.MaxPrice.InexactFloat64(),
-		IsProfitable:      plan.IsProfitable,
-		MinExpectedProfit: s.cfg.MinPriceSpread,
-		BatteryEfficiency: s.cfg.BatteryEfficiency,
-		PlanRetained:      planRetained,
-		DischargeOnly:     plan.DischargeOnly,
+		Day:                day,
+		Date:               plan.Date,
+		SlotsTotal:         slotsTotal,
+		SlotsAnalyzed:      slotsAnalyzed,
+		PriceMin:           plan.MinPrice.InexactFloat64(),
+		PriceMax:           plan.MaxPrice.InexactFloat64(),
+		IsProfitable:       plan.IsProfitable,
+		MinExpectedProfit:  s.cfg.MinPriceSpread,
+		MeasuredEfficiency: s.measuredEfficiencyData(),
+		PlanRetained:       planRetained,
+		DischargeOnly:      plan.DischargeOnly,
 	}
 	if !plan.IsProfitable {
 		data.Reason = "No eligible sequence meets the configured expected-profit minimum over the available horizon"
@@ -2806,6 +2812,7 @@ func (s *Service) checkDailySummary(ctx context.Context) {
 		UnpricedKWh:        unpricedF,
 		PnLIncomplete:      summary.CashFlowUnpricedKWh.IsPositive(),
 		TotalPnLIncomplete: totalPnLIncomplete,
+		MeasuredEfficiency: s.measuredEfficiencyData(),
 	}
 
 	if s.telegramEnabled() {
@@ -3238,6 +3245,7 @@ func (s *Service) sendTelegramStatus(ctx context.Context) {
 		TotalPnL:           totalPnLF,
 		TodayPnLIncomplete: summary.CashFlowUnpricedKWh.IsPositive(),
 		TotalPnLIncomplete: totalPnLIncomplete,
+		MeasuredEfficiency: s.measuredEfficiencyData(),
 	}
 
 	if err := s.telegram.SendStatus(ctx, data); err != nil {
@@ -3284,6 +3292,7 @@ type CurrentStatus struct {
 	CommitmentDurable            bool                     `json:"commitment_durable"`
 	CommitmentDischargeWindowEnd *time.Time               `json:"commitment_discharge_window_end,omitempty"`
 	NextAction                   string                   `json:"next_action,omitempty"`
+	MeasuredEfficiency           efficiencySummary        `json:"measured_efficiency"`
 }
 
 // GetCurrentStatus returns cached control-loop telemetry and current trading
@@ -3296,12 +3305,13 @@ func (s *Service) GetCurrentStatus(ctx context.Context) CurrentStatus {
 
 	now := s.now()
 	status := CurrentStatus{
-		State:             s.state,
-		BatteryAvailable:  s.batteryTelemetryAvailable,
-		BatterySOC:        s.batteryTelemetrySOC,
-		BatteryPowerW:     s.batteryTelemetryPowerW,
-		BatteryObservedAt: s.batteryTelemetryUpdatedAt,
-		PlanPending:       s.pendingPlan != nil,
+		State:              s.state,
+		BatteryAvailable:   s.batteryTelemetryAvailable,
+		BatterySOC:         s.batteryTelemetrySOC,
+		BatteryPowerW:      s.batteryTelemetryPowerW,
+		BatteryObservedAt:  s.batteryTelemetryUpdatedAt,
+		PlanPending:        s.pendingPlan != nil,
+		MeasuredEfficiency: s.measuredEfficiencySummary(),
 	}
 	if s.currentPlan != nil {
 		status.PlanDischargeOnly = s.currentPlan.DischargeOnly

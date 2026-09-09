@@ -94,6 +94,19 @@ var (
 		Name: "energy_trader_cash_flow_unpriced_energy_kwh",
 		Help: "Cumulative grid charge and discharge energy excluded from known cash flow because its tariff was unavailable",
 	})
+
+	measuredEfficiency = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "energy_trader_measured_efficiency_percent",
+		Help: "Energy-weighted operational AC round-trip efficiency including standby (percent); NaN until a valid matched-SOC window completes",
+	})
+	measuredEfficiencyWindows = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "energy_trader_measured_efficiency_windows",
+		Help: "Accepted complete matched-SOC measurement windows",
+	})
+	rejectedEfficiencyWindows = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "energy_trader_rejected_efficiency_windows",
+		Help: "Incomplete or invalid efficiency measurement windows discarded",
+	})
 )
 
 func init() {
@@ -101,6 +114,7 @@ func init() {
 	prometheus.MustRegister(traderState)
 	prometheus.MustRegister(traderPnL)
 	prometheus.MustRegister(unpricedCashFlowEnergy)
+	prometheus.MustRegister(measuredEfficiency, measuredEfficiencyWindows, rejectedEfficiencyWindows)
 }
 
 // metricsHandler returns the Prometheus metrics handler.
@@ -132,6 +146,13 @@ func (h *Handler) updateMetrics(ctx context.Context) {
 
 	// Update battery SOC from current status
 	status := h.svc.GetCurrentStatus(ctx)
+	if status.MeasuredEfficiency.Percent == nil {
+		measuredEfficiency.Set(math.NaN())
+	} else {
+		measuredEfficiency.Set(*status.MeasuredEfficiency.Percent)
+	}
+	measuredEfficiencyWindows.Set(float64(status.MeasuredEfficiency.Cycles))
+	rejectedEfficiencyWindows.Set(float64(status.MeasuredEfficiency.RejectedWindows))
 	if status.BatteryAvailable {
 		batterySOC.Set(float64(status.BatterySOC))
 	} else {

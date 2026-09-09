@@ -69,7 +69,7 @@ func run() int {
 		"listen_addr", cfg.HTTPListenAddr,
 		"nordpool_area", cfg.NordPoolArea,
 		"min_expected_profit_eur_kwh", cfg.MinPriceSpread,
-		"efficiency", cfg.BatteryEfficiency,
+		"configured_planning_efficiency", cfg.BatteryEfficiency,
 		"energy_tax_eur_kwh", cfg.EnergyTaxEURPerKWh,
 		"vat_rate", cfg.VATRate,
 		"supplier_fee_eur_kwh", cfg.SupplierFeeEURPerKWh,

@@ -239,14 +239,16 @@ func TestSendTradingPlanExplainsNetProfitThreshold(t *testing.T) {
 		return telegramUpdatesResponse(`{"ok":true,"result":true}`), nil
 	})}
 
+	measuredEfficiency := 83.2
+
 	err = client.SendTradingPlan(context.Background(), TradingPlanData{
-		Day:               "horizon",
-		Date:              time.Date(2026, 9, 6, 0, 0, 0, 0, time.UTC),
-		PriceMin:          0.126,
-		PriceMax:          0.4394,
-		IsProfitable:      true,
-		MinExpectedProfit: 0.05,
-		BatteryEfficiency: 0.90,
+		Day:                "horizon",
+		Date:               time.Date(2026, 9, 6, 0, 0, 0, 0, time.UTC),
+		PriceMin:           0.126,
+		PriceMax:           0.4394,
+		IsProfitable:       true,
+		MinExpectedProfit:  0.05,
+		MeasuredEfficiency: EfficiencyData{Percent: &measuredEfficiency, Cycles: 3, WindowHours: 12.5},
 		Cycles: []TradingPlanCycle{{
 			ChargeStart:    "Mon 07 Sep 01:45",
 			ChargeEnd:      "Mon 07 Sep 04:00",
@@ -263,7 +265,8 @@ func TestSendTradingPlanExplainsNetProfitThreshold(t *testing.T) {
 
 	for _, want := range []string{
 		"Configured minimum net profit: 0.0500 EUR/kWh",
-		"Battery efficiency: 90.0%",
+		"Measured AC round-trip efficiency:</b> 83.2%",
+		"3 accepted windows, 12.5 measurement hours; includes standby",
 		"Mon 07 Sep 01:45",
 		"Expected profit: 0.0558 EUR/kWh",
 	} {
@@ -271,17 +274,20 @@ func TestSendTradingPlanExplainsNetProfitThreshold(t *testing.T) {
 			t.Errorf("message missing %q:\n%s", want, message.Text)
 		}
 	}
+	if strings.Contains(message.Text, "90.0%") {
+		t.Errorf("message shows configured efficiency:\n%s", message.Text)
+	}
 
 	err = client.SendTradingPlan(context.Background(), TradingPlanData{
-		Day:               "horizon",
-		Date:              time.Date(2026, 9, 6, 0, 0, 0, 0, time.UTC),
-		SlotsTotal:        192,
-		SlotsAnalyzed:     192,
-		PriceMin:          0.126,
-		PriceMax:          0.4394,
-		Reason:            "Expected profit is below the configured minimum",
-		MinExpectedProfit: 0.05,
-		BatteryEfficiency: 0.855,
+		Day:                "horizon",
+		Date:               time.Date(2026, 9, 6, 0, 0, 0, 0, time.UTC),
+		SlotsTotal:         192,
+		SlotsAnalyzed:      192,
+		PriceMin:           0.126,
+		PriceMax:           0.4394,
+		Reason:             "Expected profit is below the configured minimum",
+		MinExpectedProfit:  0.05,
+		MeasuredEfficiency: EfficiencyData{Percent: &measuredEfficiency, Cycles: 3, WindowHours: 12.5},
 	})
 	if err != nil {
 		t.Fatalf("SendTradingPlan() non-profitable error = %v", err)
@@ -289,7 +295,7 @@ func TestSendTradingPlanExplainsNetProfitThreshold(t *testing.T) {
 	for _, want := range []string{
 		"No profitable opportunities",
 		"Configured minimum net profit: 0.0500 EUR/kWh",
-		"Battery efficiency: 85.5%",
+		"Measured AC round-trip efficiency:</b> 83.2%",
 	} {
 		if !strings.Contains(message.Text, want) {
 			t.Errorf("non-profitable message missing %q:\n%s", want, message.Text)
@@ -300,7 +306,6 @@ func TestSendTradingPlanExplainsNetProfitThreshold(t *testing.T) {
 		Day:               "horizon",
 		Date:              time.Date(2026, 9, 6, 0, 0, 0, 0, time.UTC),
 		MinExpectedProfit: 0.05,
-		BatteryEfficiency: 0.90,
 		PlanRetained:      true,
 		DischargeOnly:     true,
 		DischargeStart:    "Mon 07 Sep 06:30",
@@ -315,6 +320,7 @@ func TestSendTradingPlanExplainsNetProfitThreshold(t *testing.T) {
 		"Grid charging is disabled",
 		"Discharge: Mon 07 Sep 06:30 - Mon 07 Sep 08:45 @ 0.3958 EUR/kWh",
 		"Active committed-cycle plan retained; refreshed plan pending.",
+		"unavailable (waiting for valid measurement; includes standby)",
 	} {
 		if !strings.Contains(message.Text, want) {
 			t.Errorf("discharge-only message missing %q:\n%s", want, message.Text)
@@ -336,16 +342,36 @@ func TestSendStatusDistinguishesUnavailableAndZeroPrice(t *testing.T) {
 		messages = append(messages, message)
 		return telegramUpdatesResponse(`{"ok":true,"result":true}`), nil
 	})}
+	measuredEfficiency := 83.2
 
 	if err := client.SendStatus(context.Background(), StatusData{}); err != nil {
 		t.Fatalf("SendStatus(unavailable) error = %v", err)
 	}
-	if err := client.SendStatus(context.Background(), StatusData{CurrentPriceKnown: true}); err != nil {
+	if err := client.SendStatus(context.Background(), StatusData{
+		CurrentPriceKnown: true,
+		MeasuredEfficiency: EfficiencyData{
+			Percent:     &measuredEfficiency,
+			Cycles:      3,
+			WindowHours: 12.5,
+		},
+	}); err != nil {
 		t.Fatalf("SendStatus(zero) error = %v", err)
 	}
 	if len(messages) != 2 || !strings.Contains(messages[0].Text, "<b>Price:</b> unavailable") ||
 		!strings.Contains(messages[1].Text, "<b>Price:</b> 0.0000 EUR/kWh") {
 		t.Fatalf("status price messages = %+v", messages)
+	}
+	if !strings.Contains(messages[0].Text, "unavailable (waiting for valid measurement; includes standby)") ||
+		strings.Contains(messages[0].Text, "0.0%") || strings.Contains(messages[0].Text, "90.0%") {
+		t.Errorf("status with no measurement = %q", messages[0].Text)
+	}
+	for _, want := range []string{
+		"Measured AC round-trip efficiency:</b> 83.2%",
+		"3 accepted windows, 12.5 measurement hours; includes standby",
+	} {
+		if !strings.Contains(messages[1].Text, want) {
+			t.Errorf("measured status missing %q:\n%s", want, messages[1].Text)
+		}
 	}
 }
 
@@ -362,6 +388,8 @@ func TestDailySummaryDisclosesUnpricedEnergy(t *testing.T) {
 		return telegramUpdatesResponse(`{"ok":true,"result":true}`), nil
 	})}
 
+	measuredEfficiency := 83.2
+
 	err = client.SendDailySummaryFull(context.Background(), DailySummaryData{
 		Date:               time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC),
 		DischargeCycles:    1,
@@ -369,11 +397,19 @@ func TestDailySummaryDisclosesUnpricedEnergy(t *testing.T) {
 		UnpricedKWh:        .25,
 		PnLIncomplete:      true,
 		TotalPnLIncomplete: true,
+		MeasuredEfficiency: EfficiencyData{Percent: &measuredEfficiency, Cycles: 3, WindowHours: 12.5},
 	})
 	if err != nil {
 		t.Fatalf("SendDailySummaryFull() error = %v", err)
 	}
-	for _, want := range []string{"Today's known cash flow", "Cumulative known cash flow", "0.25 kWh could not be priced", "totals are incomplete"} {
+	for _, want := range []string{
+		"Today's known cash flow",
+		"Cumulative known cash flow",
+		"0.25 kWh could not be priced",
+		"totals are incomplete",
+		"Measured AC round-trip efficiency:</b> 83.2%",
+		"3 accepted windows, 12.5 measurement hours; includes standby",
+	} {
 		if !strings.Contains(message.Text, want) {
 			t.Errorf("daily summary %q does not contain %q", message.Text, want)
 		}
@@ -472,7 +508,6 @@ func TestSendTradingPlanFitsTelegramMessageLimit(t *testing.T) {
 		PriceMax:          .40,
 		IsProfitable:      true,
 		MinExpectedProfit: .05,
-		BatteryEfficiency: .90,
 		PlanRetained:      true,
 		Cycles:            cycles,
 	})

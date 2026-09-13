@@ -32,7 +32,7 @@ Every price uses one configured all-in EUR/kWh rate:
 (wholesale price + energy tax) * (1 + VAT) + supplier fee
 ```
 
-Import, export, and solar opportunity cost are valued symmetrically with that rate; a separate feed-in tariff is not modeled. Planning, accounting, and solar-charging rules are detailed in [Methodology](docs/methodology.md), and the full state machine and accounting rules are in [the PRD](docs/energy-trader-prd.md).
+Export and solar opportunity cost are valued at the configured export tariff (`EXPORT_PRICE_MODE`), symmetric with the import rate by default and optionally wholesale-based. Planning, accounting, and solar-charging rules are detailed in [Methodology](docs/methodology.md), and the full state machine and accounting rules are in [the PRD](docs/energy-trader-prd.md).
 
 ## Quick Start
 

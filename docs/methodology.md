@@ -34,7 +34,7 @@ NordPool EUR/MWh prices are converted to one all-in EUR/kWh rate:
 (wholesale price + energy tax) * (1 + VAT) + supplier fee
 ```
 
-That same configured rate values import, discharge/export, and solar export opportunity cost. This assumes symmetric import/export value and does not model a separate feed-in tariff.
+Exported energy is valued by `EXPORT_PRICE_MODE`. In the default `symmetric` mode that same all-in rate values import, discharge/export, and solar export opportunity cost. In `wholesale` mode, discharge/export and the forgone solar export opportunity cost are instead valued at `wholesale price + EXPORT_FEE_EUR_PER_KWH` (no energy tax, no VAT), which approximates Dutch pricing after net metering ends in 2027; grid import keeps the all-in rate. Discharge is then valued entirely at the export rate, which is conservative: it ignores the share of discharge that offsets house load and is therefore worth the import rate.
 
 NordPool responses are validated against CET/CEST market-day boundaries, then assembled into the configured timezone's local calendar days. A local day can span adjacent market publications; until the next publication, only a contiguous known prefix is used. Incomplete calendars are refreshed every 15 minutes, including after midnight promotion, without erasing previously known coverage.
 
@@ -62,4 +62,4 @@ Solar charging is enabled only when `HOMEWIZARD_P1_URL` is an explicit meter URL
 - Surplus below `max(75 W, SOLAR_MIN_SURPLUS_W / 4)` enters a 60-second grace period at 75 W before stopping.
 - Adaptive cooldowns reduce short-session cycling.
 - Battery-full protection, grid reservations, discharge windows, and repeated telemetry failure override solar charging.
-- Solar is used ahead of reserved grid energy only when its forgone export value is no greater than the marginal reserved grid price.
+- Solar is used ahead of reserved grid energy only when its forgone export value, priced at the configured export rate, is no greater than the marginal reserved grid import price.

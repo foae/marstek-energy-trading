@@ -5544,3 +5544,77 @@ func TestActiveChargeSurvivesTariffBoundaryWithFallingPrices(t *testing.T) {
 			battery.IdleCalls, battery.ChargeAttempts)
 	}
 }
+
+// makeAsymmetricServicePrices builds a price series whose export value differs
+// from its import value.
+func makeAsymmetricServicePrices(baseTime time.Time, importValue, exportValue float64, slots int) []nordpool.Price {
+	prices := make([]nordpool.Price, slots)
+	for i := range prices {
+		prices[i] = nordpool.Price{
+			Time:           baseTime.Add(time.Duration(i) * 15 * time.Minute),
+			Value:          importValue,
+			ExportValue:    exportValue,
+			HasExportValue: true,
+		}
+	}
+	return prices
+}
+
+func TestMeasuredSessionPriceUsesExportForDischargeAndImportForCharge(t *testing.T) {
+	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	prices := makeAsymmetricServicePrices(baseTime, 0.30, 0.08, 4)
+
+	for _, tt := range []struct {
+		name     string
+		charging bool
+		powerW   float64
+		want     string
+	}{
+		{name: "charge is valued at the import price", charging: true, powerW: 1000, want: "0.3"},
+		{name: "discharge is valued at the export price", charging: false, powerW: -1000, want: "0.08"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := newTestService(testConfigSmallBattery(), NewMockBattery(50), prices, baseTime)
+			svc.mu.Lock()
+			svc.currentTradeStart = baseTime
+			svc.currentTradeLastUpdate = baseTime
+			svc.currentTradeLastPowerW = tt.powerW
+			svc.accumulateMeasuredTradeEnergyAtLocked(tt.powerW, baseTime.Add(30*time.Minute), tt.charging)
+			price, known := svc.measuredTradePriceLocked()
+			svc.mu.Unlock()
+
+			if !known {
+				t.Fatal("measuredTradePriceLocked() known = false, want true")
+			}
+			if want := decimal.RequireFromString(tt.want); !price.Equal(want) {
+				t.Errorf("session price = %s, want %s", price, want)
+			}
+		})
+	}
+}
+
+func TestSolarAccountingUsesImportForGridAndExportForOpportunity(t *testing.T) {
+	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+	prices := makeAsymmetricServicePrices(baseTime, 0.30, 0.08, 4)
+	svc := newTestService(testConfigSmallBattery(), NewMockBattery(50), prices, baseTime)
+
+	svc.mu.Lock()
+	svc.currentTradeStart = baseTime
+	svc.solarLastUpdate = baseTime
+	svc.solarMeasuredChargePowerW = 1000
+	svc.solarGridPowerW = 400
+	// One hour at 1000 W: 0.4 kWh from the grid, 0.6 kWh from solar.
+	svc.accumulateSolarEnergyAtLocked(1000, baseTime.Add(time.Hour))
+	gridCost := svc.solarGridCostEUR
+	opportunityCost := svc.solarOpportunityCostEUR
+	svc.mu.Unlock()
+
+	wantGrid := decimal.RequireFromString("0.12")         // 0.4 kWh * 0.30 import
+	wantOpportunity := decimal.RequireFromString("0.048") // 0.6 kWh * 0.08 export
+	if gridCost.Sub(wantGrid).Abs().GreaterThan(decimal.New(1, -9)) {
+		t.Errorf("grid cost = %s, want %s at the import price", gridCost, wantGrid)
+	}
+	if opportunityCost.Sub(wantOpportunity).Abs().GreaterThan(decimal.New(1, -9)) {
+		t.Errorf("opportunity cost = %s, want %s at the export price", opportunityCost, wantOpportunity)
+	}
+}

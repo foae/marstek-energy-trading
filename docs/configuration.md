@@ -14,6 +14,8 @@ All settings are environment variables, typically provided through a `.env` file
 | `ENERGY_TAX_EUR_PER_KWH` | `0.09161` | Example Dutch 2026 energy tax; verify before use |
 | `VAT_RATE` | `0.21` | VAT applied to wholesale price and energy tax |
 | `SUPPLIER_FEE_EUR_PER_KWH` | `0.02` | VAT-inclusive supplier fee |
+| `EXPORT_PRICE_MODE` | `symmetric` | `symmetric` values export at the all-in import rate; `wholesale` values it at the wholesale price plus `EXPORT_FEE_EUR_PER_KWH` |
+| `EXPORT_FEE_EUR_PER_KWH` | `0` | Signed per-kWh adjustment to the export rate, applied only in `wholesale` mode; negative models a feed-in cost |
 | `MIN_PRICE_SPREAD` | `0.05` | Minimum expected profit after efficiency loss in EUR/kWh (historical name) |
 | `BATTERY_EFFICIENCY` | `0.90` | Round-trip efficiency in `(0, 1]` |
 | `BATTERY_CHARGE_EFFICIENCY` | `0.95` | Charging (AC input to stored) efficiency in `(0, 1]`, at least `BATTERY_EFFICIENCY`; the discharge efficiency is `BATTERY_EFFICIENCY / BATTERY_CHARGE_EFFICIENCY` |
@@ -38,7 +40,7 @@ NordPool EUR/MWh prices are converted to one all-in EUR/kWh rate:
 (wholesale price + energy tax) * (1 + VAT) + supplier fee
 ```
 
-That same configured rate values import, discharge/export, and solar export opportunity cost. This assumes symmetric import/export value and does not model a separate feed-in tariff; installations with a separate feed-in tariff need code changes. `NORDPOOL_CURRENCY` must remain EUR for all-in pricing.
+By default (`EXPORT_PRICE_MODE=symmetric`) that same rate values import, discharge/export, and solar export opportunity cost. With `EXPORT_PRICE_MODE=wholesale`, discharge, export, and forgone solar export are instead valued at `wholesale price + EXPORT_FEE_EUR_PER_KWH` (no energy tax, no VAT), which approximates Dutch pricing after net metering ends in 2027. In that mode discharge is valued entirely at the export rate; this is conservative, because it ignores the share of discharge that offsets house load and is therefore worth the import rate. `NORDPOOL_CURRENCY` must remain EUR for all-in pricing.
 
 The default tax, VAT, fee, area, timezone, battery capacity, and efficiency values are examples for one Dutch setup and will become stale. Verify them for your installation before use.
 

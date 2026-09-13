@@ -132,7 +132,7 @@ Execution (`service/service.go`, `service/charging_reservations.go`):
 - Size charge windows from usable capacity divided by `BATTERY_CHARGE_EFFICIENCY` and discharge windows from usable capacity times `BATTERY_EFFICIENCY` divided by it, so both are AC-side energies; reserve the AC input as the SOC shortfall divided by the charge-side efficiency, not the round-trip figure.
 - Extend a running, truncated reservation slice to its 15-minute tariff boundary when displacing that energy onto cheaper reserved slices costs under one cent, so falling prices cannot force a stop/start at every boundary.
 - Do not start or refresh automatic control in the final minute of its window; bind ESPHome control and battery-power verification to the active window deadline.
-- Solar replaces reserved grid energy only when its forgone export value is no greater than the marginal reservation price. If economics makes the reservation infeasible, solar must still satisfy the paired cycle's per-slice expected-profit ceiling; that ceiling remains active between the charge deadline and paired discharge. Import/export use the same tariff.
+- Solar replaces reserved grid energy only when its forgone export value is no greater than the marginal reservation price. If economics makes the reservation infeasible, solar must still satisfy the paired cycle's per-slice expected-profit ceiling; that ceiling remains active between the charge deadline and paired discharge. Export is valued at the configured export tariff (symmetric by default).
 - Measured taper reduces available delivery capacity; expose infeasibility and attempt best effort rather than guaranteeing 100%.
 - `lastChargePrice` is restored for information only, never a discharge gate.
 

@@ -4,7 +4,7 @@ Product Requirements Document for the Marstek Energy Trading Bot.
 
 ## Overview
 
-A Go service that performs energy price arbitrage using a Marstek Venus E battery. The service fetches NordPool day-ahead prices, builds a global plan of profitable charge/discharge cycles, and controls the battery via an ESPHome HTTP REST API. A HomeWizard P1 meter can direct solar surplus into the battery only when doing so is no more expensive than its forgone export value relative to reserved grid energy; it is not free profit.
+A Go service that performs energy price arbitrage using a Marstek Venus E battery. The service fetches NordPool day-ahead prices, builds a global plan of profitable charge/discharge cycles, and controls the battery via an ESPHome HTTP REST API. A HomeWizard P1 meter can direct solar surplus into the battery only when doing so is no more expensive than its forgone export value, priced at the configured export tariff, relative to reserved grid energy; it is not free profit.
 
 ## Hardware
 
@@ -33,7 +33,7 @@ A Go service that performs energy price arbitrage using a Marstek Venus E batter
 - **Endpoint**: `GET /api/v1/data` - returns `active_power_w` (positive = import, negative = export)
 - **Connectivity check**: `GET /api` - returns device info
 - **Timeout**: 5 seconds
-- **Purpose**: Detects solar surplus (grid export) for battery charging; captured solar is valued at the configured all-in export opportunity rate.
+- **Purpose**: Detects solar surplus (grid export) for battery charging; captured solar is valued at the configured export tariff.
 - **Auto-discovery**: Only when `HOMEWIZARD_P1_URL=auto`, the service attempts two discovery methods in order:
   1. **mDNS** (3s timeout): Browses `_hwenergy._tcp` on the local network. Filters for `product_type=HWE-P1` and `api_enabled=1` in TXT records.
   2. **HTTP scan** (30s timeout): Falls back to probing `GET /api` on `192.168.0.x` and `192.168.1.x` (64 concurrent workers, 500ms connect timeout). Checks `product_type=HWE-P1` in JSON response. Useful when mDNS is unavailable (e.g., Docker bridge networks).
@@ -48,7 +48,7 @@ A Go service that performs energy price arbitrage using a Marstek Venus E batter
 - **Endpoint**: `https://dataportal-api.nordpoolgroup.com/api/DayAheadPriceIndices`
 - **Resolution**: 15-minute intervals (96 data points/day)
 - **Area**: NL (Netherlands)
-- **Rates**: EUR/MWh wholesale data converted to one configured all-in EUR/kWh rate: `(NordPool + energy tax) × (1 + VAT) + supplier fee`. That same rate prices grid import, discharge/export valuation, and solar opportunity cost; no separate feed-in tariff is modeled.
+- **Rates**: EUR/MWh wholesale data converted to one configured all-in EUR/kWh rate: `(NordPool + energy tax) × (1 + VAT) + supplier fee`. That rate prices grid import; discharge/export and solar opportunity cost use the configured export tariff (`EXPORT_PRICE_MODE`), symmetric with the import rate by default or wholesale-based with `EXPORT_FEE_EUR_PER_KWH`.
 
 ## Trading Strategy
 
@@ -74,7 +74,7 @@ A Go service that performs energy price arbitrage using a Marstek Venus E batter
 
 For the next unfinished charge cycle, the service derives a deadline from its charge-window end and calculates the grid input needed to reach 100% from current SOC, dividing the SOC shortfall by the charge-side efficiency `BATTERY_CHARGE_EFFICIENCY` rather than by the round-trip figure, since the discharge-side loss is not paid on import. It considers eligible 15-minute price slices from the known today and tomorrow tariff sets after the prior planned discharge and through that deadline, then reserves the cheapest slices first. It forecasts no future solar: any solar already reflected in measured SOC reduces the reservation. After a grid charge has run for 30 seconds, any lower observed charging power becomes the deliverability limit. A grid slice is excluded when its individual price would reduce expected profit against the paired discharge average below `MIN_PRICE_SPREAD`. Automatic control does not start or refresh in the final minute of a reserved window, reserving a bounded interval for ESPHome confirmation and battery-power verification before the tariff boundary. While a charge is running, its slice is extended to the full 15-minute tariff boundary rather than truncated, as long as displacing the same energy onto cheaper reserved slices costs less than one cent, so a gently falling price curve cannot force a stop/start at every boundary. When delivery capacity, time, or that economic bound prevents a full charge, the service reserves an eligible best-effort subset and marks the reservation infeasible.
 
-For a feasible reservation, solar begins only if its current all-in export opportunity cost is no greater than the marginal (highest-priced) selected grid slice. Otherwise the service exports the expensive solar now and retains the cheaper grid reservation. If economic exclusions cause the reservation shortfall, solar must still satisfy the same per-slice expected-profit ceiling; that ceiling remains active between the charge deadline and paired discharge. Infeasibility caused by time or taper even with all slices available permits solar capture regardless. With no deadline and no pending paired discharge, solar is captured. A feasible or economics-limited reservation with no known current tariff does not start solar.
+For a feasible reservation, solar begins only if its current export opportunity cost, priced at the configured export tariff, is no greater than the marginal (highest-priced) selected grid slice. Otherwise the service exports the expensive solar now and retains the cheaper grid reservation. If economic exclusions cause the reservation shortfall, solar must still satisfy the same per-slice expected-profit ceiling; that ceiling remains active between the charge deadline and paired discharge. Infeasibility caused by time or taper even with all slices available permits solar capture regardless. With no deadline and no pending paired discharge, solar is captured. A feasible or economics-limited reservation with no known current tariff does not start solar.
 
 ### Execution accounting and discharge
 
@@ -93,7 +93,7 @@ When a HomeWizard P1 meter is configured, the service detects grid export (solar
 5. **Ramp-up cooldown**: After starting or adjusting charge power, a 5-second cooldown prevents re-adjustment while the battery ramps to the new target (~3s). This avoids a positive feedback spiral where transient over-estimation of effective surplus causes the target power to spiral upward.
 6. **Low-surplus, economic choice, and failures**: EMA below `max(SOLAR_MIN_SURPLUS_W / 4, 75W)` starts a 60-second grace requesting 75W; recovery immediately clears it. Grace expiry stops charging. Surplus-loss sessions under ten minutes get a five-minute cooldown; three consecutive marginal sessions get fifteen minutes. Longer sessions and legitimate stops reset the streak and use sixty seconds. Battery-full, active-reservation, and discharge-window checks precede P1 reads. For a feasible reservation, solar starts only when the current export opportunity cost is no greater than the marginal reserved grid price; otherwise expensive solar is exported and cheaper grid energy remains reserved. An economics-limited reservation still applies the paired cycle's per-slice price ceiling to solar, including after the charge deadline while its discharge remains pending; infeasibility caused only by time or taper permits solar capture regardless. Failed adjustments and repeated telemetry failure request a confirmed stop; an unconfirmed stop retains the session and is retried.
 7. **Scheduled priority**: An active grid reservation or discharge window stops solar charging before its scheduled action begins. Solar does not start during either, then can resume once the window ends if the economic rule permits it.
-8. **Recording**: `solar_charge` records measured battery energy from AC power, separate estimated grid energy/cost, and solar opportunity cost. Grid input is `min(measuredACChargePower, max(netGridImport, 0))`, integrated between samples. Solar energy is the remainder. Known rate slots price grid cost and the forgone-export opportunity cost; unavailable rates are explicitly unpriced. Legacy records without split fields remain all-solar.
+8. **Recording**: `solar_charge` records measured battery energy from AC power, separate estimated grid energy/cost, and solar opportunity cost. Grid input is `min(measuredACChargePower, max(netGridImport, 0))`, integrated between samples. Solar energy is the remainder. Known rate slots price grid cost at the import rate and the forgone-export opportunity cost at the export rate; unavailable rates are explicitly unpriced. Legacy records without split fields remain all-solar.
 
 ### Configurable Profit Threshold
 
@@ -314,7 +314,7 @@ make docker-build   # Build Docker image
 - Startup and graceful shutdown attempt a confirmed stop, but abrupt termination cannot guarantee one. Container shutdown must allow at least 95 seconds.
 - The HTTP API, ESPHome API, and HomeWizard local API have no authentication in this design and must remain on trusted networks. Status and metrics reveal household and financial data.
 - The paired cycle for purchased grid energy is persisted before issuing a charge command and restored after restart. Partial active-session energy measurements are not persisted, so abrupt termination can still under-report a session.
-- Import and export use one symmetric configured tariff. P&L is operational cash-flow estimation, not inventory-matched profit or revenue-grade metering.
+- Export uses the configured export tariff, symmetric with the import rate by default. P&L is operational cash-flow estimation, not inventory-matched profit or revenue-grade metering.
 - The repository does not provide the ESPHome firmware configuration or an independent hardware watchdog.
 
 ## Out of Scope (v1)

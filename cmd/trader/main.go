@@ -73,6 +73,8 @@ func run() int {
 		"energy_tax_eur_kwh", cfg.EnergyTaxEURPerKWh,
 		"vat_rate", cfg.VATRate,
 		"supplier_fee_eur_kwh", cfg.SupplierFeeEURPerKWh,
+		"export_price_mode", cfg.ExportPriceMode,
+		"export_fee_eur_kwh", cfg.ExportFeeEURPerKWh,
 	)
 
 	// Initialize clients with configured timezone and all-in pricing.
@@ -84,6 +86,8 @@ func run() int {
 			EnergyTaxEURPerKWh:   cfg.EnergyTaxEURPerKWh,
 			VATRate:              cfg.VATRate,
 			SupplierFeeEURPerKWh: cfg.SupplierFeeEURPerKWh,
+			ExportMode:           cfg.ExportPriceMode,
+			ExportFeeEURPerKWh:   cfg.ExportFeeEURPerKWh,
 		},
 	)
 	minSOC := cfg.MinSOCPercent()

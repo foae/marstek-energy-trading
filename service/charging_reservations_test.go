@@ -610,3 +610,25 @@ func TestReservationDoesNotExtendSingleReservedSlice(t *testing.T) {
 		t.Errorf("window end = %s, want the truncated %s", reservation.Windows[0].End, now.Add(3*time.Minute))
 	}
 }
+
+func TestSolarAdmittedWhenExportPriceIsBelowMarginalReservedImportPrice(t *testing.T) {
+	s, now := reservationFixture()
+	// Symmetric baseline: a 30ct surplus loses to 5/10ct reserved grid energy.
+	if solarEconomicalAt(s, now, 50) {
+		t.Fatal("symmetric 30ct solar should not displace cheaper reserved grid energy")
+	}
+
+	// Asymmetric export: the surplus is only worth 5ct if exported, at or below
+	// the cheapest reserved slice, while importing it still costs 30ct.
+	s.todayPrices[0].ExportValue = .05
+	s.todayPrices[0].HasExportValue = true
+	if !solarEconomicalAt(s, now, 50) {
+		t.Fatal("solar worth only its export value should displace equally priced reserved grid energy")
+	}
+
+	// Above the marginal reserved price it is rejected again.
+	s.todayPrices[0].ExportValue = .11
+	if solarEconomicalAt(s, now, 50) {
+		t.Fatal("export value above every reserved slice price should reject solar")
+	}
+}

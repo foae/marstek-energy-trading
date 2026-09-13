@@ -20,8 +20,10 @@ func localMidnight(t time.Time) time.Time {
 // priceSlot is an internal type used by the analyzer. Prices are converted from
 // nordpool.Price (float64 API boundary) to decimal.Decimal for precise arithmetic.
 type priceSlot struct {
-	Time  time.Time
-	Value decimal.Decimal
+	Time time.Time
+	// Value is the all-in import price; Export is the price credited on export.
+	Value  decimal.Decimal
+	Export decimal.Decimal
 }
 
 type averagedWindow struct {
@@ -94,7 +96,11 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 	// Convert API float64 prices to decimal for precise monetary arithmetic
 	slots := make([]priceSlot, len(sorted))
 	for i, p := range sorted {
-		slots[i] = priceSlot{Time: p.Time, Value: decimal.NewFromFloat(p.Value)}
+		slots[i] = priceSlot{
+			Time:   p.Time,
+			Value:  decimal.NewFromFloat(p.Value),
+			Export: decimal.NewFromFloat(p.Export()),
+		}
 	}
 
 	// Find min and max prices
@@ -190,8 +196,8 @@ func selectOptimalCycles(prices []priceSlot, chargeWindowSize, dischargeWindowSi
 		return nil
 	}
 
-	chargeAverages := precomputeWindowAverages(prices, chargeWindowSize, now, nil)
-	dischargeAverages := precomputeWindowAverages(prices, dischargeWindowSize, now, retiredDischargeWindows)
+	chargeAverages := precomputeWindowAverages(prices, chargeWindowSize, now, nil, false)
+	dischargeAverages := precomputeWindowAverages(prices, dischargeWindowSize, now, retiredDischargeWindows, true)
 	profits := make([][]decimal.Decimal, maxCycles+1)
 	choices := make([][]cycleChoice, maxCycles+1)
 	for cycleCount := range profits {
@@ -272,8 +278,8 @@ func selectRecoveryCycle(prices []priceSlot, chargeSize, dischargeSize int, effi
 			return nil
 		}
 	}
-	charges := precomputeWindowAverages(prices, chargeSize, time.Time{}, nil)
-	discharges := precomputeWindowAverages(prices, dischargeSize, cfg.Now.Add(minimumAutomaticControlWindow), cfg.RetiredDischargeWindows)
+	charges := precomputeWindowAverages(prices, chargeSize, time.Time{}, nil, false)
+	discharges := precomputeWindowAverages(prices, dischargeSize, cfg.Now.Add(minimumAutomaticControlWindow), cfg.RetiredDischargeWindows, true)
 	var best *TradeCycle
 	for chargeStart, charge := range charges {
 		if !charge.valid {
@@ -311,8 +317,15 @@ func selectRecoveryCycle(prices []priceSlot, chargeSize, dischargeSize int, effi
 
 // precomputeWindowAverages calculates each contiguous quarter-hour window once.
 // A window is invalid when it spans a missing or duplicate price slot, has ended,
-// or matches a retired discharge window.
-func precomputeWindowAverages(prices []priceSlot, windowSize int, now time.Time, retiredWindows []TimeWindow) []averagedWindow {
+// or matches a retired discharge window. useExport averages the export price
+// (discharge windows) instead of the import price (charge windows).
+func precomputeWindowAverages(prices []priceSlot, windowSize int, now time.Time, retiredWindows []TimeWindow, useExport bool) []averagedWindow {
+	slotPrice := func(s priceSlot) decimal.Decimal {
+		if useExport {
+			return s.Export
+		}
+		return s.Value
+	}
 	averages := make([]averagedWindow, len(prices))
 	if windowSize <= 0 || windowSize > len(prices) {
 		return averages
@@ -321,7 +334,7 @@ func precomputeWindowAverages(prices []priceSlot, windowSize int, now time.Time,
 	sum := decimal.Zero
 	invalidTransitions := 0
 	for i := range windowSize {
-		sum = sum.Add(prices[i].Value)
+		sum = sum.Add(slotPrice(prices[i]))
 		if i > 0 && !prices[i-1].Time.Add(15*time.Minute).Equal(prices[i].Time) {
 			invalidTransitions++
 		}
@@ -342,7 +355,7 @@ func precomputeWindowAverages(prices []priceSlot, windowSize int, now time.Time,
 		if windowSize > 1 && !prices[start].Time.Add(15*time.Minute).Equal(prices[start+1].Time) {
 			invalidTransitions--
 		}
-		sum = sum.Sub(prices[start].Value).Add(prices[start+windowSize].Value)
+		sum = sum.Sub(slotPrice(prices[start])).Add(slotPrice(prices[start+windowSize]))
 		if windowSize > 1 && !prices[start+windowSize-1].Time.Add(15*time.Minute).Equal(prices[start+windowSize].Time) {
 			invalidTransitions++
 		}
@@ -382,6 +395,17 @@ func GetCurrentPrice(prices []nordpool.Price, t time.Time) (decimal.Decimal, boo
 		slotEnd := p.Time.Add(15 * time.Minute)
 		if !t.Before(p.Time) && t.Before(slotEnd) {
 			return decimal.NewFromFloat(p.Value), true
+		}
+	}
+	return decimal.Zero, false
+}
+
+// GetCurrentExportPrice returns the export price for the current time slot.
+func GetCurrentExportPrice(prices []nordpool.Price, t time.Time) (decimal.Decimal, bool) {
+	for _, p := range prices {
+		slotEnd := p.Time.Add(15 * time.Minute)
+		if !t.Before(p.Time) && t.Before(slotEnd) {
+			return decimal.NewFromFloat(p.Export()), true
 		}
 	}
 	return decimal.Zero, false

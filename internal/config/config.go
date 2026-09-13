@@ -31,6 +31,14 @@ type Config struct {
 	EnergyTaxEURPerKWh   decimal.Decimal `env:"ENERGY_TAX_EUR_PER_KWH" envDefault:"0.09161"`
 	VATRate              decimal.Decimal `env:"VAT_RATE" envDefault:"0.21"`
 	SupplierFeeEURPerKWh decimal.Decimal `env:"SUPPLIER_FEE_EUR_PER_KWH" envDefault:"0.02"`
+	// ExportPriceMode selects how exported energy is valued: "symmetric" uses
+	// the all-in import rate, "wholesale" uses the wholesale price plus
+	// ExportFeeEURPerKWh (no energy tax, no VAT).
+	ExportPriceMode string `env:"EXPORT_PRICE_MODE" envDefault:"symmetric"`
+	// ExportFeeEURPerKWh is a signed adjustment applied only in "wholesale"
+	// mode; negative values model feed-in costs. decimal.Decimal is always
+	// finite, so no finiteness check is needed.
+	ExportFeeEURPerKWh decimal.Decimal `env:"EXPORT_FEE_EUR_PER_KWH" envDefault:"0"`
 
 	// Trading
 	MinPriceSpread    float64 `env:"MIN_PRICE_SPREAD" envDefault:"0.05"` // Historical name: minimum expected profit after efficiency loss.
@@ -115,6 +123,9 @@ func (c *Config) validate() error {
 	}
 	if c.SupplierFeeEURPerKWh.IsNegative() {
 		return fmt.Errorf("SUPPLIER_FEE_EUR_PER_KWH must be >= 0, got %s", c.SupplierFeeEURPerKWh)
+	}
+	if c.ExportPriceMode != "symmetric" && c.ExportPriceMode != "wholesale" {
+		return fmt.Errorf("EXPORT_PRICE_MODE must be one of symmetric, wholesale, got %q", c.ExportPriceMode)
 	}
 	if c.DischargePowerW < MinDischargePowerW || c.DischargePowerW > MaxDischargePowerW {
 		return fmt.Errorf("DISCHARGE_POWER_W must be between %d and %d, got %d", MinDischargePowerW, MaxDischargePowerW, c.DischargePowerW)

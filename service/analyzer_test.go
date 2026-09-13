@@ -412,6 +412,85 @@ func TestAnalyzePrices_SmallWindow(t *testing.T) {
 	}
 }
 
+// makeAsymmetricPrices pairs each import value with an explicit export value.
+func makeAsymmetricPrices(baseTime time.Time, imports, exports []float64) []nordpool.Price {
+	prices := make([]nordpool.Price, len(imports))
+	for i := range imports {
+		prices[i] = nordpool.Price{
+			Time:           baseTime.Add(time.Duration(i) * 15 * time.Minute),
+			Value:          imports[i],
+			ExportValue:    exports[i],
+			HasExportValue: true,
+		}
+	}
+	return prices
+}
+
+func TestAnalyzePrices_DischargeWindowsUseExportPrices(t *testing.T) {
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	cfg := AnalyzerConfig{
+		Efficiency:         1,
+		MinPriceSpread:     0.01,
+		BatteryCapacityKWh: 0.5,
+		ChargePowerW:       2000,
+		DischargePowerW:    2000,
+		MaxCyclesPerDay:    1,
+	}
+
+	imports := []float64{0.10, 0.30}
+	exports := []float64{0.04, 0.20}
+
+	plan := AnalyzePrices(makeAsymmetricPrices(baseTime, imports, exports), cfg)
+	if len(plan.Cycles) != 1 {
+		t.Fatalf("expected one cycle, got %d", len(plan.Cycles))
+	}
+	cycle := plan.Cycles[0]
+	if !decimalEqual(cycle.ChargeWindow.Price, 0.10) {
+		t.Errorf("charge window price = %s, want the import price 0.10", cycle.ChargeWindow.Price)
+	}
+	if !decimalEqual(cycle.DischargeWindow.Price, 0.20) {
+		t.Errorf("discharge window price = %s, want the export price 0.20", cycle.DischargeWindow.Price)
+	}
+	if !decimalEqual(cycle.Profit, 0.10) {
+		t.Errorf("profit = %s, want 0.10 from the export price", cycle.Profit)
+	}
+
+	// Without explicit export values the analyzer stays symmetric.
+	symmetric := AnalyzePrices(makePrices(baseTime, imports...), cfg)
+	if len(symmetric.Cycles) != 1 {
+		t.Fatalf("expected one symmetric cycle, got %d", len(symmetric.Cycles))
+	}
+	if !decimalEqual(symmetric.Cycles[0].DischargeWindow.Price, 0.30) {
+		t.Errorf("symmetric discharge window price = %s, want 0.30", symmetric.Cycles[0].DischargeWindow.Price)
+	}
+	if !decimalEqual(symmetric.Cycles[0].Profit, 0.20) {
+		t.Errorf("symmetric profit = %s, want 0.20", symmetric.Cycles[0].Profit)
+	}
+}
+
+func TestGetCurrentExportPrice(t *testing.T) {
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	prices := makeAsymmetricPrices(baseTime, []float64{0.30}, []float64{0.08})
+
+	got, ok := GetCurrentExportPrice(prices, baseTime.Add(5*time.Minute))
+	if !ok {
+		t.Fatal("GetCurrentExportPrice() ok = false, want true")
+	}
+	if !decimalEqual(got, 0.08) {
+		t.Errorf("GetCurrentExportPrice() = %s, want 0.08", got)
+	}
+	if imported, _ := GetCurrentPrice(prices, baseTime.Add(5*time.Minute)); !decimalEqual(imported, 0.30) {
+		t.Errorf("GetCurrentPrice() = %s, want 0.30", imported)
+	}
+	if _, ok := GetCurrentExportPrice(prices, baseTime.Add(time.Hour)); ok {
+		t.Error("GetCurrentExportPrice() outside the horizon ok = true, want false")
+	}
+	// Symmetric prices fall back to the import value.
+	if got, _ := GetCurrentExportPrice(makePrices(baseTime, 0.30), baseTime); !decimalEqual(got, 0.30) {
+		t.Errorf("symmetric GetCurrentExportPrice() = %s, want 0.30", got)
+	}
+}
+
 func TestAnalyzePrices_MaximizesTotalProfitAcrossCycles(t *testing.T) {
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
 	cfg := AnalyzerConfig{

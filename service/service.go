@@ -312,14 +312,18 @@ func (s *Service) snapshotSessionPricesLocked() {
 }
 
 // sessionPriceAtLocked returns the retained price that applies at at, along
-// with the end of that priced or explicitly-unpriced interval.
-func (s *Service) sessionPriceAtLocked(at, until time.Time) (decimal.Decimal, time.Time, bool) {
+// with the end of that priced or explicitly-unpriced interval. export selects
+// the export rate instead of the all-in import rate.
+func (s *Service) sessionPriceAtLocked(at, until time.Time, export bool) (decimal.Decimal, time.Time, bool) {
 	end := until
 	for _, price := range s.currentTradePrices {
 		slotEnd := price.Time.Add(15 * time.Minute)
 		if !at.Before(price.Time) && at.Before(slotEnd) {
 			if slotEnd.Before(end) {
 				end = slotEnd
+			}
+			if export {
+				return decimal.NewFromFloat(price.Export()), end, true
 			}
 			return decimal.NewFromFloat(price.Value), end, true
 		}
@@ -430,7 +434,9 @@ func (s *Service) accumulateMeasuredTradeEnergyAtLocked(measuredPowerW float64, 
 	}
 	s.snapshotSessionPricesLocked()
 	for cursor := s.currentTradeLastUpdate; cursor.Before(at); {
-		price, end, known := s.sessionPriceAtLocked(cursor, at)
+		// Charged energy is valued at the import rate; discharged energy at
+		// the export rate.
+		price, end, known := s.sessionPriceAtLocked(cursor, at, !charging)
 		if dayEnd := localMidnight(cursor.In(s.loc)).AddDate(0, 0, 1); dayEnd.Before(end) {
 			end = dayEnd
 		}
@@ -751,6 +757,9 @@ func (s *Service) tick(ctx context.Context) {
 	// an obligation even when the corresponding tariff sample is unavailable.
 	dischargeWindow, inDischargeWindow := s.dischargeWindowAtLocked(now)
 	currentPrice, ok := s.currentPriceLocked(now)
+	// Discharge sessions are valued at the export rate; the charge decision and
+	// everything else keep the import rate.
+	currentExportPrice, exportOK := s.currentExportPriceLocked(now)
 	if !ok {
 		retainedDischarge := inDischargeWindow &&
 			(s.automaticCycleCommit != nil || s.solarCycleRetention != nil)
@@ -809,7 +818,7 @@ func (s *Service) tick(ctx context.Context) {
 				l.Info("decision: start discharging",
 					"last_charge_price", lastChargeF,
 					"max_price", s.currentPlan.MaxPrice)
-				s.startDischargingLocked(ctx, currentPrice, ok, batStatus.SOC, s.cfg.DischargePowerW, StateDischarging)
+				s.startDischargingLocked(ctx, currentExportPrice, exportOK, batStatus.SOC, s.cfg.DischargePowerW, StateDischarging)
 			}
 		} else if reservation.currentPriceTooHigh && !reservation.Feasible {
 			slot := now.Truncate(15 * time.Minute)
@@ -839,7 +848,7 @@ func (s *Service) tick(ctx context.Context) {
 				return
 			}
 			if batStatus.SOC > minSOC && batStatus.DischargFlag {
-				s.startDischargingLocked(ctx, currentPrice, ok, batStatus.SOC, s.cfg.DischargePowerW, StateDischarging)
+				s.startDischargingLocked(ctx, currentExportPrice, exportOK, batStatus.SOC, s.cfg.DischargePowerW, StateDischarging)
 			}
 		}
 
@@ -921,7 +930,11 @@ func (s *Service) accumulateSolarEnergyAtLocked(measuredChargePowerW float64, at
 		s.solarGridEnergyWs += gridPowerW * elapsed
 		s.snapshotSessionPricesLocked()
 		for cursor := s.solarLastUpdate; cursor.Before(at); {
-			price, end, known := s.sessionPriceAtLocked(cursor, at)
+			// Grid-sourced charge energy costs the import rate; the solar
+			// share forgoes the export rate. Both share the same slot
+			// boundaries, so the interval end is identical.
+			price, end, known := s.sessionPriceAtLocked(cursor, at, false)
+			exportPrice, _, _ := s.sessionPriceAtLocked(cursor, at, true)
 			if dayEnd := localMidnight(cursor.In(s.loc)).AddDate(0, 0, 1); dayEnd.Before(end) {
 				end = dayEnd
 			}
@@ -935,7 +948,7 @@ func (s *Service) accumulateSolarEnergyAtLocked(measuredChargePowerW float64, at
 			allocation.GridEnergyKWh = allocation.GridEnergyKWh.Add(gridEnergyKWh)
 			if known {
 				gridCost := price.Mul(gridEnergyKWh)
-				opportunityCost := price.Mul(solarEnergyKWh)
+				opportunityCost := exportPrice.Mul(solarEnergyKWh)
 				s.solarGridCostEUR = s.solarGridCostEUR.Add(gridCost)
 				s.solarOpportunityCostEUR = s.solarOpportunityCostEUR.Add(opportunityCost)
 				allocation.GridCostEUR = allocation.GridCostEUR.Add(gridCost)
@@ -1707,7 +1720,7 @@ func (s *Service) startChargingLocked(ctx context.Context, price decimal.Decimal
 	s.cacheBatteryTelemetryLocked(soc, measuredPowerW)
 	// DC seed for the taper; the next tick overrides it with the AC reading.
 	s.observedChargePowerW = max(measuredPowerW, 0)
-	_, _, priceKnown := s.sessionPriceAtLocked(s.currentTradeStart, s.currentTradeStart.Add(time.Nanosecond))
+	_, _, priceKnown := s.sessionPriceAtLocked(s.currentTradeStart, s.currentTradeStart.Add(time.Nanosecond), false)
 	if priceKnown {
 		s.lastChargePrice = price // Track the known start price for profitability.
 	}
@@ -1881,7 +1894,7 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 		s.stopDischargingLocked(ctx, soc)
 		return
 	}
-	notificationPrice, notificationPriceKnown := s.currentPriceLocked(s.currentTradeStart)
+	notificationPrice, notificationPriceKnown := s.currentExportPriceLocked(s.currentTradeStart)
 	notificationPriceF, _ := notificationPrice.Float64()
 
 	l.Info("discharge session started", "state", s.state, "measured_battery_power_w", measuredPowerW,
@@ -2405,6 +2418,14 @@ func (s *Service) currentPriceLocked(now time.Time) (decimal.Decimal, bool) {
 		return price, true
 	}
 	return GetCurrentPrice(s.tomorrowPrices, now)
+}
+
+// currentExportPriceLocked returns the rate credited for exported energy now.
+func (s *Service) currentExportPriceLocked(now time.Time) (decimal.Decimal, bool) {
+	if price, ok := GetCurrentExportPrice(s.todayPrices, now); ok {
+		return price, true
+	}
+	return GetCurrentExportPrice(s.tomorrowPrices, now)
 }
 
 func (s *Service) automaticCycleCommittedLocked() bool {
@@ -3166,8 +3187,8 @@ func (s *Service) handleManualDischargeCommand(ctx context.Context, args []strin
 		return
 	}
 
-	currentPrice, currentPriceKnown := s.currentPriceLocked(s.now())
-	s.startDischargingLocked(ctx, currentPrice, currentPriceKnown, batStatus.SOC, powerW, StateManualDischarging)
+	currentExportPrice, currentExportPriceKnown := s.currentExportPriceLocked(s.now())
+	s.startDischargingLocked(ctx, currentExportPrice, currentExportPriceKnown, batStatus.SOC, powerW, StateManualDischarging)
 	started := s.state == StateManualDischarging
 	stopPending := s.state == StateStopping
 	overrideUntil := s.manualOverrideUntil
@@ -3315,6 +3336,7 @@ type CurrentStatus struct {
 	BatteryPowerW                float64                  `json:"battery_power_w"`
 	BatteryObservedAt            time.Time                `json:"battery_observed_at,omitempty"`
 	CurrentPrice                 float64                  `json:"current_price_eur_kwh"`
+	CurrentExportPrice           float64                  `json:"current_export_price_eur_kwh"`
 	CurrentPriceKnown            bool                     `json:"current_price_known"`
 	ChargeReservation            *ChargeReservationStatus `json:"charge_reservation,omitempty"`
 	PlanPending                  bool                     `json:"plan_pending"`
@@ -3371,6 +3393,9 @@ func (s *Service) GetCurrentStatus(ctx context.Context) CurrentStatus {
 	}
 
 	// Keep a zero-valued valid price distinct from an unavailable price.
+	if price, ok := s.currentExportPriceLocked(now); ok {
+		status.CurrentExportPrice = price.InexactFloat64()
+	}
 	if price, ok := s.currentPriceLocked(now); ok {
 		status.CurrentPrice = price.InexactFloat64()
 		status.CurrentPriceKnown = true

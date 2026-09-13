@@ -79,6 +79,33 @@ func validConfig() Config {
 		DischargePowerW:         2500,
 		PassiveModeTimeoutS:     300,
 		SolarMinSurplusW:        100,
+		ExportPriceMode:         "symmetric",
+	}
+}
+
+func TestValidate_ExportPriceMode(t *testing.T) {
+	for _, mode := range []string{"symmetric", "wholesale"} {
+		cfg := validConfig()
+		cfg.ExportPriceMode = mode
+		if err := cfg.validate(); err != nil {
+			t.Errorf("EXPORT_PRICE_MODE %q: unexpected error: %v", mode, err)
+		}
+	}
+	for _, mode := range []string{"", "Symmetric", "feed-in", "none"} {
+		cfg := validConfig()
+		cfg.ExportPriceMode = mode
+		if err := cfg.validate(); err == nil {
+			t.Errorf("EXPORT_PRICE_MODE %q: validate() error = nil, want rejection", mode)
+		}
+	}
+}
+
+func TestValidate_ExportFeeMayBeNegative(t *testing.T) {
+	cfg := validConfig()
+	cfg.ExportPriceMode = "wholesale"
+	cfg.ExportFeeEURPerKWh = decimal.RequireFromString("-0.01")
+	if err := cfg.validate(); err != nil {
+		t.Errorf("negative EXPORT_FEE_EUR_PER_KWH: unexpected error: %v", err)
 	}
 }
 
@@ -390,6 +417,38 @@ func TestLoad_AllInPricing(t *testing.T) {
 	}
 	if got := cfg.SupplierFeeEURPerKWh.String(); got != "0.02" {
 		t.Errorf("SupplierFeeEURPerKWh = %s, want 0.02", got)
+	}
+	if cfg.ExportPriceMode != "symmetric" {
+		t.Errorf("ExportPriceMode = %q, want symmetric", cfg.ExportPriceMode)
+	}
+	if got := cfg.ExportFeeEURPerKWh.String(); got != "0" {
+		t.Errorf("ExportFeeEURPerKWh = %s, want 0", got)
+	}
+}
+
+func TestLoad_ExportPricingWholesale(t *testing.T) {
+	t.Setenv("ESPHOME_URL", "http://192.168.1.50")
+	t.Setenv("EXPORT_PRICE_MODE", "wholesale")
+	t.Setenv("EXPORT_FEE_EUR_PER_KWH", "-0.015")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.ExportPriceMode != "wholesale" {
+		t.Errorf("ExportPriceMode = %q, want wholesale", cfg.ExportPriceMode)
+	}
+	if got := cfg.ExportFeeEURPerKWh.String(); got != "-0.015" {
+		t.Errorf("ExportFeeEURPerKWh = %s, want -0.015", got)
+	}
+}
+
+func TestLoad_RejectsUnknownExportPriceMode(t *testing.T) {
+	t.Setenv("ESPHOME_URL", "http://192.168.1.50")
+	t.Setenv("EXPORT_PRICE_MODE", "feed-in")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() error = nil, want unknown EXPORT_PRICE_MODE rejection")
 	}
 }
 

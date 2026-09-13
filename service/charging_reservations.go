@@ -223,6 +223,10 @@ func (s *Service) solarBlockedLocked(now time.Time, soc int) bool {
 		!s.solarEconomicalForReservationLocked(now, reservation)
 }
 
+// solarEconomicalForReservationLocked reports whether consuming solar now beats
+// exporting it and importing reserved grid energy instead. Solar's cost is the
+// forgone export value, so it is compared at the export rate against the
+// reserved slices' import prices.
 func (s *Service) solarEconomicalForReservationLocked(now time.Time, reservation chargingReservation) bool {
 	// When only time or measured taper makes the grid reservation infeasible,
 	// accept every available solar watt as best effort toward the commitment.
@@ -234,23 +238,23 @@ func (s *Service) solarEconomicalForReservationLocked(now time.Time, reservation
 		return true
 	}
 	if maxChargePrice, committed := s.pendingCycleMaxChargePriceLocked(now); committed {
-		price, known := s.currentPriceLocked(now)
-		if !known || !s.chargePriceMeetsProfitFloorLocked(price, maxChargePrice) {
+		exportPrice, known := s.currentExportPriceLocked(now)
+		if !known || !s.chargePriceMeetsProfitFloorLocked(exportPrice, maxChargePrice) {
 			return false
 		}
 	}
 	if reservation.Deadline.IsZero() {
 		return true
 	}
-	price, known := s.currentPriceLocked(now)
+	exportPrice, known := s.currentExportPriceLocked(now)
 	if !known {
 		return false
 	}
 	if !reservation.Feasible {
-		return s.chargePriceMeetsProfitFloorLocked(price, reservation.maxChargePrice)
+		return s.chargePriceMeetsProfitFloorLocked(exportPrice, reservation.maxChargePrice)
 	}
 	for _, window := range reservation.Windows {
-		if !price.LessThanOrEqual(window.Price) {
+		if !exportPrice.LessThanOrEqual(window.Price) {
 			continue
 		}
 		return true

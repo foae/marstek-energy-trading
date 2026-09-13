@@ -41,6 +41,59 @@ func TestAllInPricingApply(t *testing.T) {
 	}
 }
 
+func TestAllInPricingApplyExport(t *testing.T) {
+	base := AllInPricing{
+		EnergyTaxEURPerKWh:   decimal.RequireFromString("0.09161"),
+		VATRate:              decimal.RequireFromString("0.21"),
+		SupplierFeeEURPerKWh: decimal.RequireFromString("0.02"),
+	}
+
+	t.Run("symmetric mode matches the import rate", func(t *testing.T) {
+		pricing := base
+		pricing.ExportMode = "symmetric"
+		pricing.ExportFeeEURPerKWh = decimal.RequireFromString("-0.01")
+		wholesale := decimal.RequireFromString("0.20051")
+		got := pricing.ApplyExport(wholesale)
+		if !got.Equal(pricing.Apply(wholesale)) {
+			t.Fatalf("ApplyExport = %s, want the all-in import rate %s", got, pricing.Apply(wholesale))
+		}
+	})
+
+	t.Run("wholesale mode adds only the signed export fee", func(t *testing.T) {
+		pricing := base
+		pricing.ExportMode = "wholesale"
+		pricing.ExportFeeEURPerKWh = decimal.RequireFromString("-0.01")
+		for _, tt := range []struct{ wholesale, want string }{
+			{"0.20051", "0.19051"},
+			{"0.00105", "-0.00895"},
+			{"-0.01", "-0.02"},
+		} {
+			got := pricing.ApplyExport(decimal.RequireFromString(tt.wholesale))
+			if want := decimal.RequireFromString(tt.want); !got.Equal(want) {
+				t.Errorf("ApplyExport(%s) = %s, want %s", tt.wholesale, got, want)
+			}
+		}
+	})
+
+	t.Run("unset mode is symmetric", func(t *testing.T) {
+		wholesale := decimal.RequireFromString("0.05")
+		if got := base.ApplyExport(wholesale); !got.Equal(base.Apply(wholesale)) {
+			t.Fatalf("ApplyExport = %s, want %s", got, base.Apply(wholesale))
+		}
+	})
+}
+
+func TestPriceExportDefaultsToImportValue(t *testing.T) {
+	symmetric := Price{Time: time.Now(), Value: 0.25}
+	if got := symmetric.Export(); got != 0.25 {
+		t.Errorf("Export() = %v, want 0.25", got)
+	}
+	asymmetric := Price{Time: time.Now(), Value: 0.25, ExportValue: 0.08, HasExportValue: true}
+	if got := asymmetric.Export(); got != 0.08 {
+		t.Errorf("Export() = %v, want 0.08", got)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -86,6 +139,52 @@ func TestFetchDayAheadPricesAppliesAllInPricing(t *testing.T) {
 	const want = 0.2393609 // (89.68/1000 + 0.09161) * 1.21 + 0.02
 	if math.Abs(prices[0].Value-want) > 1e-12 {
 		t.Errorf("price = %.10f, want %.10f", prices[0].Value, want)
+	}
+	// Symmetric by default: the export value equals the all-in import value.
+	if !prices[0].HasExportValue {
+		t.Error("HasExportValue = false, want true")
+	}
+	if math.Abs(prices[0].ExportValue-want) > 1e-12 {
+		t.Errorf("export price = %.10f, want %.10f", prices[0].ExportValue, want)
+	}
+}
+
+func TestFetchDayAheadPricesAppliesWholesaleExportPricing(t *testing.T) {
+	pricing := AllInPricing{
+		EnergyTaxEURPerKWh:   decimal.RequireFromString("0.09161"),
+		VATRate:              decimal.RequireFromString("0.21"),
+		SupplierFeeEURPerKWh: decimal.RequireFromString("0.02"),
+		ExportMode:           "wholesale",
+		ExportFeeEURPerKWh:   decimal.RequireFromString("-0.01"),
+	}
+	marketLoc := loadLocation(t, "Europe/Oslo")
+	client := NewWithLocation("NL", "EUR", time.UTC, pricing)
+	client.httpClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		marketDay := parseMarketDate(t, req.URL.Query().Get("date"), marketLoc)
+		return response(makeDayAheadResponse(t, marketDay, 89.68)), nil
+	})
+
+	prices, err := client.FetchDayAheadPrices(context.Background(), time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("FetchDayAheadPrices() error = %v", err)
+	}
+	if len(prices) != 96 {
+		t.Fatalf("len(prices) = %d, want 96", len(prices))
+	}
+
+	const wantImport = 0.2393609 // (89.68/1000 + 0.09161) * 1.21 + 0.02
+	const wantExport = 0.07968   // 89.68/1000 - 0.01
+	if math.Abs(prices[0].Value-wantImport) > 1e-12 {
+		t.Errorf("import price = %.10f, want %.10f", prices[0].Value, wantImport)
+	}
+	if !prices[0].HasExportValue {
+		t.Error("HasExportValue = false, want true")
+	}
+	if math.Abs(prices[0].ExportValue-wantExport) > 1e-12 {
+		t.Errorf("export price = %.10f, want %.10f", prices[0].ExportValue, wantExport)
+	}
+	if got := prices[0].Export(); math.Abs(got-wantExport) > 1e-12 {
+		t.Errorf("Export() = %.10f, want %.10f", got, wantExport)
 	}
 }
 

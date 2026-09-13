@@ -24,7 +24,21 @@ var ErrPricesUnavailable = errors.New("prices unavailable")
 // Price represents a single price point.
 type Price struct {
 	Time  time.Time
-	Value float64 // EUR/kWh
+	Value float64 // EUR/kWh paid on import
+
+	// ExportValue is the EUR/kWh credited on export. It is only meaningful
+	// when HasExportValue is set.
+	ExportValue    float64
+	HasExportValue bool
+}
+
+// Export returns the EUR/kWh credited on export. Prices constructed without an
+// export value are symmetric: export is credited at the import rate.
+func (p Price) Export() float64 {
+	if p.HasExportValue {
+		return p.ExportValue
+	}
+	return p.Value
 }
 
 // AllInPricing converts wholesale prices to the amount paid or received per kWh.
@@ -32,6 +46,12 @@ type AllInPricing struct {
 	EnergyTaxEURPerKWh   decimal.Decimal
 	VATRate              decimal.Decimal
 	SupplierFeeEURPerKWh decimal.Decimal
+
+	// ExportMode selects how export is valued: "wholesale" credits the
+	// wholesale price plus ExportFeeEURPerKWh; anything else is symmetric
+	// with the all-in import rate.
+	ExportMode         string
+	ExportFeeEURPerKWh decimal.Decimal
 }
 
 // Apply returns (wholesale price + energy tax) including VAT, plus the supplier fee.
@@ -40,6 +60,14 @@ func (p AllInPricing) Apply(wholesaleEURPerKWh decimal.Decimal) decimal.Decimal 
 		Add(p.EnergyTaxEURPerKWh).
 		Mul(decimal.NewFromInt(1).Add(p.VATRate)).
 		Add(p.SupplierFeeEURPerKWh)
+}
+
+// ApplyExport returns the amount credited per exported kWh.
+func (p AllInPricing) ApplyExport(wholesaleEURPerKWh decimal.Decimal) decimal.Decimal {
+	if p.ExportMode == "wholesale" {
+		return wholesaleEURPerKWh.Add(p.ExportFeeEURPerKWh)
+	}
+	return p.Apply(wholesaleEURPerKWh)
 }
 
 // Client is a NordPool API client.
@@ -154,8 +182,10 @@ func (c *Client) FetchDayAheadPrices(ctx context.Context, date time.Time) ([]Pri
 			}
 
 			prices = append(prices, Price{
-				Time:  price.Time.In(loc),
-				Value: price.Value,
+				Time:           price.Time.In(loc),
+				Value:          price.Value,
+				ExportValue:    price.ExportValue,
+				HasExportValue: price.HasExportValue,
 			})
 			expectedStart = expectedStart.Add(15 * time.Minute)
 		}
@@ -276,9 +306,12 @@ func (c *Client) fetchMarketDay(
 		// Convert from EUR/MWh to EUR/kWh, then add the configured taxes and fee.
 		wholesalePrice := decimal.NewFromFloat(*pricePerMWh).Div(decimal.NewFromInt(1000))
 		allInPrice, _ := c.pricing.Apply(wholesalePrice).Float64()
+		exportPrice, _ := c.pricing.ApplyExport(wholesalePrice).Float64()
 		prices = append(prices, Price{
-			Time:  start,
-			Value: allInPrice,
+			Time:           start,
+			Value:          allInPrice,
+			ExportValue:    exportPrice,
+			HasExportValue: true,
 		})
 	}
 	if !expectedStart.Equal(marketEnd) {

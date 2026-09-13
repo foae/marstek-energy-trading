@@ -283,7 +283,10 @@ func (s *Service) analyzerConfig() AnalyzerConfig {
 	}
 }
 
-const measuredBatteryPowerEnergyBasis = "measured_battery_power"
+const (
+	measuredBatteryPowerEnergyBasis = "measured_battery_power"
+	measuredACPowerEnergyBasis      = "measured_ac_power"
+)
 
 // snapshotSessionPricesLocked retains every price slot seen while a session is
 // active. Fetches may replace the live day slices at midnight, but settlement
@@ -637,17 +640,20 @@ func (s *Service) tick(ctx context.Context) {
 		return
 	}
 	measuredPowerW, powerErr := s.battery.GetBatteryPower(ctx)
+	// Accounting and the reservation taper both work on AC-side power: cash flow
+	// must include inverter losses and the nameplate charge power is AC-side.
+	measuredACPowerW, acPowerErr := s.battery.GetACPower(ctx)
 
 	s.mu.Lock()
 	s.currentTradeLastSOC = batStatus.SOC
-	if powerErr == nil {
+	if powerErr == nil && acPowerErr == nil {
 		s.cacheBatteryTelemetryLocked(batStatus.SOC, measuredPowerW)
 		switch s.state {
 		case StateCharging:
-			s.observedChargePowerW = max(measuredPowerW, 0)
-			s.accumulateMeasuredTradeEnergyLocked(measuredPowerW)
+			s.observedChargePowerW = max(measuredACPowerW, 0)
+			s.accumulateMeasuredTradeEnergyLocked(measuredACPowerW)
 		case StateDischarging, StateManualDischarging:
-			s.accumulateMeasuredTradeEnergyLocked(measuredPowerW)
+			s.accumulateMeasuredTradeEnergyLocked(measuredACPowerW)
 		}
 	} else {
 		s.batteryTelemetryAvailable = false
@@ -664,6 +670,11 @@ func (s *Service) tick(ctx context.Context) {
 	if powerErr != nil {
 		slog.Error("failed to get battery power", "error", powerErr)
 		s.notifyError(ctx, "Battery power telemetry unavailable: "+powerErr.Error())
+		return
+	}
+	if acPowerErr != nil {
+		slog.Error("failed to get battery AC power", "error", acPowerErr)
+		s.notifyError(ctx, "Battery AC power telemetry unavailable: "+acPowerErr.Error())
 		return
 	}
 
@@ -965,6 +976,9 @@ func (s *Service) solarTick(ctx context.Context) {
 	}
 	batterySOC := esStatus.BatterySOC
 	measuredChargePowerW := max(esStatus.BatteryPower, 0)
+	// Control compensation uses DC battery power; accounting and grid attribution
+	// use the AC-side power the meter actually sees.
+	measuredACChargePowerW := max(esStatus.ACPowerW, 0)
 	s.mu.Lock()
 	s.currentTradeLastSOC = batterySOC
 	s.cacheBatteryTelemetryLocked(batterySOC, esStatus.BatteryPower)
@@ -972,16 +986,16 @@ func (s *Service) solarTick(ctx context.Context) {
 	if s.state == StateSolarCharging {
 		if batterySOC >= solarChargeUpperSOC {
 			s.solarUpperSOCHold = true
-			s.accumulateSolarEnergyLocked(measuredChargePowerW)
-			s.solarGridPowerW = min(s.solarGridPowerW, measuredChargePowerW)
+			s.accumulateSolarEnergyLocked(measuredACChargePowerW)
+			s.solarGridPowerW = min(s.solarGridPowerW, measuredACChargePowerW)
 			s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonBatteryFull)
 			s.mu.Unlock()
 			return
 		}
 		now := s.now()
 		if s.solarBlockedLocked(now, batterySOC) {
-			s.accumulateSolarEnergyLocked(measuredChargePowerW)
-			s.solarGridPowerW = min(s.solarGridPowerW, measuredChargePowerW)
+			s.accumulateSolarEnergyLocked(measuredACChargePowerW)
+			s.solarGridPowerW = min(s.solarGridPowerW, measuredACChargePowerW)
 			s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonYieldWindow)
 			s.mu.Unlock()
 			s.tick(ctx)
@@ -1008,8 +1022,8 @@ func (s *Service) solarTick(ctx context.Context) {
 	}
 	s.solarLastSampleAt = now
 	if s.state == StateSolarCharging && s.solarBlockedLocked(now, batterySOC) {
-		s.accumulateSolarEnergyLocked(measuredChargePowerW)
-		s.solarGridPowerW = min(max(activePowerW, 0), measuredChargePowerW)
+		s.accumulateSolarEnergyLocked(measuredACChargePowerW)
+		s.solarGridPowerW = min(max(activePowerW, 0), measuredACChargePowerW)
 		s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonYieldWindow)
 		s.mu.Unlock()
 		s.tick(ctx)
@@ -1077,9 +1091,9 @@ func (s *Service) solarTick(ctx context.Context) {
 		}
 
 	case StateSolarCharging:
-		s.accumulateSolarEnergyLocked(measuredChargePowerW)
+		s.accumulateSolarEnergyLocked(measuredACChargePowerW)
 		// Attribute only the part of battery draw covered by net grid import.
-		s.solarGridPowerW = min(max(activePowerW, 0), measuredChargePowerW)
+		s.solarGridPowerW = min(max(activePowerW, 0), measuredACChargePowerW)
 
 		// Compensate for feedback loop: the battery's charge power is visible on
 		// the P1 meter as consumption, so measured surplus is artificially low.
@@ -1242,9 +1256,14 @@ func (s *Service) startSolarChargingLocked(ctx context.Context, powerW int, soc 
 	s.mu.Unlock()
 	err := s.battery.ChargeContext(ctx, powerW, s.cfg.PassiveModeTimeoutS)
 	var measuredPowerW float64
+	var measuredACPowerW float64
 	var idleErr error
 	if err == nil {
 		measuredPowerW, err = s.waitForBatteryPower(ctx, true, powerW)
+	}
+	if err == nil {
+		// Accounting integrates AC-side power; seed the session with it.
+		measuredACPowerW, err = s.battery.GetACPower(ctx)
 	}
 	if err != nil {
 		if idleErr = s.idleBattery(ctx); idleErr != nil {
@@ -1292,7 +1311,7 @@ func (s *Service) startSolarChargingLocked(ctx context.Context, powerW int, soc 
 	s.cacheBatteryTelemetryLocked(soc, measuredPowerW)
 	s.solarOpportunityUnpricedWs = 0
 	s.solarLastUpdate = s.now()
-	s.solarMeasuredChargePowerW = max(measuredPowerW, 0)
+	s.solarMeasuredChargePowerW = max(measuredACPowerW, 0)
 	s.solarSurplusEMA = 0
 	s.solarEMALastSampleAt = time.Time{}
 	s.solarTelemetryFailureSince = time.Time{}
@@ -1373,7 +1392,7 @@ func (s *Service) stopSolarChargingLocked(ctx context.Context, endSOC int, reaso
 		GridUnpricedKWh:    decimal.NewFromFloat(s.solarGridUnpricedWs / 3_600_000),
 		UnpricedKWh:        decimal.NewFromFloat(s.solarOpportunityUnpricedWs / 3_600_000),
 		OpportunityCostEUR: s.solarOpportunityCostEUR,
-		EnergyBasis:        measuredBatteryPowerEnergyBasis,
+		EnergyBasis:        measuredACPowerEnergyBasis,
 		DayAllocations:     completeTradeDayAllocations(s.solarDayAllocations, tradeStart, tradeDurationS, s.loc),
 		StartSOC:           s.currentTradeSOC,
 		EndSOC:             endSOC,
@@ -1623,8 +1642,13 @@ func (s *Service) startChargingLocked(ctx context.Context, price decimal.Decimal
 	commandCtx, cancelCommand := context.WithTimeout(ctx, chargeWindow.End.Sub(revalidatedAt))
 	commandErr := s.battery.ChargeContext(commandCtx, s.cfg.ChargePowerW, s.cfg.PassiveModeTimeoutS)
 	err = commandErr
+	var measuredACPowerW float64
 	if err == nil {
 		measuredPowerW, err = s.waitForBatteryPower(commandCtx, true, s.cfg.ChargePowerW)
+	}
+	if err == nil {
+		// Accounting integrates AC-side power; seed the session with it.
+		measuredACPowerW, err = s.battery.GetACPower(commandCtx)
 	}
 	cancelCommand()
 	s.mu.Lock()
@@ -1679,8 +1703,9 @@ func (s *Service) startChargingLocked(ctx context.Context, price decimal.Decimal
 	s.currentTradeStart = s.now()
 	s.currentTradeSOC = soc
 	s.currentTradeLastSOC = soc
-	s.beginMeasuredTradeLocked(measuredPowerW)
+	s.beginMeasuredTradeLocked(measuredACPowerW)
 	s.cacheBatteryTelemetryLocked(soc, measuredPowerW)
+	// DC seed for the taper; the next tick overrides it with the AC reading.
 	s.observedChargePowerW = max(measuredPowerW, 0)
 	_, _, priceKnown := s.sessionPriceAtLocked(s.currentTradeStart, s.currentTradeStart.Add(time.Nanosecond))
 	if priceKnown {
@@ -1742,7 +1767,7 @@ func (s *Service) stopChargingLocked(ctx context.Context, endSOC int) {
 		DurationS:      tradeDurationS,
 		EnergyKWh:      energyKWh,
 		UnpricedKWh:    decimal.NewFromFloat(s.currentTradeUnpricedWs / 3_600_000),
-		EnergyBasis:    measuredBatteryPowerEnergyBasis,
+		EnergyBasis:    measuredACPowerEnergyBasis,
 		DayAllocations: completeTradeDayAllocations(s.currentTradeDayAllocations, tradeStart, tradeDurationS, s.loc),
 		StartSOC:       s.currentTradeSOC,
 		EndSOC:         endSOC,
@@ -1800,8 +1825,13 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 	err := s.battery.DischargeContext(controlCtx, powerW, s.cfg.PassiveModeTimeoutS)
 	var measuredPowerW float64
 	var idleErr error
+	var measuredACPowerW float64
 	if err == nil {
 		measuredPowerW, err = s.waitForBatteryPower(controlCtx, false, powerW)
+	}
+	if err == nil {
+		// Accounting integrates AC-side power; seed the session with it.
+		measuredACPowerW, err = s.battery.GetACPower(controlCtx)
 	}
 	cancelControl()
 	if err != nil {
@@ -1838,7 +1868,7 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 	s.currentTradeSOC = soc
 	s.currentTradeLastSOC = soc
 	s.currentTradePowerW = powerW
-	s.beginMeasuredTradeLocked(measuredPowerW)
+	s.beginMeasuredTradeLocked(measuredACPowerW)
 	s.lastPassiveRefresh = s.now()
 	s.batteryCooldownUntil = time.Time{}
 	if targetState == StateManualDischarging {
@@ -1921,7 +1951,7 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 		DurationS:      tradeDurationS,
 		EnergyKWh:      energyKWh,
 		UnpricedKWh:    decimal.NewFromFloat(s.currentTradeUnpricedWs / 3_600_000),
-		EnergyBasis:    measuredBatteryPowerEnergyBasis,
+		EnergyBasis:    measuredACPowerEnergyBasis,
 		DayAllocations: completeTradeDayAllocations(s.currentTradeDayAllocations, tradeStart, tradeDurationS, s.loc),
 		StartSOC:       s.currentTradeSOC,
 		EndSOC:         endSOC,

@@ -115,6 +115,9 @@ type ESStatus struct {
 	TotalGridOutputEnergy float64 `json:"total_grid_output_energy"` // Total export (Wh)
 	TotalGridInputEnergy  float64 `json:"total_grid_input_energy"`  // Total import (Wh)
 	TotalLoadEnergy       float64 `json:"total_load_energy"`        // Total load (Wh)
+	// ACPowerW is the normalized AC-side power (positive charging), filled by
+	// the ESPHome backend only.
+	ACPowerW float64 `json:"-"`
 }
 
 // ESMode contains the current operating mode.

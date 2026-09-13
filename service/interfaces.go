@@ -22,6 +22,8 @@ type BatteryController interface {
 	GetBatteryStatusContext(ctx context.Context) (*marstek.BatteryStatus, error)
 	GetESStatus(ctx context.Context) (*marstek.ESStatus, error)
 	GetBatteryPower(ctx context.Context) (float64, error)
+	// GetACPower returns the normalized AC-side power: positive charging, negative discharging.
+	GetACPower(ctx context.Context) (float64, error)
 	ChargeContext(ctx context.Context, powerW int, timeoutS int) error
 	DischargeContext(ctx context.Context, powerW int, timeoutS int) error
 	SetPassiveModeContext(ctx context.Context, power int, cdTime int) error

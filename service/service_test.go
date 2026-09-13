@@ -49,6 +49,8 @@ type MockBattery struct {
 	DischargFlag        bool
 	CurrentMode         string
 	CurrentPower        int
+	ACPower             int
+	ACPowerSet          bool
 	IgnorePowerCommands bool
 	IdleAttempts        int
 	IdleFailures        int
@@ -74,6 +76,8 @@ type MockBattery struct {
 	StatusCalls   int
 	ESCalls       int
 	PowerCalls    int
+	ACPowerCalls  int
+	GetACPowerErr error
 	StatusHook    func()
 	ChargeHook    func()
 	DischargeHook func()
@@ -151,6 +155,27 @@ func (m *MockBattery) GetBatteryPower(_ context.Context) (float64, error) {
 	return float64(m.CurrentPower), nil
 }
 
+// acPowerLocked returns the configured AC power, mirroring the DC reading when unset.
+func (m *MockBattery) acPowerLocked() float64 {
+	if m.ACPowerSet {
+		return float64(m.ACPower)
+	}
+	return float64(m.CurrentPower)
+}
+
+func (m *MockBattery) GetACPower(_ context.Context) (float64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ACPowerCalls++
+	if m.GetACPowerErr != nil {
+		return 0, m.GetACPowerErr
+	}
+	if m.GetStatusErr != nil {
+		return 0, m.GetStatusErr
+	}
+	return m.acPowerLocked(), nil
+}
+
 func (m *MockBattery) GetESStatus(_ context.Context) (*marstek.ESStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -158,7 +183,7 @@ func (m *MockBattery) GetESStatus(_ context.Context) (*marstek.ESStatus, error) 
 	if m.GetStatusErr != nil {
 		return nil, m.GetStatusErr
 	}
-	return &marstek.ESStatus{BatterySOC: m.SOC, BatteryPower: float64(m.CurrentPower)}, nil
+	return &marstek.ESStatus{BatterySOC: m.SOC, BatteryPower: float64(m.CurrentPower), ACPowerW: m.acPowerLocked()}, nil
 }
 
 func (m *MockBattery) ChargeContext(ctx context.Context, powerW int, timeoutS int) error {
@@ -3617,8 +3642,8 @@ func TestMeasuredChargeSettlementUsesPowerWhenSOCUnchanged(t *testing.T) {
 	if !trade.EnergyKWh.Equal(wantEnergy) {
 		t.Fatalf("measured short-session energy = %s, want %s", trade.EnergyKWh, wantEnergy)
 	}
-	if trade.EnergyBasis != measuredBatteryPowerEnergyBasis {
-		t.Fatalf("energy basis = %q, want %q", trade.EnergyBasis, measuredBatteryPowerEnergyBasis)
+	if trade.EnergyBasis != measuredACPowerEnergyBasis {
+		t.Fatalf("energy basis = %q, want %q", trade.EnergyBasis, measuredACPowerEnergyBasis)
 	}
 }
 

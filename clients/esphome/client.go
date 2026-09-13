@@ -174,9 +174,15 @@ func (c *Client) GetESStatus(ctx context.Context) (*marstek.ESStatus, error) {
 		return nil, fmt.Errorf("get battery power: %w", err)
 	}
 
+	acPower, err := c.acPowerContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get AC power: %w", err)
+	}
+
 	return &marstek.ESStatus{
 		BatterySOC:   socInt,
 		BatteryPower: power,
+		ACPowerW:     acPower,
 	}, nil
 }
 
@@ -196,11 +202,26 @@ func (c *Client) GetACSample(ctx context.Context) (int, float64, error) {
 		return 0, 0, err
 	}
 
-	power, err := c.getSensorFloatContext(ctx, sensorACPower)
+	power, err := c.acPowerContext(ctx)
 	if err != nil {
 		return 0, 0, fmt.Errorf("get AC power: %w", err)
 	}
-	return socInt, -power, nil
+	return socInt, power, nil
+}
+
+// GetACPower returns the normalized AC-side power: positive charging, negative discharging.
+func (c *Client) GetACPower(ctx context.Context) (float64, error) {
+	return c.acPowerContext(ctx)
+}
+
+// acPowerContext reads the AC power sensor and normalizes its sign: the sensor
+// reports negative values while charging.
+func (c *Client) acPowerContext(ctx context.Context) (float64, error) {
+	power, err := c.getSensorFloatContext(ctx, sensorACPower)
+	if err != nil {
+		return 0, err
+	}
+	return -power, nil
 }
 
 // Charge starts charging at the specified power (watts).

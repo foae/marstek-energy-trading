@@ -615,6 +615,8 @@ func TestGetESStatus(t *testing.T) {
 			w.Write([]byte(`{"id":"sensor-soc","value":80,"state":"80 %"}`))
 		case strings.Contains(r.URL.Path, "Battery%20Power") || strings.Contains(r.URL.Path, "Battery Power"):
 			w.Write([]byte(`{"id":"sensor-power","value":1500,"state":"1500 W"}`)) // positive = charging
+		case strings.Contains(r.URL.Path, "AC%20Power") || strings.Contains(r.URL.Path, "AC Power"):
+			w.Write([]byte(`{"id":"sensor-ac-power","value":-1580,"state":"-1580 W"}`)) // negative = charging
 		default:
 			http.NotFound(w, r)
 		}
@@ -631,6 +633,43 @@ func TestGetESStatus(t *testing.T) {
 	}
 	if status.BatteryPower != 1500 {
 		t.Errorf("BatteryPower = %v, want 1500", status.BatteryPower)
+	}
+	if status.ACPowerW != 1580 {
+		t.Errorf("ACPowerW = %v, want 1580", status.ACPowerW)
+	}
+}
+
+func TestGetACPower_NormalizesSign(t *testing.T) {
+	testCases := []struct {
+		name  string
+		rawAC float64
+		want  float64
+	}{
+		{name: "charging reports negative", rawAC: -2192, want: 2192},
+		{name: "discharging reports positive", rawAC: 2200, want: -2200},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if strings.Contains(r.URL.Path, "AC%20Power") || strings.Contains(r.URL.Path, "AC Power") {
+					fmt.Fprintf(w, `{"id":"sensor-ac-power","value":%v,"state":"%v W"}`, tc.rawAC, tc.rawAC)
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			defer server.Close()
+
+			client := New(server.URL, 11)
+			power, err := client.GetACPower(context.Background())
+			if err != nil {
+				t.Fatalf("GetACPower() error = %v", err)
+			}
+			if power != tc.want {
+				t.Errorf("GetACPower() = %v, want %v", power, tc.want)
+			}
+		})
 	}
 }
 

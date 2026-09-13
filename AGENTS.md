@@ -155,7 +155,7 @@ When the HomeWizard P1 meter is enabled, the service captures solar surplus by c
 - **Power tracking**: Charges at the EMA-smoothed surplus power, dynamically adjusted with 50W deadband outside low-surplus grace.
 - **Priority**: Active grid reservations and discharge windows override solar charging.
 - **Fault priority**: Read battery status and evaluate full/window stops before reading P1. Failed adjustments immediately request a confirmed stop; retained failure state retries only through the throttled stop path, with a five-minute cooldown after success.
-- **Energy accounting**: Integrate measured battery input and the grid-attributable portion (`min(batteryChargePower, max(netGridImport, 0))`) separately. Price grid intervals at their applicable slot, exposing missing-price energy rather than labelling it free solar. Estimates retain last observed power across telemetry gaps; historical unsplit records remain all-solar.
+- **Energy accounting**: Integrate measured battery input from AC power and the grid-attributable portion (`min(acChargePower, max(netGridImport, 0))`) separately; control compensation still uses DC battery power. Price grid intervals at their applicable slot, exposing missing-price energy rather than labelling it free solar. Estimates retain last observed power across telemetry gaps; historical unsplit records remain all-solar.
 
 ### Scheduled window priority
 Solar charging and scheduled trading never conflict — three rules enforce strict priority:

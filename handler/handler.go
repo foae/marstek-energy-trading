@@ -95,6 +95,21 @@ var (
 		Help: "Cumulative grid charge and discharge energy excluded from known cash flow because its tariff was unavailable",
 	})
 
+	opportunityAdjustedPnL = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "energy_trader_opportunity_adjusted_pnl_eur_total",
+		Help: "Known cash flow less known signed forgone-export value; not a counterfactual savings metric",
+	})
+
+	unattributedChargeEnergy = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "energy_trader_unattributed_charge_energy_kwh",
+		Help: "Scheduled charge energy before the first successful P1 source observation",
+	})
+
+	unpricedOpportunityEnergy = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "energy_trader_opportunity_unpriced_energy_kwh",
+		Help: "Solar-attributed charged energy excluded from forgone-export valuation because its export tariff was unavailable",
+	})
+
 	measuredEfficiency = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "energy_trader_measured_efficiency_percent",
 		Help: "Energy-weighted operational AC round-trip efficiency including standby (percent); NaN until a valid matched-SOC window completes",
@@ -113,7 +128,7 @@ func init() {
 	prometheus.MustRegister(batterySOC)
 	prometheus.MustRegister(traderState)
 	prometheus.MustRegister(traderPnL)
-	prometheus.MustRegister(unpricedCashFlowEnergy)
+	prometheus.MustRegister(unpricedCashFlowEnergy, opportunityAdjustedPnL, unattributedChargeEnergy, unpricedOpportunityEnergy)
 	prometheus.MustRegister(measuredEfficiency, measuredEfficiencyWindows, rejectedEfficiencyWindows)
 }
 
@@ -139,9 +154,12 @@ func (h *Handler) updateMetrics(ctx context.Context) {
 
 	recorder := h.svc.GetRecorder()
 	if recorder != nil {
-		pnl, unpricedKWh := historyMetricValues(recorder.GetHistory())
+		pnl, unpricedKWh, opportunityAdjusted, unattributedKWh, opportunityUnpricedKWh := historyMetricValues(recorder.GetHistory())
 		traderPnL.Set(pnl)
 		unpricedCashFlowEnergy.Set(unpricedKWh)
+		opportunityAdjustedPnL.Set(opportunityAdjusted)
+		unattributedChargeEnergy.Set(unattributedKWh)
+		unpricedOpportunityEnergy.Set(opportunityUnpricedKWh)
 	}
 
 	// Update battery SOC from current status
@@ -160,12 +178,15 @@ func (h *Handler) updateMetrics(ctx context.Context) {
 	}
 }
 
-func historyMetricValues(history service.History) (float64, float64) {
-	pnl, _ := history.TotalPnL.Float64()
-	unpricedKWh := 0.0
+func historyMetricValues(history service.History) (pnl, unpricedKWh, opportunityAdjustedPnL, unattributedKWh, opportunityUnpricedKWh float64) {
+	pnl, _ = history.TotalPnL.Float64()
+	opportunityAdjustedPnL, _ = history.TotalOpportunityAdjustedPnLEUR.Float64()
+	unattributedKWh, _ = history.TotalUnattributedChargeKWh.Float64()
 	for _, day := range history.Days {
-		value, _ := day.CashFlowUnpricedKWh.Float64()
-		unpricedKWh += value
+		cashFlowUnpriced, _ := day.CashFlowUnpricedKWh.Float64()
+		totalUnpriced, _ := day.UnpricedKWh.Float64()
+		unpricedKWh += cashFlowUnpriced
+		opportunityUnpricedKWh += totalUnpriced - cashFlowUnpriced
 	}
-	return pnl, unpricedKWh
+	return pnl, unpricedKWh, opportunityAdjustedPnL, unattributedKWh, opportunityUnpricedKWh
 }

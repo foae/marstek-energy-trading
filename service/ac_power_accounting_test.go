@@ -167,6 +167,10 @@ func TestChargeStartSeedsFromDCWhenACReadFails(t *testing.T) {
 	svc.nowFunc = func() time.Time { return now }
 	svc.recorder = NewRecorder(t.TempDir(), svc.cfg.BatteryEfficiency, time.UTC)
 	setReservedChargePlan(svc, baseTime, decimal.NewFromFloat(0.05))
+	// Keep the paired grid cycle committed so SOC-aware inventory dispatch
+	// cannot replace this scheduled charge before the AC-fallback path runs.
+	commitment := svc.currentPlan.Cycles[0]
+	svc.automaticCycleCommit = &commitment
 
 	svc.tick(context.Background())
 	battery.GetACPowerErr = nil
@@ -203,6 +207,10 @@ func TestCommittedCycleRecordsExportPriceMode(t *testing.T) {
 	svc := newTestService(cfg, battery, makePrices(baseTime, 0.05, 0.05, 0.05, 0.05), baseTime)
 	svc.recorder = NewRecorder(dir, cfg.BatteryEfficiency, time.UTC)
 	setReservedChargePlan(svc, baseTime, decimal.NewFromFloat(0.05))
+	// Keep the paired grid cycle committed so SOC-aware inventory dispatch
+	// cannot replace the charge whose persisted export-price mode is under test.
+	committedCycle := svc.currentPlan.Cycles[0]
+	svc.automaticCycleCommit = &committedCycle
 
 	svc.tick(context.Background())
 	if svc.state != StateCharging {

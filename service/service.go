@@ -106,7 +106,10 @@ type Service struct {
 	automaticCycleCommit         *TradeCycle  // persisted discharge pairing for grid energy already purchased
 	automaticCycleCommitDurable  bool         // the current grid pairing is confirmed published and synced
 	automaticCycleCleanupPending bool         // record must be cleared and cannot authorize further control
-	solarCycleRetention          *TradeCycle  // live discharge pairing for solar energy admitted against a cycle
+	activeInventorySale          *TimeWindow  // session-owned sale; never a grid purchase obligation
+	lastPlanSlot                 time.Time
+	lastPlanSOC                  int
+	planRevision                 uint64
 	todayPrices                  []nordpool.Price
 	tomorrowPrices               []nordpool.Price
 	lastPassiveRefresh           time.Time
@@ -122,6 +125,7 @@ type Service struct {
 	currentTradeCostEUR          decimal.Decimal
 	currentTradePrices           []nordpool.Price
 	currentTradeDayAllocations   []TradeDayAllocation
+	scheduledChargeAccounting    scheduledChargeAccounting
 	lastChargePrice              decimal.Decimal // informational price of the most recent grid charge
 	observedChargePowerW         float64
 	manualOverrideUntil          time.Time
@@ -493,8 +497,8 @@ func (s *Service) Start(ctx context.Context) error {
 		return err
 	}
 	s.mu.Lock()
-	s.retiredDischargeWindows = retiredWindows
-	s.retiredDischargeWindowsDirty = false
+	s.retiredDischargeWindows = retainedDischargeWindows(retiredWindows, s.now())
+	s.retiredDischargeWindowsDirty = len(s.retiredDischargeWindows) != len(retiredWindows)
 	s.mu.Unlock()
 
 	// Restore the last charge price for informational status and logging only.
@@ -581,8 +585,20 @@ func (s *Service) Start(ctx context.Context) error {
 		defer solarTicker.Stop()
 		solarTickCh = solarTicker.C
 	}
+	dischargeDeadlineTimer := time.NewTimer(time.Hour)
+	dischargeDeadlineTimer.Stop()
+	defer dischargeDeadlineTimer.Stop()
 
 	for {
+		dischargeDeadlineTimer.Stop()
+		s.mu.RLock()
+		deadline := s.automaticDischargeDeadlineLocked()
+		s.mu.RUnlock()
+		var dischargeDeadlineCh <-chan time.Time
+		if !deadline.IsZero() {
+			dischargeDeadlineTimer.Reset(max(deadline.Sub(s.now()), 0))
+			dischargeDeadlineCh = dischargeDeadlineTimer.C
+		}
 		select {
 		case <-ctx.Done():
 			slog.Info("stopping trading service")
@@ -593,6 +609,14 @@ func (s *Service) Start(ctx context.Context) error {
 
 		case <-ticker.C:
 			s.tick(ctx)
+
+		case <-dischargeDeadlineCh:
+			s.mu.Lock()
+			deadline := s.automaticDischargeDeadlineLocked()
+			if !deadline.IsZero() && !s.now().Before(deadline) {
+				s.stopDischargingLocked(ctx, s.currentTradeLastSOC)
+			}
+			s.mu.Unlock()
 
 		case <-priceBoundaryTimer.C:
 			s.tick(ctx)
@@ -611,6 +635,21 @@ func (s *Service) Start(ctx context.Context) error {
 			s.solarTick(ctx)
 		}
 	}
+}
+
+// automaticDischargeDeadlineLocked retains the selected endpoint even when
+// telemetry or tariffs disappear. Failed stops belong to the throttled retry path.
+func (s *Service) automaticDischargeDeadlineLocked() time.Time {
+	if s.state != StateDischarging || s.stopPending {
+		return time.Time{}
+	}
+	if s.activeInventorySale != nil {
+		return s.activeInventorySale.End
+	}
+	if s.automaticCycleCommit != nil {
+		return s.automaticCycleCommit.DischargeWindow.End
+	}
+	return time.Time{}
 }
 
 func durationUntilNextPriceBoundary(now time.Time) time.Duration {
@@ -658,7 +697,9 @@ func (s *Service) tick(ctx context.Context) {
 		switch s.state {
 		case StateCharging:
 			s.observedChargePowerW = max(measuredACPowerW, 0)
-			s.accumulateMeasuredTradeEnergyLocked(measuredACPowerW)
+			now := s.now()
+			s.accumulateMeasuredTradeEnergyAtLocked(measuredACPowerW, now, true)
+			s.scheduledChargeAccounting.Sample(now, measuredACPowerW, 0, false, s.loc, s.sessionPriceAtLocked)
 		case StateDischarging, StateManualDischarging:
 			s.accumulateMeasuredTradeEnergyLocked(measuredACPowerW)
 		}
@@ -705,7 +746,7 @@ func (s *Service) tick(ctx context.Context) {
 	if s.state != StateCharging && s.state != StateDischarging {
 		s.clearExpiredAutomaticCycleCommitmentLocked(ctx, now)
 	}
-	s.activateRecoveryCycleLocked()
+	s.refreshObservedPlanLocked(now)
 
 	// Create contextual logger for this tick
 	l := slog.With(
@@ -763,7 +804,7 @@ func (s *Service) tick(ctx context.Context) {
 	currentExportPrice, exportOK := s.currentExportPriceLocked(now)
 	if !ok {
 		retainedDischarge := inDischargeWindow &&
-			(s.automaticCycleCommit != nil || s.solarCycleRetention != nil)
+			(s.automaticCycleCommit != nil || (s.state == StateDischarging && s.activeInventorySale != nil))
 		if retainedDischarge {
 			currentPrice = dischargeWindow.Price
 			if !exportOK {
@@ -901,6 +942,11 @@ func (s *Service) tick(ctx context.Context) {
 			l.Info("decision: stop discharging - battery at min SOC", "min_soc", minSOC)
 			s.stopDischargingLocked(ctx, batStatus.SOC)
 		} else {
+			if s.activeInventorySale != nil && exportOK && !currentExportPrice.IsPositive() {
+				l.Info("decision: stop inventory sale - nonpositive export tariff")
+				s.stopDischargingLocked(ctx, batStatus.SOC)
+				return
+			}
 			if dischargeWindow.End.Sub(now) <= minimumAutomaticControlWindow {
 				l.Debug("skipping discharge refresh near window end", "window_end", dischargeWindow.End)
 				return
@@ -972,6 +1018,26 @@ func (s *Service) accumulateSolarEnergyAtLocked(measuredChargePowerW float64, at
 	s.solarLastUpdate = at
 }
 
+// sampleScheduledCharge observes source attribution without changing the grid
+// command. The serialized one-second meter loop also sees solar consumed during
+// a reserved charge, rather than incorrectly booking it as purchased energy.
+func (s *Service) sampleScheduledCharge(ctx context.Context) {
+	measuredACPowerW, err := s.battery.GetACPower(ctx)
+	if err != nil {
+		return // existing minute telemetry/control path owns charge fault handling
+	}
+	importPowerW, meterErr := s.meter.GetActivePowerW()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != StateCharging {
+		return
+	}
+	now := s.now()
+	s.observedChargePowerW = max(measuredACPowerW, 0)
+	s.accumulateMeasuredTradeEnergyAtLocked(measuredACPowerW, now, true)
+	s.scheduledChargeAccounting.Sample(now, measuredACPowerW, importPowerW, meterErr == nil, s.loc, s.sessionPriceAtLocked)
+}
+
 // solarTick is called every 1 second to manage solar self-consumption charging.
 func (s *Service) solarTick(ctx context.Context) {
 	if s.retryStopping(ctx) {
@@ -980,6 +1046,10 @@ func (s *Service) solarTick(ctx context.Context) {
 	s.mu.RLock()
 	state := s.state
 	s.mu.RUnlock()
+	if state == StateCharging {
+		s.sampleScheduledCharge(ctx)
+		return
+	}
 	if state != StateIdle && state != StateSolarCharging {
 		return
 	}
@@ -1001,7 +1071,7 @@ func (s *Service) solarTick(ctx context.Context) {
 	s.mu.Lock()
 	s.currentTradeLastSOC = batterySOC
 	s.cacheBatteryTelemetryLocked(batterySOC, esStatus.BatteryPower)
-	s.activateRecoveryCycleLocked()
+	s.refreshObservedPlanLocked(s.now())
 	if s.state == StateSolarCharging {
 		if batterySOC >= solarChargeUpperSOC {
 			s.solarUpperSOCHold = true
@@ -1049,12 +1119,6 @@ func (s *Service) solarTick(ctx context.Context) {
 		s.mu.Lock()
 		return
 	}
-	if s.state == StateSolarCharging && s.automaticCycleCommit == nil && s.solarCycleRetention == nil {
-		reservation := s.chargeReservationLocked(now, batterySOC)
-		if retainedCycle := s.cycleForSolarRetentionLocked(now, reservation); retainedCycle != nil {
-			s.solarCycleRetention = retainedCycle
-		}
-	}
 
 	switch s.state {
 	case StateIdle:
@@ -1089,8 +1153,7 @@ func (s *Service) solarTick(ctx context.Context) {
 			return
 		}
 
-		// Yield to reserved grid charging, planned discharge, or a cheaper
-		// reserved grid slot that solar can no longer economically replace.
+		// Yield only to active grid reservations and selected discharge windows.
 		if s.solarBlockedLocked(now, batterySOC) {
 			s.solarSurplusSince = time.Time{}
 			return
@@ -1269,8 +1332,6 @@ func (s *Service) handleSolarStatusFailure(ctx context.Context, telemetryErr err
 func (s *Service) startSolarChargingLocked(ctx context.Context, powerW int, soc int) {
 	l := slog.With("action", "solar_charge", "power_w", powerW, "soc", soc)
 	l.Info("starting solar charge session")
-	reservation := s.chargeReservationLocked(s.now(), soc)
-	retainedCycle := s.cycleForSolarRetentionLocked(s.now(), reservation)
 
 	// Release lock during network I/O
 	s.mu.Unlock()
@@ -1315,9 +1376,6 @@ func (s *Service) startSolarChargingLocked(ctx context.Context, powerW int, soc 
 		s.notifyError(ctx, errMsg)
 		s.mu.Lock()
 		return
-	}
-	if retainedCycle != nil && s.automaticCycleCommit == nil && s.solarCycleRetention == nil {
-		s.solarCycleRetention = retainedCycle
 	}
 	s.state = StateSolarCharging
 	s.currentTradeStart = s.now()
@@ -1496,6 +1554,21 @@ func sameWindowPeriod(a, b TimeWindow) bool {
 	return a.Start.Equal(b.Start) && a.End.Equal(b.End)
 }
 
+// Retirements can affect only today's remaining tariff horizon or later.
+// Discard older markers when publishing the next completed window rather than
+// growing the durable history indefinitely. Keep today's markers for SOC
+// rebound protection and plans that were calculated earlier in the day.
+func retainedDischargeWindows(windows []TimeWindow, now time.Time) []TimeWindow {
+	cutoff := localMidnight(now)
+	retained := make([]TimeWindow, 0, len(windows))
+	for _, window := range windows {
+		if window.End.After(cutoff) {
+			retained = append(retained, window)
+		}
+	}
+	return retained
+}
+
 func retireDischargeWindow(plan *TradingPlan, completed TimeWindow) *TradingPlan {
 	if plan == nil {
 		return nil
@@ -1536,6 +1609,9 @@ func retireDischargeWindow(plan *TradingPlan, completed TimeWindow) *TradingPlan
 		}
 	}
 	updated := *plan
+	if updated.InventorySale != nil && sameWindowPeriod(*updated.InventorySale, completed) {
+		updated.InventorySale = nil
+	}
 	updated.Cycles = cycles
 	updated.ChargeWindows = chargeWindows
 	updated.DischargeWindows = dischargeWindows
@@ -1545,27 +1621,30 @@ func retireDischargeWindow(plan *TradingPlan, completed TimeWindow) *TradingPlan
 }
 
 func (s *Service) dischargeWindowAtLocked(now time.Time) (TimeWindow, bool) {
+	if s.retiredDischargeWindowsDirty {
+		return TimeWindow{}, false
+	}
 	if s.automaticCycleCommit != nil {
 		window := s.automaticCycleCommit.DischargeWindow
 		return window, !s.automaticCycleCleanupPending && !now.Before(window.Start) && now.Before(window.End)
 	}
-	if s.solarCycleRetention != nil {
-		window := s.solarCycleRetention.DischargeWindow
+	if s.activeInventorySale != nil {
+		window := *s.activeInventorySale
 		return window, !now.Before(window.Start) && now.Before(window.End)
 	}
-	if s.currentPlan == nil {
-		return TimeWindow{}, false
-	}
-	for _, window := range s.currentPlan.DischargeWindows {
-		if !now.Before(window.Start) && now.Before(window.End) {
-			return window, true
-		}
+	if s.currentPlan != nil && s.currentPlan.InventorySale != nil {
+		window := *s.currentPlan.InventorySale
+		return window, !now.Before(window.Start) && now.Before(window.End)
 	}
 	return TimeWindow{}, false
 }
 
 // startChargingLocked begins a charge session. Caller must hold s.mu.
 func (s *Service) startChargingLocked(ctx context.Context, price decimal.Decimal, soc int) {
+	if s.retiredDischargeWindowsDirty {
+		slog.Warn("charge start blocked while completed sale persistence is pending", "soc", soc)
+		return
+	}
 	now := s.now()
 	reservation := s.chargeReservationLocked(now, soc)
 	chargeWindow, reserved := reservation.windowAt(now)
@@ -1689,6 +1768,13 @@ func (s *Service) startChargingLocked(ctx context.Context, price decimal.Decimal
 			measuredACPowerW = acPowerW
 		}
 	}
+	var importPowerW float64
+	meterSampleKnown := false
+	if err == nil && s.meterEnabled() {
+		var meterErr error
+		importPowerW, meterErr = s.meter.GetActivePowerW()
+		meterSampleKnown = meterErr == nil
+	}
 	cancelCommand()
 	s.mu.Lock()
 	postCommandAt := s.now()
@@ -1743,6 +1829,7 @@ func (s *Service) startChargingLocked(ctx context.Context, price decimal.Decimal
 	s.currentTradeSOC = soc
 	s.currentTradeLastSOC = soc
 	s.beginMeasuredTradeLocked(measuredACPowerW)
+	s.scheduledChargeAccounting.Begin(s.currentTradeLastUpdate, measuredACPowerW, s.meterEnabled(), importPowerW, meterSampleKnown)
 	s.cacheBatteryTelemetryLocked(soc, measuredPowerW)
 	s.observedChargePowerW = max(measuredACPowerW, 0)
 	_, _, priceKnown := s.sessionPriceAtLocked(s.currentTradeStart, s.currentTradeStart.Add(time.Nanosecond), false)
@@ -1775,26 +1862,18 @@ func (s *Service) stopChargingLocked(ctx context.Context, endSOC int) {
 	}
 	stopTime := s.now()
 	s.accumulateMeasuredTradeEnergyAtLocked(s.currentTradeLastPowerW, stopTime, true)
+	s.scheduledChargeAccounting.Sample(stopTime, s.currentTradeLastPowerW, 0, false, s.loc, s.sessionPriceAtLocked)
 	duration := stopTime.Sub(s.currentTradeStart)
 	energyKWh := decimal.NewFromFloat(s.currentTradeEnergyWs / 3_600_000)
 	avgPrice, hasPricedEnergy := s.measuredTradePriceLocked()
 	avgPriceF, _ := avgPrice.Float64()
-	if hasPricedEnergy {
-		// Informational only; discharge eligibility is based on the current plan.
-		s.lastChargePrice = avgPrice
-	}
-	energyF, _ := energyKWh.Float64()
 
 	l := slog.With(
 		"action", "charge",
-		"avg_price_eur_kwh", avgPriceF,
-		"price_known", hasPricedEnergy,
 		"start_soc", s.currentTradeSOC,
 		"end_soc", endSOC,
 		"duration", duration,
-		"energy_kwh", energyF,
 	)
-	l.Info("stopping charge session")
 
 	tradeStart, tradeDurationS := serializedTradeInterval(s.currentTradeStart, stopTime)
 	trade := Trade{
@@ -1810,9 +1889,32 @@ func (s *Service) stopChargingLocked(ctx context.Context, endSOC int) {
 		StartSOC:       s.currentTradeSOC,
 		EndSOC:         endSOC,
 	}
+	s.scheduledChargeAccounting.Apply(&trade, s.loc)
+	energyF, _ := trade.EnergyKWh.Float64()
 	pricedEnergyF, _ := decimal.NewFromFloat(s.currentTradePricedEnergyWs / 3_600_000).Float64()
 	unpricedEnergyF, _ := trade.UnpricedKWh.Float64()
 	knownCostF, _ := s.currentTradeCostEUR.Float64()
+	if trade.hasMeasuredP1SourceSplit() {
+		pricedGrid := trade.GridEnergyKWh.Sub(trade.GridUnpricedKWh)
+		hasPricedEnergy = pricedGrid.IsPositive()
+		avgPrice = decimal.Zero
+		if hasPricedEnergy {
+			avgPrice = trade.GridCostEUR.Div(pricedGrid)
+		}
+		avgPriceF, _ = avgPrice.Float64()
+		pricedEnergyF, _ = pricedGrid.Float64()
+		unpricedEnergyF, _ = trade.GridUnpricedKWh.Float64()
+		knownCostF, _ = trade.GridCostEUR.Float64()
+		l = l.With("grid_kwh", trade.GridEnergyKWh,
+			"solar_kwh", trade.EnergyKWh.Sub(trade.GridEnergyKWh).Sub(trade.UnattributedEnergyKWh),
+			"unattributed_kwh", trade.UnattributedEnergyKWh)
+	}
+	if hasPricedEnergy {
+		s.lastChargePrice = avgPrice // information only, never a discharge gate
+	}
+	l = l.With("avg_price_eur_kwh", avgPriceF, "price_known", hasPricedEnergy,
+		"energy_kwh", energyF)
+	l.Info("stopping charge session")
 	// Release lock for I/O
 	s.mu.Unlock()
 	if err := s.recorder.RecordTrade(trade); err != nil {
@@ -1821,7 +1923,18 @@ func (s *Service) stopChargingLocked(ctx context.Context, endSOC int) {
 	}
 	if s.telegramEnabled() {
 		var err error
-		if trade.UnpricedKWh.IsPositive() {
+		if trade.hasMeasuredP1SourceSplit() {
+			unattributedF, _ := trade.UnattributedEnergyKWh.Float64()
+			solarF, _ := trade.EnergyKWh.Sub(trade.GridEnergyKWh).Sub(trade.UnattributedEnergyKWh).Float64()
+			completeness := "complete"
+			if trade.GridUnpricedKWh.IsPositive() || trade.UnattributedEnergyKWh.IsPositive() {
+				completeness = "incomplete"
+			}
+			err = s.telegram.SendMessage(ctx, fmt.Sprintf(
+				"<b>Charging completed</b>\nBattery input: %.2f kWh\nSolar input: %.2f kWh\nPriced grid: %.2f kWh\nUnpriced grid: %.2f kWh\nUnknown source: %.2f kWh\nKnown grid cost: %.4f EUR (%s)\nSOC: %d%%",
+				energyF, solarF, pricedEnergyF, unpricedEnergyF, unattributedF, knownCostF, completeness, endSOC,
+			))
+		} else if trade.UnpricedKWh.IsPositive() {
 			err = s.telegram.SendMessage(ctx, fmt.Sprintf(
 				"<b>Charging completed</b>\nEnergy: %.2f kWh\nPriced energy: %.2f kWh\nUnpriced energy: %.2f kWh\nKnown cost: %.4f EUR\nTotal cost: incomplete\nSOC: %d%%",
 				energyF, pricedEnergyF, unpricedEnergyF, knownCostF, endSOC,
@@ -1845,6 +1958,10 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 		dischargeWindow, active = s.dischargeWindowAtLocked(s.now())
 		if !active || dischargeWindow.End.Sub(s.now()) <= minimumAutomaticControlWindow {
 			slog.Info("automatic discharge start cancelled because its window is no longer safely active", "soc", soc)
+			return
+		}
+		if s.automaticCycleCommit == nil && (!currentPriceKnown || !price.IsPositive()) {
+			slog.Info("inventory sale start requires a known positive export price", "soc", soc)
 			return
 		}
 	}
@@ -1909,6 +2026,10 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 		return
 	}
 	s.state = targetState
+	if automatic && s.automaticCycleCommit == nil {
+		window := dischargeWindow
+		s.activeInventorySale = &window
+	}
 	s.cacheBatteryTelemetryLocked(soc, measuredPowerW)
 	s.currentTradeStart = s.now()
 	s.currentTradeSOC = soc
@@ -1963,7 +2084,7 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 	tradePowerW := s.currentTradePowerW
 	var uncommittedSessionWindow TimeWindow
 	hasUncommittedSessionWindow := false
-	if previousState == StateDischarging && s.automaticCycleCommit == nil && s.solarCycleRetention == nil {
+	if previousState == StateDischarging && s.automaticCycleCommit == nil {
 		uncommittedSessionWindow, hasUncommittedSessionWindow = s.dischargeWindowAtLocked(s.currentTradeStart)
 	}
 	if !s.transitionToIdleLocked(ctx, endSOC) {
@@ -2007,9 +2128,6 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 	knownValueF, _ := s.currentTradeCostEUR.Float64()
 	committedCycle := s.automaticCycleCommit
 	hadAutomaticCycleCommit := committedCycle != nil
-	if committedCycle == nil {
-		committedCycle = s.solarCycleRetention
-	}
 	var completedWindow TimeWindow
 	hasAutomaticWindow := false
 	if committedCycle != nil {
@@ -2020,7 +2138,7 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 	}
 	completedAutomaticCycle := hasAutomaticWindow &&
 		(!stopTime.Before(completedWindow.End) || endSOC <= s.cfg.MinSOCPercent())
-	retirements := append([]TimeWindow(nil), s.retiredDischargeWindows...)
+	retirements := retainedDischargeWindows(s.retiredDischargeWindows, stopTime)
 	if completedAutomaticCycle {
 		retiredKnown := false
 		for _, window := range retirements {
@@ -2072,11 +2190,15 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 		s.automaticCycleCommit = nil
 		s.automaticCycleCommitDurable = false
 		s.automaticCycleCleanupPending = false
-		s.solarCycleRetention = nil
+		s.activeInventorySale = nil
 		if s.pendingPlan != nil {
 			s.currentPlan = s.pendingPlan
 			s.pendingPlan = nil
 		}
+	}
+	if previousState == StateDischarging {
+		s.activeInventorySale = nil
+		s.lastPlanSlot = time.Time{}
 	}
 
 	notificationAction := "Discharging"
@@ -2138,7 +2260,7 @@ func (s *Service) transitionToIdleLocked(ctx context.Context, soc int) bool {
 	s.stopPending = false
 	s.lastStopAttempt = time.Time{}
 	s.lastStopLinkDown = false
-	if s.pendingPlan != nil && s.automaticCycleCommit == nil && s.solarCycleRetention == nil {
+	if s.pendingPlan != nil && s.automaticCycleCommit == nil && s.activeInventorySale == nil {
 		s.currentPlan = s.pendingPlan
 		s.pendingPlan = nil
 	}
@@ -2470,7 +2592,7 @@ func (s *Service) automaticCycleCommittedLocked() bool {
 	if s.automaticCycleCommit != nil {
 		return true
 	}
-	if s.solarCycleRetention != nil && s.now().Before(s.solarCycleRetention.DischargeWindow.End) {
+	if s.activeInventorySale != nil {
 		return true
 	}
 	return false
@@ -2479,11 +2601,8 @@ func (s *Service) automaticCycleCommittedLocked() bool {
 // clearExpiredAutomaticCycleCommitmentLocked removes an elapsed pairing from
 // both durable and live state. Caller must hold s.mu.
 func (s *Service) clearExpiredAutomaticCycleCommitmentLocked(ctx context.Context, now time.Time) {
-	if s.solarCycleRetention != nil && !now.Before(s.solarCycleRetention.DischargeWindow.End) {
-		s.solarCycleRetention = nil
-	}
 	if s.automaticCycleCommit == nil || (!s.automaticCycleCleanupPending && now.Before(s.automaticCycleCommit.DischargeWindow.End)) {
-		if s.automaticCycleCommit == nil && s.solarCycleRetention == nil && s.pendingPlan != nil {
+		if s.automaticCycleCommit == nil && s.activeInventorySale == nil && s.pendingPlan != nil {
 			s.currentPlan = s.pendingPlan
 			s.pendingPlan = nil
 		}
@@ -2517,7 +2636,7 @@ func (s *Service) clearExpiredAutomaticCycleCommitmentLocked(ctx context.Context
 	s.automaticCycleCommit = nil
 	s.automaticCycleCommitDurable = false
 	s.automaticCycleCleanupPending = false
-	if s.state != StateCharging && s.state != StateDischarging && s.solarCycleRetention == nil && s.pendingPlan != nil {
+	if s.state != StateCharging && s.state != StateDischarging && s.activeInventorySale == nil && s.pendingPlan != nil {
 		s.currentPlan = s.pendingPlan
 		s.pendingPlan = nil
 	}
@@ -2532,43 +2651,47 @@ func (s *Service) refreshCurrentPlanLocked(now time.Time) *TradingPlan {
 	if s.automaticCycleCleanupPending && s.automaticCycleCommit != nil {
 		cfg.RetiredDischargeWindows = append(append([]TimeWindow(nil), s.retiredDischargeWindows...), s.automaticCycleCommit.DischargeWindow)
 	}
-	plan := AnalyzePrices(s.futurePriceHorizonLocked(localMidnight(now)), cfg)
+	cfg.InitialSOC = s.batteryTelemetrySOC
+	cfg.InitialSOCKnown = s.batteryTelemetryAvailable
+	prices := s.futurePriceHorizonLocked(localMidnight(now))
+	cfg.RetiredDischargeWindows = append([]TimeWindow(nil), cfg.RetiredDischargeWindows...)
+	s.planRevision++
+	revision := s.planRevision
+	// Analysis has no side effects. Never hold the status/control mutex while
+	// evaluating the joint energy alternatives.
+	s.mu.Unlock()
+	plan := AnalyzePrices(prices, cfg)
+	s.mu.Lock()
+	if revision != s.planRevision {
+		return s.currentPlan
+	}
+	s.lastPlanSlot = now.Truncate(15 * time.Minute)
+	s.lastPlanSOC = -1
+	if cfg.InitialSOCKnown {
+		s.lastPlanSOC = cfg.InitialSOC
+	}
 	if s.automaticCycleCommittedLocked() {
 		s.pendingPlan = plan
 		return s.currentPlan
 	}
 	s.currentPlan = plan
 	s.pendingPlan = nil
-	s.activateRecoveryCycleLocked()
 	return plan
 }
 
-// activateRecoveryCycleLocked admits only observed stored energy, not a missed
-// grid purchase. Recovery cannot displace new cycles and carries no charge window.
-func (s *Service) activateRecoveryCycleLocked() {
-	plan := s.currentPlan
-	if plan == nil || plan.recoveryCycle == nil || !s.batteryTelemetryAvailable ||
+// refreshObservedPlanLocked replans uncommitted inventory when measured SOC
+// changes or a new tariff slot becomes executable. Active sales retain their
+// own endpoint, so falling SOC cannot extend a running sale.
+func (s *Service) refreshObservedPlanLocked(now time.Time) {
+	if s.automaticCycleCommittedLocked() || !s.batteryTelemetryAvailable ||
 		(s.state != StateIdle && s.state != StateSolarCharging) ||
-		(s.state != StateSolarCharging && s.batteryTelemetrySOC <= s.cfg.MinSOCPercent()) {
+		(len(s.todayPrices) == 0 && len(s.tomorrowPrices) == 0) {
 		return
 	}
-	recovery := plan.recoveryCycle
-	if recovery.DischargeWindow.End.Sub(s.now()) <= minimumAutomaticControlWindow {
+	if s.lastPlanSlot.Equal(now.Truncate(15*time.Minute)) && s.lastPlanSOC == s.batteryTelemetrySOC {
 		return
 	}
-	// The historical pair lets solar acquire retention and prevents a later
-	// grid reservation from beginning before this recovered discharge ends.
-	cycles := make([]TradeCycle, len(plan.Cycles)+1)
-	cycles[0] = *recovery
-	copy(cycles[1:], plan.Cycles)
-	plan.Cycles = cycles
-	windows := make([]TimeWindow, len(plan.DischargeWindows)+1)
-	windows[0] = recovery.DischargeWindow
-	copy(windows[1:], plan.DischargeWindows)
-	plan.DischargeWindows = windows
-	plan.DischargeOnly = len(plan.ChargeWindows) == 0
-	plan.IsProfitable = true
-	plan.recoveryCycle = nil
+	s.refreshCurrentPlanLocked(now)
 }
 
 func (s *Service) restoreAutomaticCycleCommitment() error {
@@ -2778,6 +2901,12 @@ func (s *Service) logAndNotifyTradingPlan(ctx context.Context, l *slog.Logger, p
 			"configured_planning_efficiency", s.cfg.BatteryEfficiency,
 		)
 	} else {
+		if plan.InventorySale != nil {
+			l.Info("stored energy sale selected",
+				"discharge_start", plan.InventorySale.Start.Format(windowFormat),
+				"discharge_end", plan.InventorySale.End.Format(windowFormat),
+				"discharge_avg_eur_kwh", plan.InventorySale.Price)
+		}
 		// Log each profitable cycle
 		for i, c := range plan.Cycles {
 			l.Info(
@@ -2821,6 +2950,12 @@ func (s *Service) logAndNotifyTradingPlan(ctx context.Context, l *slog.Logger, p
 		data.DischargeStart = window.Start.Format(windowFormat)
 		data.DischargeEnd = window.End.Format(windowFormat)
 		data.DischargePrice = window.Price.InexactFloat64()
+	}
+	if plan.InventorySale != nil {
+		data.InventorySale = true
+		data.InventoryStart = plan.InventorySale.Start.Format(windowFormat)
+		data.InventoryEnd = plan.InventorySale.End.Format(windowFormat)
+		data.InventoryPrice = plan.InventorySale.Price.InexactFloat64()
 	}
 	for _, c := range plan.Cycles {
 		data.Cycles = append(data.Cycles, telegram.TradingPlanCycle{
@@ -2878,7 +3013,7 @@ func (s *Service) checkDailySummary(ctx context.Context) {
 	history := s.recorder.GetHistory()
 	totalPnLIncomplete := false
 	for _, day := range history.Days {
-		if day.CashFlowUnpricedKWh.IsPositive() {
+		if day.CashFlowUnpricedKWh.IsPositive() || day.UnattributedChargeKWh.IsPositive() {
 			totalPnLIncomplete = true
 		}
 		if day.Date == targetDate {
@@ -2913,7 +3048,7 @@ func (s *Service) checkDailySummary(ctx context.Context) {
 		MaxDischargePrice:  maxDischargeF,
 		TotalPnLEUR:        totalPnLF,
 		UnpricedKWh:        unpricedF,
-		PnLIncomplete:      summary.CashFlowUnpricedKWh.IsPositive(),
+		PnLIncomplete:      summary.CashFlowUnpricedKWh.IsPositive() || summary.UnattributedChargeKWh.IsPositive(),
 		TotalPnLIncomplete: totalPnLIncomplete,
 		MeasuredEfficiency: s.measuredEfficiencyData(),
 	}
@@ -3330,7 +3465,7 @@ func (s *Service) sendTelegramStatus(ctx context.Context) {
 	totalPnL := history.TotalPnL
 	totalPnLIncomplete := false
 	for _, day := range history.Days {
-		totalPnLIncomplete = totalPnLIncomplete || day.CashFlowUnpricedKWh.IsPositive()
+		totalPnLIncomplete = totalPnLIncomplete || day.CashFlowUnpricedKWh.IsPositive() || day.UnattributedChargeKWh.IsPositive()
 	}
 
 	todayPnLF, _ := summary.PnLEUR.Float64()
@@ -3346,7 +3481,7 @@ func (s *Service) sendTelegramStatus(ctx context.Context) {
 		NextAction:         status.NextAction,
 		TodayPnL:           todayPnLF,
 		TotalPnL:           totalPnLF,
-		TodayPnLIncomplete: summary.CashFlowUnpricedKWh.IsPositive(),
+		TodayPnLIncomplete: summary.CashFlowUnpricedKWh.IsPositive() || summary.UnattributedChargeKWh.IsPositive(),
 		TotalPnLIncomplete: totalPnLIncomplete,
 		MeasuredEfficiency: s.measuredEfficiencyData(),
 	}
@@ -3425,9 +3560,9 @@ func (s *Service) GetCurrentStatus(ctx context.Context) CurrentStatus {
 		status.CommitmentType = "grid"
 		status.CommitmentDurable = s.automaticCycleCommitDurable
 		status.CommitmentDischargeWindowEnd = &end
-	} else if s.solarCycleRetention != nil {
-		end := s.solarCycleRetention.DischargeWindow.End
-		status.CommitmentType = "solar"
+	} else if s.activeInventorySale != nil {
+		end := s.activeInventorySale.End
+		status.CommitmentType = "inventory"
 		status.CommitmentDischargeWindowEnd = &end
 	}
 	var reservation chargingReservation
@@ -3465,6 +3600,10 @@ func (s *Service) GetCurrentStatus(ctx context.Context) CurrentStatus {
 		}
 	} else if commitmentCleanupPending {
 		status.NextAction = "automatic cycle commitment cleanup pending"
+	} else if s.retiredDischargeWindowsDirty {
+		status.NextAction = "completed sale persistence pending; automatic control blocked"
+	} else if s.state == StateSolarCharging {
+		status.NextAction = "capturing solar surplus independently of tariffs"
 	} else if s.currentPlan != nil && s.currentPlan.IsProfitable {
 		inReservedWindow := reservation.contains(now)
 		if inReservedWindow {
@@ -3477,11 +3616,19 @@ func (s *Service) GetCurrentStatus(ctx context.Context) CurrentStatus {
 			status.NextAction = "charge reservation unavailable: battery telemetry unavailable"
 		} else if status.BatteryAvailable && len(reservation.Windows) > 0 {
 			status.NextAction = "waiting for reserved charge window"
+		} else if s.currentPlan.InventorySale != nil {
+			status.NextAction = "holding stored energy for selected export window"
 		} else {
 			status.NextAction = "waiting for next window"
 		}
+	} else if !status.BatteryAvailable {
+		status.NextAction = "inventory planning unavailable: battery telemetry unavailable"
+	} else if s.solarUpperSOCHold {
+		status.NextAction = "solar full-SOC hold until 97%; waiting for a valuable sale"
+	} else if now.Before(s.solarCooldownUntil) {
+		status.NextAction = "solar restart cooldown; waiting for a valuable sale"
 	} else {
-		status.NextAction = "no profitable trades in the current horizon"
+		status.NextAction = "holding inventory for valuable known prices; qualified solar capture remains enabled"
 	}
 	return status
 }

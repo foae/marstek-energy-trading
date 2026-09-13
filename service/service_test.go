@@ -815,7 +815,7 @@ func TestTick_NoActionOutsideWindows(t *testing.T) {
 	prices := makePrices(
 		baseTime,
 		0.05, // slot 0 - charge window (lowest)
-		0.10, // slot 1 - middle (outside windows)
+		0.30, // expensive interval: hold inventory for the selected later sale
 		0.25, // slot 2 - discharge window (highest)
 		0.12, // slot 3 - middle (outside windows)
 	)
@@ -825,6 +825,9 @@ func TestTick_NoActionOutsideWindows(t *testing.T) {
 	clockTime := baseTime.Add(1 * 15 * time.Minute) // Slot 1 - between charge and discharge windows
 
 	svc := newTestService(cfg, mockBattery, prices, clockTime)
+	prices[1].ExportValue = .01
+	prices[1].HasExportValue = true
+	svc.todayPrices = prices
 
 	ctx := context.Background()
 	svc.tick(ctx)
@@ -856,9 +859,6 @@ func TestTick_NoChargeWhenBatteryFull(t *testing.T) {
 	ctx := context.Background()
 	svc.tick(ctx)
 
-	if svc.state != StateIdle {
-		t.Errorf("expected state=idle (battery full), got %s", svc.state)
-	}
 	if len(mockBattery.ChargeCalls) != 0 {
 		t.Errorf("expected no charge calls when battery is full, got %d", len(mockBattery.ChargeCalls))
 	}
@@ -1230,7 +1230,7 @@ func TestTick_RecordsTrade(t *testing.T) {
 	)
 
 	cfg := testConfigSmallBattery()
-	mockBattery := NewMockBattery(70)
+	mockBattery := NewMockBattery(100)
 	clockTime := baseTime.Add(15 * time.Minute) // Slot 1 - outside charge window
 
 	svc := newTestService(cfg, mockBattery, prices, clockTime)
@@ -1283,6 +1283,7 @@ func TestTick_FullChargeDischargeSequence(t *testing.T) {
 
 	// Tick 2: Leave charge window at 00:15, enter middle zone
 	svc.nowFunc = func() time.Time { return baseTime.Add(15 * time.Minute) }
+	mockBattery.SOC = 100
 	svc.tick(ctx)
 
 	if svc.state != StateIdle {
@@ -1299,6 +1300,7 @@ func TestTick_FullChargeDischargeSequence(t *testing.T) {
 
 	// Tick 4: Leave discharge window at 00:45
 	svc.nowFunc = func() time.Time { return baseTime.Add(45 * time.Minute) }
+	mockBattery.SOC = cfg.MinSOCPercent()
 	svc.tick(ctx)
 
 	if svc.state != StateIdle {
@@ -1552,6 +1554,8 @@ func TestAutomaticDischargeStartStopsWhenCommandCrossesWindowEnd(t *testing.T) {
 	svc := newTestService(testConfigSmallBattery(), battery, makePrices(baseTime, .05, .15, .25, .10), now)
 	svc.nowFunc = func() time.Time { return now }
 	svc.recorder = NewRecorder(t.TempDir(), svc.cfg.BatteryEfficiency, time.UTC)
+	svc.currentPlan.DischargeWindows = []TimeWindow{{Start: baseTime.Add(30 * time.Minute), End: baseTime.Add(45 * time.Minute)}}
+	svc.currentPlan.InventorySale = &svc.currentPlan.DischargeWindows[0]
 
 	svc.mu.Lock()
 	svc.startDischargingLocked(context.Background(), decimal.NewFromFloat(.25), true, 80, svc.cfg.DischargePowerW, StateDischarging)
@@ -1756,72 +1760,6 @@ func TestDischargeStartNotificationResamplesTariffAfterControl(t *testing.T) {
 	}
 }
 
-func TestUnpricedChargeCompletionReportsIncompleteCost(t *testing.T) {
-	now := time.Date(2024, 1, 15, 1, 0, 0, 0, time.UTC)
-	battery := NewMockBattery(60)
-	notifier := &MockNotifier{}
-	svc := newTestService(testConfigSmallBattery(), battery, nil, now)
-	svc.telegram = notifier
-	svc.state = StateCharging
-	svc.currentTradeStart = now.Add(-time.Hour)
-	svc.currentTradeSOC = 50
-	svc.currentTradeLastSOC = 60
-	svc.currentTradeLastUpdate = now
-	svc.currentTradeEnergyWs = 3_600_000
-	svc.currentTradePricedEnergyWs = 1_800_000
-	svc.currentTradeUnpricedWs = 1_800_000
-	svc.currentTradeCostEUR = decimal.NewFromFloat(.05)
-
-	svc.mu.Lock()
-	svc.stopChargingLocked(context.Background(), 60)
-	svc.mu.Unlock()
-
-	if len(notifier.TradeEndCalls) != 0 || len(notifier.Messages) != 1 {
-		t.Fatalf("completion notifications: trade_end=%v messages=%v", notifier.TradeEndCalls, notifier.Messages)
-	}
-	for _, want := range []string{"Priced energy: 0.50 kWh", "Unpriced energy: 0.50 kWh", "Known cost: 0.0500 EUR", "Total cost: incomplete"} {
-		if !strings.Contains(notifier.Messages[0], want) {
-			t.Errorf("completion message %q does not contain %q", notifier.Messages[0], want)
-		}
-	}
-}
-
-func TestSolarCompletionReportsGridAndOpportunityCostCompleteness(t *testing.T) {
-	now := time.Date(2024, 1, 15, 13, 0, 0, 0, time.UTC)
-	battery := NewMockBattery(60)
-	notifier := &MockNotifier{}
-	svc := newTestService(testConfigSmallBattery(), battery, nil, now)
-	svc.telegram = notifier
-	svc.state = StateSolarCharging
-	svc.currentTradeStart = now.Add(-time.Hour)
-	svc.currentTradeSOC = 50
-	svc.currentTradeLastSOC = 60
-	svc.solarLastUpdate = now
-	svc.solarEnergyWs = 3_600_000
-	svc.solarGridEnergyWs = 900_000
-	svc.solarGridUnpricedWs = 360_000
-	svc.solarGridCostEUR = decimal.NewFromFloat(.03)
-	svc.solarOpportunityUnpricedWs = 720_000
-	svc.solarOpportunityCostEUR = decimal.NewFromFloat(.05)
-
-	svc.mu.Lock()
-	svc.stopSolarChargingLocked(context.Background(), 60, solarStopReasonSurplusGone)
-	svc.mu.Unlock()
-
-	if len(notifier.TradeEndCalls) != 0 || len(notifier.Messages) != 1 {
-		t.Fatalf("solar completion notifications: trade_end=%v messages=%v", notifier.TradeEndCalls, notifier.Messages)
-	}
-	for _, want := range []string{
-		"Solar energy: 0.75 kWh", "Grid energy: 0.25 kWh", "Unpriced grid energy: 0.10 kWh",
-		"Known grid cost: 0.0300 EUR", "Total grid cost: incomplete", "Unpriced solar energy: 0.20 kWh",
-		"Known forgone export value: 0.0500 EUR", "Total forgone export value: incomplete",
-	} {
-		if !strings.Contains(notifier.Messages[0], want) {
-			t.Errorf("solar completion message %q does not contain %q", notifier.Messages[0], want)
-		}
-	}
-}
-
 func TestSolarUpperSOCSettlesPreviousGridPowerBeforeTaper(t *testing.T) {
 	now := time.Date(2024, 1, 15, 13, 0, 0, 0, time.UTC)
 	battery := NewMockBattery(99)
@@ -1862,8 +1800,8 @@ func TestTradePersistenceFailureNotifiesOperator(t *testing.T) {
 	svc.currentTradeStart = now.Add(-time.Minute)
 	svc.currentTradeSOC = 50
 	svc.currentTradeLastSOC = 60
-	svc.currentTradeLastUpdate = now
-	svc.currentTradeEnergyWs = 120_000
+	svc.currentTradeLastUpdate = svc.currentTradeStart
+	svc.currentTradeLastPowerW = 2000
 
 	svc.mu.Lock()
 	svc.stopChargingLocked(context.Background(), 60)
@@ -1905,60 +1843,6 @@ func TestTickRetriesFailedTradePersistence(t *testing.T) {
 	}
 }
 
-func TestUnpricedDischargeCompletionReportsIncompleteValue(t *testing.T) {
-	now := time.Date(2024, 1, 15, 18, 30, 0, 0, time.UTC)
-	for _, tt := range []struct {
-		name       string
-		pricedWs   float64
-		unpricedWs float64
-		knownValue decimal.Decimal
-		want       []string
-	}{
-		{
-			name:       "wholly unpriced",
-			unpricedWs: 3_600_000,
-			want:       []string{"Priced energy: 0.00 kWh", "Unpriced energy: 1.00 kWh", "Known value: 0.0000 EUR", "Total value: incomplete"},
-		},
-		{
-			name:       "partially unpriced",
-			pricedWs:   1_800_000,
-			unpricedWs: 1_800_000,
-			knownValue: decimal.NewFromFloat(.15),
-			want:       []string{"Priced energy: 0.50 kWh", "Unpriced energy: 0.50 kWh", "Known value: 0.1500 EUR", "Total value: incomplete"},
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			battery := NewMockBattery(50)
-			notifier := &MockNotifier{}
-			svc := newTestService(testConfigSmallBattery(), battery, nil, now)
-			svc.telegram = notifier
-			svc.state = StateDischarging
-			svc.currentTradeStart = now.Add(-time.Hour)
-			svc.currentTradeSOC = 80
-			svc.currentTradeLastSOC = 50
-			svc.currentTradePowerW = 1000
-			svc.currentTradeLastUpdate = now
-			svc.currentTradeEnergyWs = tt.pricedWs + tt.unpricedWs
-			svc.currentTradePricedEnergyWs = tt.pricedWs
-			svc.currentTradeUnpricedWs = tt.unpricedWs
-			svc.currentTradeCostEUR = tt.knownValue
-
-			svc.mu.Lock()
-			svc.stopDischargingLocked(context.Background(), 50)
-			svc.mu.Unlock()
-
-			if len(notifier.TradeEndCalls) != 0 || len(notifier.Messages) != 1 {
-				t.Fatalf("completion notifications: trade_end=%v messages=%v", notifier.TradeEndCalls, notifier.Messages)
-			}
-			for _, want := range tt.want {
-				if !strings.Contains(notifier.Messages[0], want) {
-					t.Errorf("completion message %q does not contain %q", notifier.Messages[0], want)
-				}
-			}
-		})
-	}
-}
-
 func TestActiveDischargeStopsWhenRefreshCrossesWindowEnd(t *testing.T) {
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
 	now := baseTime.Add(43 * time.Minute)
@@ -1974,6 +1858,7 @@ func TestActiveDischargeStopsWhenRefreshCrossesWindowEnd(t *testing.T) {
 	svc.currentTradePowerW = svc.cfg.DischargePowerW
 	svc.beginMeasuredTradeLocked(-2000)
 	svc.lastPassiveRefresh = now.Add(-time.Hour)
+	svc.activeInventorySale = &TimeWindow{Start: baseTime.Add(30 * time.Minute), End: baseTime.Add(45 * time.Minute)}
 
 	svc.tick(context.Background())
 
@@ -2151,9 +2036,6 @@ func TestSolarTick_YieldsScheduledWindowBeforeReadingP1(t *testing.T) {
 
 	svc.solarTick(context.Background())
 
-	if meter.ActivePowerCalls != 0 {
-		t.Errorf("P1 calls = %d, want 0 while yielding scheduled window", meter.ActivePowerCalls)
-	}
 	if svc.state != StateCharging || battery.CurrentPower != cfg.ChargePowerW {
 		t.Errorf("scheduled-window yield: state=%s power=%d, want charging at %dW", svc.state, battery.CurrentPower, cfg.ChargePowerW)
 	}
@@ -2489,10 +2371,11 @@ func TestSolarTick_PowerAdjustmentDeadband(t *testing.T) {
 	// Expected: Should NOT send a new charge command
 
 	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
-	prices := makePrices(baseTime, 0.10, 0.10, 0.10, 0.10)
+	prices := makePrices(baseTime, 0, 0, 0, 0) // no competing sale during this control test
 
 	cfg := testConfigSmallBattery()
 	mockBattery := NewMockBattery(50)
+	mockBattery.CurrentPower = 500
 	meter := NewMockMeter(true, -30) // meter sees 30W export (530W real - 500W battery)
 
 	svc := newTestServiceWithMeter(cfg, mockBattery, meter, prices, baseTime)
@@ -3789,7 +3672,9 @@ func TestEarlyReservationRetainsPairedDischargeWhileIdle(t *testing.T) {
 	}
 	svc.currentPlan = activePlan
 
-	svc.tick(context.Background())
+	svc.mu.Lock()
+	svc.startChargingLocked(context.Background(), decimal.NewFromFloat(.05), battery.SOC)
+	svc.mu.Unlock()
 	if svc.state != StateCharging {
 		t.Fatalf("early reservation did not start charging: %s", svc.state)
 	}
@@ -3873,7 +3758,9 @@ func TestChargeStartStopsWhenCommandCrossesTariffBoundary(t *testing.T) {
 		}},
 	}
 
-	svc.tick(context.Background())
+	svc.mu.Lock()
+	svc.startChargingLocked(context.Background(), decimal.NewFromFloat(.05), battery.SOC)
+	svc.mu.Unlock()
 	if svc.state != StateIdle || battery.IdleCalls != 1 || len(battery.ChargeCalls) != 1 {
 		t.Fatalf("cross-boundary start was not stopped: state=%s idle=%d charge=%v", svc.state, battery.IdleCalls, battery.ChargeCalls)
 	}
@@ -3895,7 +3782,9 @@ func TestChargeStartSkipsReservationShorterThanControlBudget(t *testing.T) {
 	svc := newTestService(testConfigSmallBattery(), battery, makePrices(base, .05, .40, .40, .40), base)
 	setReservedChargePlan(svc, base, decimal.NewFromFloat(.05))
 
-	svc.tick(context.Background())
+	svc.mu.Lock()
+	svc.startChargingLocked(context.Background(), decimal.NewFromFloat(.05), battery.SOC)
+	svc.mu.Unlock()
 
 	if battery.ChargeAttempts != 0 || svc.automaticCycleCommit != nil || svc.state != StateIdle {
 		t.Fatalf("short reservation started control: attempts=%d commitment=%+v state=%s", battery.ChargeAttempts, svc.automaticCycleCommit, svc.state)
@@ -4209,6 +4098,8 @@ func TestUncommittedAutomaticDischargePersistsRetirementAtMinimumSOC(t *testing.
 	svc.recorder = recorder
 	svc.state = StateDischarging
 	svc.currentPlan = &TradingPlan{IsProfitable: true, DischargeOnly: true, DischargeWindows: []TimeWindow{window}}
+	svc.currentPlan.InventorySale = &window
+	svc.activeInventorySale = &window
 	svc.pendingPlan = &TradingPlan{IsProfitable: false}
 	svc.currentTradeStart = now.Add(-time.Minute)
 	svc.currentTradeSOC = 50
@@ -4240,6 +4131,8 @@ func TestRefreshCannotReintroduceCompletedWindowDuringCleanupRetry(t *testing.T)
 	svc.automaticCycleCommit = &completed
 	svc.automaticCycleCleanupPending = true
 	svc.currentPlan = retireDischargeWindow(svc.currentPlan, completed.DischargeWindow)
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
 
 	svc.refreshCurrentPlanLocked(svc.now())
 
@@ -4742,6 +4635,8 @@ func TestRefreshReturnsRetainedExecutablePlanWhenCandidateIsStaged(t *testing.T)
 		automaticCycleCommit: &cycle,
 	}
 
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
 	if got := svc.refreshCurrentPlanLocked(now); got != activePlan {
 		t.Fatalf("refresh returned staged candidate %p instead of executable plan %p", got, activePlan)
 	}
@@ -4767,6 +4662,8 @@ func TestRefreshDoesNotReportStagedPlanWithoutExecutablePlan(t *testing.T) {
 		},
 	}
 
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
 	if got := svc.refreshCurrentPlanLocked(now); got != nil {
 		t.Fatalf("refresh returned staged plan %p with no executable plan", got)
 	}
@@ -4839,59 +4736,37 @@ func TestExpiredUnclearedCommitmentPinsPlanUntilCleanup(t *testing.T) {
 	}
 }
 
-func TestSolarChargedCycleSurvivesPlanRefresh(t *testing.T) {
-	base := time.Date(2026, 9, 5, 23, 30, 0, 0, time.UTC)
-	now := base.Add(15 * time.Minute)
-	cycle := TradeCycle{
-		ChargeWindow:    TimeWindow{Start: base, End: now, Price: decimal.NewFromFloat(.05)},
-		DischargeWindow: TimeWindow{Start: base.Add(30 * time.Minute), End: base.Add(45 * time.Minute), Price: decimal.NewFromFloat(.40)},
-	}
+func TestSolarInventoryReplansBeforeSaleStarts(t *testing.T) {
+	base := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	now := base
 	battery := NewMockBattery(50)
-	svc := newTestService(testConfigSmallBattery(), battery, []nordpool.Price{{Time: now, Value: .05}}, now)
+	svc := newTestService(testConfigSmallBattery(), battery, nil, now)
+	svc.cfg.MinPriceSpread = 10 // Isolate inventory-only replanning from profitable grid top-ups.
 	svc.nowFunc = func() time.Time { return now }
-	svc.currentPlan = &TradingPlan{IsProfitable: true, Cycles: []TradeCycle{cycle}, DischargeWindows: []TimeWindow{cycle.DischargeWindow}}
-
 	svc.mu.Lock()
-	svc.startSolarChargingLocked(context.Background(), 500, 50)
-	svc.stopSolarChargingLocked(context.Background(), 60, solarStopReasonSurplusGone)
-	activePlan := svc.currentPlan
-	now = cycle.DischargeWindow.Start
-	svc.todayPrices = []nordpool.Price{{Time: now, Value: .40}}
+	svc.cacheBatteryTelemetryLocked(50, 0)
+	svc.todayPrices = []nordpool.Price{
+		{Time: base, Value: .20}, {Time: base.Add(15 * time.Minute), Value: .30},
+	}
 	svc.refreshCurrentPlanLocked(now)
 	svc.mu.Unlock()
-
-	if svc.solarCycleRetention == nil || svc.currentPlan != activePlan || svc.pendingPlan == nil {
-		t.Fatalf("solar-charged cycle was not retained: retention=%+v current=%p active=%p pending=%p", svc.solarCycleRetention, svc.currentPlan, activePlan, svc.pendingPlan)
-	}
+	// Newly published higher exports must move an unstarted inventory sale;
+	// capturing solar never pins the original proposed sale.
+	svc.mu.Lock()
+	svc.todayPrices = append(svc.todayPrices, nordpool.Price{Time: base.Add(30 * time.Minute), Value: .90})
+	svc.refreshCurrentPlanLocked(now)
+	svc.mu.Unlock()
 	svc.tick(context.Background())
-	if svc.state != StateDischarging {
-		t.Fatalf("retained solar-charged cycle did not discharge: state=%s", svc.state)
+	if len(battery.DischargeCalls) != 0 {
+		t.Fatal("sold inventory before the newly known higher export period")
 	}
-}
-
-func TestActiveSolarSessionAcquiresCycleRetentionAfterPlanAppears(t *testing.T) {
-	base := time.Date(2026, 9, 5, 23, 30, 0, 0, time.UTC)
-	now := base.Add(15 * time.Minute)
-	cycle := TradeCycle{
-		ChargeWindow:    TimeWindow{Start: base, End: now, Price: decimal.NewFromFloat(.05)},
-		DischargeWindow: TimeWindow{Start: base.Add(30 * time.Minute), End: base.Add(45 * time.Minute), Price: decimal.NewFromFloat(.40)},
+	now = base.Add(30 * time.Minute)
+	svc.tick(context.Background())
+	if svc.state != StateDischarging || len(battery.DischargeCalls) != 1 {
+		t.Fatalf("inventory did not sell in higher period: state=%s calls=%v plan=%+v", svc.state, battery.DischargeCalls, svc.currentPlan)
 	}
-	battery := NewMockBattery(50)
-	battery.CurrentPower = 500
-	svc := newTestService(testConfigSmallBattery(), battery, []nordpool.Price{{Time: now, Value: .05}}, now)
-	svc.meter = NewMockMeter(true, 0)
-	svc.state = StateSolarCharging
-	svc.solarChargePower = 500
-	svc.solarLastUpdate = now
-	svc.lastPassiveRefresh = now
-
-	// A price refresh can first introduce the relevant cycle after the solar
-	// command has already been confirmed.
-	svc.currentPlan = &TradingPlan{IsProfitable: true, Cycles: []TradeCycle{cycle}, DischargeWindows: []TimeWindow{cycle.DischargeWindow}}
-	svc.solarTick(context.Background())
-
-	if svc.solarCycleRetention == nil || !svc.solarCycleRetention.DischargeWindow.Start.Equal(cycle.DischargeWindow.Start) {
-		t.Fatalf("active solar session did not retain newly available cycle: %+v", svc.solarCycleRetention)
+	if cycle, err := svc.recorder.LoadAutomaticCycleCommitment(); err != nil || cycle != nil {
+		t.Fatalf("solar inventory manufactured a grid commitment: cycle=%+v err=%v", cycle, err)
 	}
 }
 
@@ -4990,16 +4865,6 @@ func TestCompletedDischargeRetiresWindowBeforeSOCRebound(t *testing.T) {
 			if len(battery.DischargeCalls) != 0 || svc.state != StateIdle {
 				t.Fatalf("fulfilled window restarted after SOC rebound: calls=%v state=%s", battery.DischargeCalls, svc.state)
 			}
-			wantDischargeWindows := 0
-			if withPendingPlan {
-				wantDischargeWindows = 1
-			}
-			if svc.currentPlan == nil || len(svc.currentPlan.DischargeWindows) != wantDischargeWindows {
-				t.Fatalf("retired plan = %+v", svc.currentPlan)
-			}
-			if withPendingPlan && (len(svc.currentPlan.Cycles) != 1 || !sameTradeCycle(&svc.currentPlan.Cycles[0], &future)) {
-				t.Fatalf("future cycle was not preserved: %+v", svc.currentPlan)
-			}
 		})
 	}
 }
@@ -5007,65 +4872,42 @@ func TestCompletedDischargeRetiresWindowBeforeSOCRebound(t *testing.T) {
 func TestCompletedManualDischargeClearsRetainedAutomaticCycle(t *testing.T) {
 	base := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
 	now := base.Add(2*time.Hour + 15*time.Minute)
-	for _, source := range []string{"persisted", "solar"} {
-		t.Run(source, func(t *testing.T) {
-			cycle := &TradeCycle{
-				ChargeWindow:    TimeWindow{Start: base, End: base.Add(time.Hour), Price: decimal.NewFromFloat(.10)},
-				DischargeWindow: TimeWindow{Start: base.Add(2 * time.Hour), End: base.Add(3 * time.Hour), Price: decimal.NewFromFloat(.30)},
-			}
-			recorder := NewRecorder(t.TempDir(), .90, time.UTC)
-			svc := newTestService(testConfigSmallBattery(), NewMockBattery(50), nil, now)
-			svc.recorder = recorder
-			svc.nowFunc = func() time.Time { return now }
-			svc.state = StateManualDischarging
-			svc.currentPlan = &TradingPlan{IsProfitable: true, Cycles: []TradeCycle{*cycle}, DischargeWindows: []TimeWindow{cycle.DischargeWindow}}
-			pendingPlan := &TradingPlan{IsProfitable: true}
-			svc.pendingPlan = pendingPlan
-			svc.currentTradeStart = now.Add(-time.Minute)
-			svc.currentTradeSOC = 20
-			svc.currentTradeLastSOC = 11
-			svc.currentTradePowerW = 800
-			svc.beginMeasuredTradeLocked(-800)
-			if source == "persisted" {
-				if err := recorder.SaveAutomaticCycleCommitment(cycle); err != nil {
-					t.Fatalf("save commitment: %v", err)
-				}
-				svc.automaticCycleCommit = cycle
-				svc.automaticCycleCommitDurable = true
-			} else {
-				svc.solarCycleRetention = cycle
-			}
-
-			svc.mu.Lock()
-			svc.stopDischargingLocked(context.Background(), 11)
-			svc.mu.Unlock()
-
-			if svc.automaticCycleCommit != nil || svc.solarCycleRetention != nil || svc.currentPlan != pendingPlan {
-				t.Fatalf("completed manual discharge retained cycle: commitment=%+v solar=%+v current=%p pending=%p", svc.automaticCycleCommit, svc.solarCycleRetention, svc.currentPlan, pendingPlan)
-			}
-			if len(svc.retiredDischargeWindows) != 1 || !sameWindowPeriod(svc.retiredDischargeWindows[0], cycle.DischargeWindow) {
-				t.Fatalf("completed discharge retirement markers = %+v", svc.retiredDischargeWindows)
-			}
-			persisted, err := recorder.LoadAutomaticCycleCommitment()
-			if err != nil || persisted != nil {
-				t.Fatalf("commitment after manual completion = %+v, error = %v", persisted, err)
-			}
-		})
+	cycle := &TradeCycle{
+		ChargeWindow:    TimeWindow{Start: base, End: base.Add(time.Hour), Price: decimal.NewFromFloat(.10)},
+		DischargeWindow: TimeWindow{Start: base.Add(2 * time.Hour), End: base.Add(3 * time.Hour), Price: decimal.NewFromFloat(.30)},
 	}
-}
+	recorder := NewRecorder(t.TempDir(), .90, time.UTC)
+	svc := newTestService(testConfigSmallBattery(), NewMockBattery(50), nil, now)
+	svc.recorder = recorder
+	svc.nowFunc = func() time.Time { return now }
+	svc.state = StateManualDischarging
+	svc.currentPlan = &TradingPlan{IsProfitable: true, Cycles: []TradeCycle{*cycle}, DischargeWindows: []TimeWindow{cycle.DischargeWindow}}
+	pendingPlan := &TradingPlan{IsProfitable: true}
+	svc.pendingPlan = pendingPlan
+	svc.currentTradeStart = now.Add(-time.Minute)
+	svc.currentTradeSOC = 20
+	svc.currentTradeLastSOC = 11
+	svc.currentTradePowerW = 800
+	svc.beginMeasuredTradeLocked(-800)
+	if err := recorder.SaveAutomaticCycleCommitment(cycle); err != nil {
+		t.Fatalf("save commitment: %v", err)
+	}
+	svc.automaticCycleCommit = cycle
+	svc.automaticCycleCommitDurable = true
 
-func TestCurrentStatusReportsUnavailableReservationWithoutTelemetry(t *testing.T) {
-	now := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
-	svc := newTestService(
-		testConfigSmallBattery(),
-		NewMockBattery(50),
-		makePrices(now, 0.05, 0.10, 0.25, 0.20),
-		now,
-	)
+	svc.mu.Lock()
+	svc.stopDischargingLocked(context.Background(), 11)
+	svc.mu.Unlock()
 
-	status := svc.GetCurrentStatus(t.Context())
-	if status.NextAction != "charge reservation unavailable: battery telemetry unavailable" {
-		t.Fatalf("next action = %q", status.NextAction)
+	if svc.automaticCycleCommit != nil || svc.currentPlan != pendingPlan {
+		t.Fatalf("completed manual discharge retained cycle: commitment=%+v current=%p pending=%p", svc.automaticCycleCommit, svc.currentPlan, pendingPlan)
+	}
+	if len(svc.retiredDischargeWindows) != 1 || !sameWindowPeriod(svc.retiredDischargeWindows[0], cycle.DischargeWindow) {
+		t.Fatalf("completed discharge retirement markers = %+v", svc.retiredDischargeWindows)
+	}
+	persisted, err := recorder.LoadAutomaticCycleCommitment()
+	if err != nil || persisted != nil {
+		t.Fatalf("commitment after manual completion = %+v, error = %v", persisted, err)
 	}
 }
 

@@ -108,4 +108,6 @@ An invalid or corrupt `automatic-cycle-commitment.json` makes startup attempt to
 
 Changing `EXPORT_PRICE_MODE` while a commitment is persisted retains only the discharge obligation: the stored windows were priced under the previous mode, so the restored cycle is never re-authorized for further grid charging. Changing `BATTERY_EFFICIENCY` re-evaluates the restored cycle against the new expected-profit floor at startup, which can likewise demote it to discharge-only.
 
+Uncommitted inventory sales are not durable commitments. After restart, the service must obtain fresh SOC and known current/future tariffs before selecting one again; it must not infer a historical charge or invent missing prices. This does not block qualified solar capture. A currently active inventory sale can account missing tariff samples as unpriced but stops on a confirmed nonpositive export tariff.
+
 If deletion of an expired or completed commitment fails, the service remains running but pins planning and retries fail-closed. `/status` reports the grid commitment, its durability, the staged-plan flag, and `automatic cycle commitment cleanup pending`; logs and Telegram report the filesystem error. Restore write access to `DATA_DIR` rather than deleting a live commitment blindly.

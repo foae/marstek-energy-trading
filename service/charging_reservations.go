@@ -2,6 +2,7 @@ package service
 
 import (
 	"log/slog"
+	"math"
 	"sort"
 	"time"
 
@@ -30,7 +31,7 @@ func (s *Service) chargeReservationLocked(now time.Time, soc int) chargingReserv
 		(s.automaticCycleCommit != nil && !now.Before(s.automaticCycleCommit.DischargeWindow.End)) {
 		return result
 	}
-	var earliest time.Time
+	earliest := s.currentPlan.EarliestChargeStart
 	var dischargePrice decimal.Decimal
 	for _, cycle := range s.currentPlan.Cycles {
 		if cycle.ChargeWindow.End.After(now) {
@@ -40,13 +41,18 @@ func (s *Service) chargeReservationLocked(now time.Time, soc int) chargingReserv
 			result.pairedCycle = &cycleCopy
 			break
 		}
-		earliest = cycle.DischargeWindow.End
+		if cycle.DischargeWindow.End.After(earliest) {
+			earliest = cycle.DischargeWindow.End
+		}
 	}
 	if result.Deadline.IsZero() {
 		return result
 	}
 	if now.Before(earliest) {
 		return chargingReservation{}
+	}
+	if earliest.Before(now) {
+		earliest = now
 	}
 	chargeEff := s.cfg.BatteryChargeEfficiency
 	if !(chargeEff > 0 && chargeEff <= 1) {
@@ -66,8 +72,8 @@ func (s *Service) chargeReservationLocked(now time.Time, soc int) chargingReserv
 	for _, price := range s.futurePriceHorizonLocked(now) {
 		start, end := price.Time, price.Time.Add(15*time.Minute)
 		isCurrentSlice := !now.Before(start) && now.Before(end)
-		if start.Before(now) {
-			start = now
+		if start.Before(earliest) {
+			start = earliest
 		}
 		if end.After(result.Deadline) {
 			end = result.Deadline
@@ -85,28 +91,11 @@ func (s *Service) chargeReservationLocked(now time.Time, soc int) chargingReserv
 		eligibleCapacityKWh += capacityKWh
 		result.Windows = append(result.Windows, TimeWindow{Start: start, End: end, Price: priceDecimal})
 	}
-	sort.SliceStable(result.Windows, func(i, j int) bool {
-		if result.Windows[i].Price.Equal(result.Windows[j].Price) {
-			return result.Windows[i].Start.Before(result.Windows[j].Start)
-		}
-		return result.Windows[i].Price.LessThan(result.Windows[j].Price)
-	})
-	remaining := result.RequiredKWh
-	count := 0
-	for i := range result.Windows {
-		if remaining <= 0 {
-			break
-		}
-		window := &result.Windows[i]
-		energy := powerKW * window.End.Sub(window.Start).Hours()
-		if energy > remaining {
-			energy = remaining
-			window.End = window.Start.Add(time.Duration(energy / powerKW * float64(time.Hour)))
-		}
-		remaining -= energy
-		result.ReservedKWh += energy
-		count++
-	}
+	allocation := allocateCheapestChargeSlices(result.Windows, result.RequiredKWh, powerKW)
+	result.Windows = allocation.Windows
+	count := allocation.Count
+	result.ReservedKWh = allocation.ReservedKWh
+	remaining := result.RequiredKWh - result.ReservedKWh
 	if newCount, applied := s.extendRunningReservationSlice(now, result.Windows, count, powerKW, result.Deadline); applied {
 		count = newCount
 		result.ReservedKWh = 0
@@ -224,7 +213,7 @@ func (s *Service) extendRunningReservationSlice(now time.Time, windows []TimeWin
 	drop := make(map[int]bool, len(displacements))
 	for _, d := range displacements {
 		window := &windows[d.index]
-		window.End = window.End.Add(-time.Duration(d.kWh / powerKW * float64(time.Hour)))
+		window.End = window.End.Add(-time.Duration(math.Round(d.kWh / powerKW * float64(time.Hour))))
 		if !window.Start.Before(window.End) {
 			drop[d.index] = true
 		}
@@ -264,96 +253,14 @@ func (r chargingReservation) windowAt(now time.Time) (TimeWindow, bool) {
 }
 
 func (s *Service) solarBlockedLocked(now time.Time, soc int) bool {
+	if s.retiredDischargeWindowsDirty {
+		return true
+	}
 	reservation := s.chargeReservationLocked(now, soc)
 	return reservation.contains(now) ||
-		(s.currentPlan != nil && s.currentPlan.IsInDischargeWindow(now)) ||
-		!s.solarEconomicalForReservationLocked(now, reservation)
-}
-
-// solarEconomicalForReservationLocked reports whether consuming solar now beats
-// exporting it and importing reserved grid energy instead. Solar's cost is the
-// forgone export value, so it is compared at the export rate against the
-// reserved slices' import prices.
-func (s *Service) solarEconomicalForReservationLocked(now time.Time, reservation chargingReservation) bool {
-	// When only time or measured taper makes the grid reservation infeasible,
-	// accept every available solar watt as best effort toward the commitment.
-	timeLimitedCommittedCycle := s.automaticCycleCommit != nil && now.Before(s.automaticCycleCommit.ChargeWindow.End) &&
-		sameTradeCycle(reservation.pairedCycle, s.automaticCycleCommit)
-	timeLimitedRetainedSolarCycle := s.solarCycleRetention != nil && now.Before(s.solarCycleRetention.ChargeWindow.End)
-	if !reservation.Deadline.IsZero() && !reservation.Feasible && !reservation.LimitedByEconomics &&
-		(timeLimitedCommittedCycle || timeLimitedRetainedSolarCycle) {
-		return true
-	}
-	if maxChargePrice, committed := s.pendingCycleMaxChargePriceLocked(now); committed {
-		exportPrice, known := s.currentExportPriceLocked(now)
-		if !known || !s.chargePriceMeetsProfitFloorLocked(exportPrice, maxChargePrice) {
-			return false
-		}
-	}
-	if reservation.Deadline.IsZero() {
-		return true
-	}
-	exportPrice, known := s.currentExportPriceLocked(now)
-	if !known {
-		return false
-	}
-	if !reservation.Feasible {
-		return s.chargePriceMeetsProfitFloorLocked(exportPrice, reservation.maxChargePrice)
-	}
-	for _, window := range reservation.Windows {
-		if !exportPrice.LessThanOrEqual(window.Price) {
-			continue
-		}
-		return true
-	}
-	return false
+		(s.currentPlan != nil && s.currentPlan.IsInDischargeWindow(now))
 }
 
 func (s *Service) chargePriceMeetsProfitFloorLocked(price, maxChargePrice decimal.Decimal) bool {
-	minProfit := decimal.NewFromFloat(s.cfg.MinPriceSpread)
-	expectedProfit := maxChargePrice.Add(minProfit).Sub(price)
-	return expectedProfit.IsPositive() && !expectedProfit.LessThan(minProfit)
-}
-
-func (s *Service) cycleForSolarRetentionLocked(now time.Time, reservation chargingReservation) *TradeCycle {
-	if s.automaticCycleCommit != nil || s.solarCycleRetention != nil {
-		return nil
-	}
-	if s.currentPlan != nil {
-		for _, cycle := range s.currentPlan.Cycles {
-			if !now.Before(cycle.ChargeWindow.End) && now.Before(cycle.DischargeWindow.Start) {
-				cycleCopy := cycle
-				return &cycleCopy
-			}
-		}
-	}
-	if reservation.pairedCycle != nil {
-		cycleCopy := *reservation.pairedCycle
-		return &cycleCopy
-	}
-	return nil
-}
-
-func (s *Service) pendingCycleMaxChargePriceLocked(now time.Time) (decimal.Decimal, bool) {
-	var cycle *TradeCycle
-	if s.automaticCycleCommit != nil && now.Before(s.automaticCycleCommit.DischargeWindow.End) {
-		cycle = s.automaticCycleCommit
-	} else if s.solarCycleRetention != nil && !now.Before(s.solarCycleRetention.ChargeWindow.End) &&
-		now.Before(s.solarCycleRetention.DischargeWindow.End) {
-		cycle = s.solarCycleRetention
-	} else if s.currentPlan != nil {
-		for i := range s.currentPlan.Cycles {
-			candidate := &s.currentPlan.Cycles[i]
-			if !now.Before(candidate.ChargeWindow.End) && now.Before(candidate.DischargeWindow.End) {
-				cycle = candidate
-				break
-			}
-		}
-	}
-	if cycle == nil {
-		return decimal.Zero, false
-	}
-	return cycle.DischargeWindow.Price.
-		Mul(decimal.NewFromFloat(s.cfg.BatteryEfficiency)).
-		Sub(decimal.NewFromFloat(s.cfg.MinPriceSpread)), true
+	return chargePriceEligible(price, maxChargePrice, s.cfg.MinPriceSpread)
 }

@@ -31,14 +31,14 @@ An ESPHome control operation has a 45-second overall budget, while each changed 
 ## Limitations
 
 - No independent hardware watchdog or forced-command expiry is provided by the ESPHome backend.
-- Refreshed planning candidates, solar cycle retention, active-session energy, and daily-summary delivery state are not persisted. The paired grid-cycle commitment is persisted before the charge command, so it records intent rather than proof of execution; a crash after persistence but before control can restore a discharge obligation for energy that was never purchased, and a later crash can lose partial-session accounting.
+- Refreshed unstarted inventory plans, active-session energy, and daily-summary delivery state are not persisted. On restart, an uncommitted inventory sale is reconstructed only from fresh observed SOC and currently known prices. The paired grid-cycle commitment is persisted before the charge command, so it records intent rather than proof of execution; a crash after persistence but before control can restore a discharge obligation for energy that was never purchased, and a later crash can lose partial-session accounting.
 - An invalid commitment file blocks startup rather than guessing. A valid restored cycle that fails the current profit floor retains its discharge obligation but cannot resume grid charging. Confirm the battery is physically idle before following the recovery procedure in [Operations](operations.md).
 - The ESPHome bridge configuration and firmware compatibility matrix are not included.
 - Solar power-number writes use ESPHome's optimistic number state; measured power is observed on subsequent ticks rather than transactionally confirmed for every adjustment.
 - A single serialized control loop performs battery, meter, price, and Telegram I/O. Slow network calls can delay other checks.
 - Only one battery, one P1 meter, EUR pricing, and 15-minute NordPool products are supported.
 - Default tax, VAT, fee, area, timezone, battery capacity, and efficiency values are examples for one Dutch setup and will become stale.
-- Import and export are valued symmetrically; installations with a separate feed-in tariff need code changes.
-- P&L and energy are estimates, not billing, tax, warranty, or investment records.
+- Export valuation is configurable: `symmetric` uses the all-in import rate, while `wholesale` uses wholesale plus the configured signed export fee. This is still an operational estimate, not a bill; commanded AC discharge can offset household load before any metered export.
+- P&L, solar opportunity cost, and the opportunity-cost-adjusted metric are estimates, not billing, tax, warranty, or investment records.
 - Runtime history grows without retention and is rewritten atomically after every completed trade.
 - The legacy UDP package is unauthenticated, spoofable on an untrusted LAN, and not wired into the service. See [Legacy UDP Client](legacy-udp.md).

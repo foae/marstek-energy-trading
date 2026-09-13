@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -358,8 +359,8 @@ func TestAnalyzePrices_MinimumProfitAppliedAfterEfficiencyLoss(t *testing.T) {
 		t.Fatalf("expected net profit above 0.045 to be accepted, got cycles=%+v", plan.Cycles)
 	}
 	wantProfit := decimal.RequireFromString("0.04581167111111111")
-	if !plan.Cycles[0].Profit.Equal(wantProfit) {
-		t.Fatalf("profit = %s, want %s", plan.Cycles[0].Profit, wantProfit)
+	if plan.Cycles[0].Profit.Sub(wantProfit).Abs().GreaterThan(decimal.RequireFromString("0.000000000000001")) {
+		t.Fatalf("profit = %s, want approximately %s", plan.Cycles[0].Profit, wantProfit)
 	}
 
 	boundaryPrices := makePrices(baseTime, 0.10, 0.20)
@@ -565,7 +566,7 @@ func TestAnalyzePrices_NowExcludesExpiredCycleAndPreservesStaticAnalysis(t *test
 	}
 }
 
-func TestAnalyzePrices_NowKeepsInProgressWindowsEligible(t *testing.T) {
+func TestAnalyzePrices_NowUsesRemainingChargeOpportunity(t *testing.T) {
 	baseTime := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
 	values := make([]float64, 96)
 	for i := range values {
@@ -583,9 +584,9 @@ func TestAnalyzePrices_NowKeepsInProgressWindowsEligible(t *testing.T) {
 	cfg.Now = baseTime.Add(10 * time.Hour)
 	plan := AnalyzePrices(makePrices(baseTime, values...), cfg)
 	if len(plan.Cycles) != 1 ||
-		!plan.Cycles[0].ChargeWindow.Start.Equal(baseTime.Add(9*time.Hour)) ||
+		!plan.Cycles[0].ChargeWindow.Start.Equal(cfg.Now) ||
 		!plan.Cycles[0].ChargeWindow.End.After(cfg.Now) {
-		t.Fatalf("expected the in-progress 09:00-11:00 charge window to remain eligible, got %+v", plan.Cycles)
+		t.Fatalf("expected the remaining in-progress charge opportunity to remain eligible, got %+v", plan.Cycles)
 	}
 }
 
@@ -659,50 +660,6 @@ func TestAnalyzePrices_RejectsWindowsAcrossPriceGaps(t *testing.T) {
 	plan := AnalyzePrices(prices, cfg)
 	if len(plan.Cycles) != 0 {
 		t.Errorf("expected no cycles using a gap-spanning discharge window, got %d", len(plan.Cycles))
-	}
-}
-
-func TestCalculateWindowSize(t *testing.T) {
-	tests := []struct {
-		name        string
-		capacityKWh float64
-		powerW      int
-		wantSlots   int
-	}{
-		{
-			name:        "5.12 kWh at 2500W",
-			capacityKWh: 5.12,
-			powerW:      2500,
-			wantSlots:   9, // 5.12/2.5 = 2.048 hours * 4 = 8.19 -> ceil = 9
-		},
-		{
-			name:        "5 kWh at 2500W",
-			capacityKWh: 5.0,
-			powerW:      2500,
-			wantSlots:   8, // 5/2.5 = 2 hours * 4 = 8
-		},
-		{
-			name:        "1 kWh at 2000W",
-			capacityKWh: 1.0,
-			powerW:      2000,
-			wantSlots:   2, // 1/2 = 0.5 hours * 4 = 2
-		},
-		{
-			name:        "zero power defaults to 8",
-			capacityKWh: 5.0,
-			powerW:      0,
-			wantSlots:   8,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := calculateWindowSize(tt.capacityKWh, tt.powerW)
-			if got != tt.wantSlots {
-				t.Errorf("calculateWindowSize(%f, %d) = %d, want %d",
-					tt.capacityKWh, tt.powerW, got, tt.wantSlots)
-			}
-		})
 	}
 }
 
@@ -880,8 +837,8 @@ func TestTradingPlan_ShouldTrade(t *testing.T) {
 
 // TestAnalyzePrices_WindowSizesUseACSideEnergy pins the AC-side window sizing:
 // charging must draw usable capacity divided by the charge efficiency, while
-// discharging can only deliver usable capacity times the round-trip efficiency
-// divided by that same charge efficiency.
+// discharging delivers usable capacity times the round-trip efficiency divided
+// by that same charge efficiency.
 func TestAnalyzePrices_WindowSizesUseACSideEnergy(t *testing.T) {
 	baseTime := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
 	values := make([]float64, 16)
@@ -911,15 +868,18 @@ func TestAnalyzePrices_WindowSizesUseACSideEnergy(t *testing.T) {
 	if got := cycle.ChargeWindow.End.Sub(cycle.ChargeWindow.Start); got != 9*15*time.Minute {
 		t.Errorf("charge window = %s, want 9 slots (%s)", got, 9*15*time.Minute)
 	}
-	if got := cycle.DischargeWindow.End.Sub(cycle.DischargeWindow.Start); got != 7*15*time.Minute {
-		t.Errorf("discharge window = %s, want 7 slots (%s)", got, 7*15*time.Minute)
+	wantDischarge := time.Duration(math.Round(
+		(5.12 * (1 - .11) * cfg.Efficiency / cfg.ChargeEfficiency) / (float64(cfg.DischargePowerW) / 1000) * float64(time.Hour),
+	))
+	if got := cycle.DischargeWindow.End.Sub(cycle.DischargeWindow.Start); got != wantDischarge {
+		t.Errorf("discharge window = %s, want exact AC duration %s", got, wantDischarge)
 	}
 }
 
-// TestAnalyzePrices_UnsetChargeEfficiencyKeepsSymmetricWindows proves an unset
-// charge efficiency is treated as 1.0, so with a lossless round trip both
-// windows stay sized from the usable DC capacity alone.
-func TestAnalyzePrices_UnsetChargeEfficiencyKeepsSymmetricWindows(t *testing.T) {
+// TestAnalyzePrices_UnsetChargeEfficiencyUsesExactDischargeDuration proves an
+// unset charge efficiency is treated as 1.0 while the discharge duration still
+// reflects the exact AC delivery energy.
+func TestAnalyzePrices_UnsetChargeEfficiencyUsesExactDischargeDuration(t *testing.T) {
 	baseTime := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
 	values := make([]float64, 18)
 	for i := 0; i < 9; i++ {
@@ -944,14 +904,14 @@ func TestAnalyzePrices_UnsetChargeEfficiencyKeepsSymmetricWindows(t *testing.T) 
 		t.Fatalf("expected one cycle, got %+v", plan.Cycles)
 	}
 	cycle := plan.Cycles[0]
-	want := time.Duration(calculateWindowSize(5.12*0.89, 2200)) * 15 * time.Minute
-	if want != 9*15*time.Minute {
-		t.Fatalf("fixture sanity: legacy window size = %s, want 9 slots", want)
+	wantCharge := 9 * 15 * time.Minute
+	if got := cycle.ChargeWindow.End.Sub(cycle.ChargeWindow.Start); got != wantCharge {
+		t.Errorf("charge window = %s, want %s", got, wantCharge)
 	}
-	if got := cycle.ChargeWindow.End.Sub(cycle.ChargeWindow.Start); got != want {
-		t.Errorf("charge window = %s, want %s", got, want)
-	}
-	if got := cycle.DischargeWindow.End.Sub(cycle.DischargeWindow.Start); got != want {
-		t.Errorf("discharge window = %s, want %s", got, want)
+	wantDischarge := time.Duration(math.Round(
+		(5.12 * (1 - .11)) / (float64(cfg.DischargePowerW) / 1000) * float64(time.Hour),
+	))
+	if got := cycle.DischargeWindow.End.Sub(cycle.DischargeWindow.Start); got != wantDischarge {
+		t.Errorf("discharge window = %s, want exact AC duration %s", got, wantDischarge)
 	}
 }

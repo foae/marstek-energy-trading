@@ -489,6 +489,10 @@ type TradingPlanData struct {
 	DischargeStart     string
 	DischargeEnd       string
 	DischargePrice     float64
+	InventorySale      bool
+	InventoryStart     string
+	InventoryEnd       string
+	InventoryPrice     float64
 }
 
 // SendTradingPlan sends a trading plan notification.
@@ -535,7 +539,7 @@ func (c *Client) SendTradingPlan(ctx context.Context, data TradingPlanData) erro
 		text = fmt.Sprintf(
 			"%s <b>Trading Plan - %s</b>\n"+
 				"<i>%s</i>\n\n"+
-				"✅ <b>%d profitable cycle(s) found</b>\n\n"+
+				"<b>%d profitable grid cycle(s) found</b>\n\n"+
 				"Plan prices: %.4f - %.4f EUR/kWh\n"+
 				"Configured minimum net profit: %.4f EUR/kWh\n",
 			dayLabel, data.Day, dateStr,
@@ -545,6 +549,10 @@ func (c *Client) SendTradingPlan(ctx context.Context, data TradingPlanData) erro
 		)
 		if data.PlanRetained {
 			text += "\n\n<i>Active committed-cycle plan retained; refreshed plan pending.</i>"
+		}
+		if data.InventorySale {
+			text += fmt.Sprintf("\n<b>Stored energy sale:</b>\nDischarge: %s - %s @ %.4f EUR/kWh\n",
+				data.InventoryStart, data.InventoryEnd, data.InventoryPrice)
 		}
 
 		for i, cycle := range data.Cycles {

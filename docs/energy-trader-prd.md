@@ -4,7 +4,7 @@ Product Requirements Document for the Marstek Energy Trading Bot.
 
 ## Overview
 
-A Go service that performs energy price arbitrage using a Marstek Venus E battery. The service fetches NordPool day-ahead prices, builds a global plan of profitable charge/discharge cycles, and controls the battery via an ESPHome HTTP REST API. A HomeWizard P1 meter can direct solar surplus into the battery only when doing so is no more expensive than its forgone export value, priced at the configured export tariff, relative to reserved grid energy; it is not free profit.
+A Go service that controls a Marstek Venus E battery with NordPool day-ahead prices and an optional HomeWizard P1 meter. It jointly compares observed stored inventory, profitable grid cycles, and holding energy using known tariffs; qualified solar surplus is captured without an economic price veto. Solar is not free profit: its forgone export value is recorded separately from cash flow.
 
 ## Hardware
 
@@ -52,35 +52,29 @@ A Go service that performs energy price arbitrage using a Marstek Venus E batter
 
 ## Trading Strategy
 
-### Global cycle planning
+### Joint inventory and grid planning
 
-1. **Calculate usable capacity** accounting for min SOC protection:
+1. **Determine usable observed inventory.** A fresh SOC observation supplies usable stored DC energy above the configured minimum SOC:
    ```
-   usable_kWh = capacity_kWh * (1 - min_soc)
+   usable_inventory_kWh = max(0, capacity_kWh * (observed_soc - min_soc))
    ```
-   Example: 5.12 kWh with 11% min SOC = 4.56 kWh usable.
+   It is a real, finite input to the plan, not a reconstructed historical grid charge.
 
-2. **Calculate contiguous window sizes** from usable capacity and configured charge/discharge power:
-   ```
-   window_slots = ceil(usable_kWh / power_kW * 4)
-   ```
-   Example: 4.56 kWh at 2500W = 8 slots (2 hours).
+2. **Evaluate grid pairs.** A contiguous grid charge window must end before its contiguous discharge window begins. Its expected profit per input kWh is `discharge_average * efficiency - charge_average`; it must be strictly positive and meet `MIN_PRICE_SPREAD`.
 
-3. **Evaluate all chronological candidate pairs.** Each charge window must end before its discharge window begins. Expected profit per input kWh is `discharge_avg * efficiency - charge_avg`. A pair is eligible only when that result is positive and at least `MIN_PRICE_SPREAD`.
+3. **Compare total-EUR alternatives using the initial inventory once.** The planner can hold inventory, leave it available to reduce the first grid purchase, or sell it in one contiguous known-positive-export-price window followed by non-overlapping grid cycles. The sale can be shorter than the available inventory or end partway through a tariff interval. It uses integrated prices and actual energy, not average-slot economics. Following grid reservations cannot start before the selected inventory sale ends.
 
-4. **Select the global plan.** Dynamic programming maximizes the summed expected profit of up to `MAX_CYCLES_PER_DAY` non-overlapping chronological pairs. It is not a bottom/top-quartile heuristic and does not greedily select one cycle before considering later cycles.
+4. **Select the plan.** Grid cycles are selected chronologically to maximize total EUR over the known tariff horizon and stay within `MAX_CYCLES_PER_DAY`; the inventory-only sale is exempt from that grid-cycle allowance. Equal values prefer fewer control sessions and then earlier choices. This is the best contiguous sale under known prices, not a guarantee of arbitrary-slot optimization, future prices, or hindsight revenue. Unknown or nonpositive export prices do not trigger an uncommitted inventory sale; remaining energy is held. There is no solar forecast or made-up battery-wear floor.
 
 ### SOC-aware grid reservations
 
-For the next unfinished charge cycle, the service derives a deadline from its charge-window end and calculates the grid input needed to reach 100% from current SOC, dividing the SOC shortfall by the charge-side efficiency `BATTERY_CHARGE_EFFICIENCY` rather than by the round-trip figure, since the discharge-side loss is not paid on import. It considers eligible 15-minute price slices from the known today and tomorrow tariff sets after the prior planned discharge and through that deadline, then reserves the cheapest slices first. It forecasts no future solar: any solar already reflected in measured SOC reduces the reservation. After a grid charge has run for 30 seconds, any lower observed charging power becomes the deliverability limit. A grid slice is excluded when its individual price would reduce expected profit against the paired discharge average below `MIN_PRICE_SPREAD`. Automatic control does not start or refresh in the final minute of a reserved window, reserving a bounded interval for ESPHome confirmation and battery-power verification before the tariff boundary. While a charge is running, its slice is extended to the full 15-minute tariff boundary rather than truncated, as long as displacing the same energy onto cheaper reserved slices costs less than one cent, so a gently falling price curve cannot force a stop/start at every boundary. When delivery capacity, time, or that economic bound prevents a full charge, the service reserves an eligible best-effort subset and marks the reservation infeasible.
-
-For a feasible reservation, solar begins only if its current export opportunity cost, priced at the configured export tariff, is no greater than the marginal (highest-priced) selected grid slice. Otherwise the service exports the expensive solar now and retains the cheaper grid reservation. If economic exclusions cause the reservation shortfall, solar must still satisfy the same per-slice expected-profit ceiling; that ceiling remains active between the charge deadline and paired discharge. Infeasibility caused by time or taper even with all slices available permits solar capture regardless. With no deadline and no pending paired discharge, solar is captured. A feasible or economics-limited reservation with no known current tariff does not start solar.
+For the next unfinished grid charge cycle, the service derives a deadline from its charge-window end and calculates the grid input needed to reach 100% from current SOC, dividing the SOC shortfall by the charge-side efficiency `BATTERY_CHARGE_EFFICIENCY` rather than by the round-trip figure, since the discharge-side loss is not paid on import. It considers eligible 15-minute price slices from the known tariff sets after the prior planned discharge and through that deadline, then reserves the cheapest slices first. Observed stored energy, including captured solar, reduces the required purchase; no solar is forecast. After a grid charge has run for 30 seconds, any lower observed charging power becomes the deliverability limit. Every grid slice must preserve the paired cycle's `MIN_PRICE_SPREAD` floor.
 
 ### Execution accounting and discharge
 
-Executed charge and discharge energy is integrated from measured AC-power samples and priced across retained 15-minute rate slots. Energy without an applicable retained rate is explicitly unpriced. Solar sessions separately record estimated grid input/cost and the all-in opportunity cost of solar not exported. Daily and total P&L are cash flow (priced discharge revenue less priced grid cost), not inventory-matched trading profit; solar opportunity cost is reported separately and is not deducted from that P&L.
+Executed charge and discharge energy is integrated from measured AC-power samples and priced across retained 15-minute rate slots. Energy without an applicable retained rate is explicitly unpriced. New split scheduled-charge records carry an explicit source-attribution marker and record separately attributed grid and solar portions: priced grid cost remains in cash flow, while forgone solar export is priced as opportunity cost. Records without that marker retain their legacy interpretation. Cash-flow P&L is priced discharge value minus priced grid cost. The separately reported opportunity-cost-adjusted metric also deducts priced solar opportunity cost; neither is inventory-matched trading profit.
 
-Scheduled discharge starts in its planned window when SOC is above its configured minimum. `lastChargePrice` remains informational logging only and does not gate discharge.
+Scheduled discharge starts in its planned window when SOC is above its configured minimum. An active inventory sale can continue while a tariff sample is temporarily missing, recording that energy as unpriced, but stops on a confirmed nonpositive export tariff. This is separate from a durable grid-cycle commitment, whose existing discharge obligation remains conservative through unavailable current prices. `lastChargePrice` remains informational logging only and does not gate discharge.
 
 ### Solar Self-Consumption
 
@@ -88,12 +82,10 @@ When a HomeWizard P1 meter is configured, the service detects grid export (solar
 
 1. **Detection**: P1 meter is polled every 1 second. Negative `active_power_w` = exporting to grid = solar surplus.
 2. **Start confirmation**: Requires 30 seconds of sustained surplus above `SOLAR_MIN_SURPLUS_W` (default: 100W). Failed readings or telemetry gaps longer than two seconds reset qualification; EMA smoothing uses elapsed time.
-3. **Charging**: Battery charges at the detected surplus power (clamped to `CHARGE_POWER_W`). Power is dynamically adjusted with a 50W deadband to avoid flapping.
-4. **P1 feedback compensation**: During charging, `effectiveSurplus = measuredSurplus + measuredACChargePower`; an EMA (alpha 0.05) smooths the result. The AC-side draw is what the P1 meter registers, and measured rather than requested power avoids treating an unachieved command as available surplus.
-5. **Ramp-up cooldown**: After starting or adjusting charge power, a 5-second cooldown prevents re-adjustment while the battery ramps to the new target (~3s). This avoids a positive feedback spiral where transient over-estimation of effective surplus causes the target power to spiral upward.
-6. **Low-surplus, economic choice, and failures**: EMA below `max(SOLAR_MIN_SURPLUS_W / 4, 75W)` starts a 60-second grace requesting 75W; recovery immediately clears it. Grace expiry stops charging. Surplus-loss sessions under ten minutes get a five-minute cooldown; three consecutive marginal sessions get fifteen minutes. Longer sessions and legitimate stops reset the streak and use sixty seconds. Battery-full, active-reservation, and discharge-window checks precede P1 reads. For a feasible reservation, solar starts only when the current export opportunity cost is no greater than the marginal reserved grid price; otherwise expensive solar is exported and cheaper grid energy remains reserved. An economics-limited reservation still applies the paired cycle's per-slice price ceiling to solar, including after the charge deadline while its discharge remains pending; infeasibility caused only by time or taper permits solar capture regardless. Failed adjustments and repeated telemetry failure request a confirmed stop; an unconfirmed stop retains the session and is retried.
-7. **Scheduled priority**: An active grid reservation or discharge window stops solar charging before its scheduled action begins. Solar does not start during either, then can resume once the window ends if the economic rule permits it.
-8. **Recording**: `solar_charge` records measured battery energy from AC power, separate estimated grid energy/cost, and solar opportunity cost. Grid input is `min(measuredACChargePower, max(netGridImport, 0))`, integrated between samples. Solar energy is the remainder. Known rate slots price grid cost at the import rate and the forgone-export opportunity cost at the export rate; unavailable rates are explicitly unpriced. Legacy records without split fields remain all-solar.
+3. **Charging and compensation**: Battery charging is clamped to `CHARGE_POWER_W`. The AC-side feedback compensation is `effectiveSurplus = measuredSurplus + measuredACChargePower`; the P1 meter sees that AC draw, so DC battery power is not substituted. A five-second settling cooldown after power changes prevents a positive-feedback spiral.
+4. **Low surplus and full battery**: EMA below `max(SOLAR_MIN_SURPLUS_W / 4, 75W)` starts a 60-second grace requesting 75W; recovery clears it. Adaptive cooldowns reduce short sessions. Solar stops at 99% SOC and can qualify again at 97%; a grid reservation can charge to 100%.
+5. **Priority and pricing**: Safety/fault handling, manual control, selected or active automatic discharge, and current grid reservations take priority. Otherwise qualified solar capture has no tariff, forecast, reservation-economics, or grid-cycle-profit veto: missing, negative, or changing tariffs do not alone prevent or stop capture.
+6. **Recording**: Measured AC energy, separately attributed grid input/cost, and forgone solar-export opportunity cost are recorded. Known rate slots price grid cost at the import rate and forgone export at the export rate; unavailable prices remain explicitly unpriced. New split scheduled-charge records carry source attribution; records without it retain their historical interpretation.
 
 ### Configurable Profit Threshold
 
@@ -281,6 +273,7 @@ marstek-energy-trading/
 │   ├── service.go               # Trading engine
 │   ├── analyzer.go              # Price analysis
 │   ├── recorder.go              # Trade recording (decimal)
+│   ├── charge_accounting.go     # Scheduled-charge source attribution and value metrics
 │   └── interfaces.go            # BatteryController interface
 ├── clients/
 │   ├── esphome/client.go        # ESPHome HTTP client (default)

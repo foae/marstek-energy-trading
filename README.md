@@ -1,18 +1,18 @@
 # Energy Market Minitrader
 
-An experimental Go service that schedules a Marstek Venus E home battery around NordPool day-ahead prices and can capture solar surplus measured by a HomeWizard P1 meter.
+An experimental Go service that schedules a Marstek Venus E home battery around NordPool day-ahead prices and captures qualified solar surplus measured by a HomeWizard P1 meter.
 
 This project is for technically experienced owners of a compatible battery and ESPHome bridge who can validate the control entities, network isolation, tariffs, and fail-safe behavior on their own installation. It is not a general-purpose energy management system, a financial product, or safety-certified control software. Read [Safety](docs/safety.md) before enabling automatic operation.
 
 ## Capabilities
 
 - Fetches 15-minute NordPool day-ahead prices for a configured bidding area.
-- Builds globally optimized, chronological charge-to-discharge plans over the known today/tomorrow horizon.
+- Selects a joint total-EUR plan from observed stored energy, optional following grid cycles, and holding energy for later known prices.
+- Sells uncommitted observed inventory only in its best contiguous positive-export-price window in the known tariff horizon; it is not an arbitrary-slot or future-price guarantee.
 - Recalculates grid charging from measured state of charge and reserves the cheapest remaining slots before the next charge deadline.
 - Controls one Marstek Venus E through an ESPHome HTTP bridge, with read-back confirmation and measured-power start verification.
-- Captures solar surplus from an optional HomeWizard P1 meter while giving scheduled grid reservations and discharge windows priority.
-- Records measured energy, priced and unpriced energy, estimated grid-attributable solar-session input, opportunity cost, and cash-flow P&L in local JSON.
-- Exposes health, Prometheus metrics, and status/history endpoints.
+- Captures qualified solar surplus without a tariff veto, except for safety/fault handling, manual control, selected or active discharge, and a grid reservation.
+- Records measured energy, scheduled-charge source attribution, cash flow, solar opportunity cost, and a separate opportunity-cost-adjusted metric in local JSON.
 - Sends optional Telegram notifications and accepts authorized private-chat status/manual-discharge commands.
 - Detects a frozen ESPHome-to-battery RS485 link during active sessions and can restart the bridge when a restart button is configured.
 
@@ -33,6 +33,12 @@ Every price uses one configured all-in EUR/kWh rate:
 ```
 
 Export and solar opportunity cost are valued at the configured export tariff (`EXPORT_PRICE_MODE`), symmetric with the import rate by default and optionally wholesale-based. Planning, accounting, and solar-charging rules are detailed in [Methodology](docs/methodology.md), and the full state machine and accounting rules are in [the PRD](docs/energy-trader-prd.md).
+
+### Stored energy and solar
+
+The planner uses fresh observed stored DC energy exactly once when comparing total EUR: it can sell that inventory in one contiguous future window, let it reduce the first grid purchase, or hold it. An inventory sale is exempt from the grid-cycle allowance; later grid cycles still obey `MAX_CYCLES_PER_DAY` and their existing per-slice minimum-profit rule. It uses only the known tariff horizon—there is no solar forecast, invented future price, arbitrary battery-wear floor, or guarantee that the chosen sale is hindsight-optimal.
+
+Qualified solar capture is unconditional outside safety/fault handling, manual override, automatic-discharge priority, and a current grid reservation. Solar stops at 99% SOC and can qualify again at 97%; a grid reservation may charge to 100%. Solar control retains AC-side surplus compensation, anti-cycling, power limits, and telemetry protections. A commanded AC discharge may offset household load before reaching the meter, so it is not a promise of metered export revenue.
 
 ## Quick Start
 

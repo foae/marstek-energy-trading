@@ -26,10 +26,6 @@ func reservationFixture() (*Service, time.Time) {
 	return s, now
 }
 
-func solarEconomicalAt(s *Service, now time.Time, soc int) bool {
-	return s.solarEconomicalForReservationLocked(now, s.chargeReservationLocked(now, soc))
-}
-
 func TestReservationOnlyUsesSlicesMeetingExpectedProfitThreshold(t *testing.T) {
 	now := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
 	prices := make([]nordpool.Price, 9)
@@ -83,7 +79,7 @@ func TestReservationOnlyUsesSlicesMeetingExpectedProfitThreshold(t *testing.T) {
 	}
 }
 
-func TestEconomicShortfallDoesNotBypassSolarOpportunityCost(t *testing.T) {
+func TestEconomicShortfallDoesNotBlockSolarWithoutActiveReservation(t *testing.T) {
 	now := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
 	s := &Service{
 		loc: time.UTC,
@@ -110,27 +106,8 @@ func TestEconomicShortfallDoesNotBypassSolarOpportunityCost(t *testing.T) {
 	if reservation.Feasible || !reservation.LimitedByEconomics {
 		t.Fatalf("expected economics-limited reservation: %+v", reservation)
 	}
-	if solarEconomicalAt(s, now, 11) {
-		t.Fatal("solar with 0.45 export value must not charge for a 0.40 discharge at 90% efficiency")
-	}
-}
-
-func TestTimeLimitedReservationAllowsBestEffortSolarWithCommitment(t *testing.T) {
-	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
-	cycle := &TradeCycle{
-		ChargeWindow:    TimeWindow{Start: now.Add(-time.Hour), End: now.Add(time.Hour), Price: decimal.NewFromFloat(.10)},
-		DischargeWindow: TimeWindow{Start: now.Add(2 * time.Hour), End: now.Add(3 * time.Hour), Price: decimal.NewFromFloat(.40)},
-	}
-	s := &Service{
-		cfg:                  testConfigSmallBattery(),
-		loc:                  time.UTC,
-		todayPrices:          []nordpool.Price{{Time: now, Value: .50}},
-		automaticCycleCommit: cycle,
-	}
-	reservation := chargingReservation{Deadline: cycle.ChargeWindow.End, Feasible: false, LimitedByEconomics: false, pairedCycle: cycle}
-
-	if !s.solarEconomicalForReservationLocked(now, reservation) {
-		t.Fatal("time-limited committed reservation rejected best-effort solar")
+	if s.solarBlockedLocked(now, 11) {
+		t.Fatal("economic shortfall without an active reservation must not block solar charging")
 	}
 }
 
@@ -156,93 +133,8 @@ func TestLaterCycleDoesNotCreateReservationBeforeEarlierDischargeCompletes(t *te
 	if !reservation.Deadline.IsZero() || reservation.pairedCycle != nil || len(reservation.Windows) != 0 {
 		t.Fatalf("later cycle leaked into pre-discharge reservation: %+v", reservation)
 	}
-	if !s.solarEconomicalForReservationLocked(now, reservation) {
-		t.Fatal("empty later-cycle reservation blocked solar allowed by the committed cycle ceiling")
-	}
-}
-
-func TestMixedCapacityAndEconomicShortfallRetainsSolarProfitCeiling(t *testing.T) {
-	now := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
-	s := &Service{
-		loc: time.UTC,
-		cfg: &config.Config{
-			BatteryCapacityKWh: 1,
-			BatteryEfficiency:  .90,
-			MinPriceSpread:     .05,
-			ChargePowerW:       1000,
-		},
-		nowFunc: func() time.Time { return now },
-		currentPlan: &TradingPlan{Cycles: []TradeCycle{{
-			ChargeWindow:    TimeWindow{Start: now, End: now.Add(time.Hour)},
-			DischargeWindow: TimeWindow{Price: decimal.NewFromFloat(.40)},
-		}}},
-		todayPrices: []nordpool.Price{
-			{Time: now, Value: .45},
-			{Time: now.Add(15 * time.Minute), Value: .30},
-			{Time: now.Add(30 * time.Minute), Value: .30},
-			{Time: now.Add(45 * time.Minute), Value: .30},
-		},
-	}
-
-	reservation := s.chargeReservationLocked(now, 0)
-	if reservation.Feasible || !reservation.LimitedByEconomics {
-		t.Fatalf("expected mixed time/economic shortfall: %+v", reservation)
-	}
-	if solarEconomicalAt(s, now, 0) {
-		t.Fatal("mixed shortfall bypassed the paired cycle's solar profit ceiling")
-	}
-}
-
-func TestCommittedCycleRetainsSolarProfitCeilingAfterChargeDeadline(t *testing.T) {
-	now := time.Date(2026, 9, 7, 1, 0, 0, 0, time.UTC)
-	cycle := TradeCycle{
-		ChargeWindow:    TimeWindow{Start: now.Add(-time.Hour), End: now, Price: decimal.NewFromFloat(.30)},
-		DischargeWindow: TimeWindow{Start: now.Add(time.Hour), End: now.Add(2 * time.Hour), Price: decimal.NewFromFloat(.40)},
-	}
-	s := &Service{
-		loc:                  time.UTC,
-		cfg:                  &config.Config{BatteryCapacityKWh: 1, BatteryEfficiency: .90, MinPriceSpread: .05, ChargePowerW: 1000},
-		nowFunc:              func() time.Time { return now },
-		currentPlan:          &TradingPlan{Cycles: []TradeCycle{cycle}},
-		automaticCycleCommit: &cycle,
-		todayPrices:          []nordpool.Price{{Time: now, Value: .45}},
-	}
-
-	if reservation := s.chargeReservationLocked(now, 50); !reservation.Deadline.IsZero() {
-		t.Fatalf("post-deadline reservation unexpectedly active: %+v", reservation)
-	}
-	if solarEconomicalAt(s, now, 50) {
-		t.Fatal("expensive solar bypassed the committed cycle ceiling after its charge deadline")
-	}
-}
-
-func TestCommittedCycleSolarCeilingPrecedesLaterCycleReservation(t *testing.T) {
-	now := time.Date(2026, 9, 7, 1, 0, 0, 0, time.UTC)
-	committed := TradeCycle{
-		ChargeWindow:    TimeWindow{Start: now.Add(-time.Hour), End: now, Price: decimal.NewFromFloat(.30)},
-		DischargeWindow: TimeWindow{Start: now.Add(time.Hour), End: now.Add(2 * time.Hour), Price: decimal.NewFromFloat(.40)},
-	}
-	later := TradeCycle{
-		ChargeWindow:    TimeWindow{Start: now.Add(3 * time.Hour), End: now.Add(4 * time.Hour), Price: decimal.NewFromFloat(.10)},
-		DischargeWindow: TimeWindow{Start: now.Add(5 * time.Hour), End: now.Add(6 * time.Hour), Price: decimal.NewFromFloat(.50)},
-	}
-	s := &Service{
-		loc:                  time.UTC,
-		cfg:                  &config.Config{BatteryCapacityKWh: 1, BatteryEfficiency: .90, MinPriceSpread: .05, ChargePowerW: 1000},
-		nowFunc:              func() time.Time { return now },
-		currentPlan:          &TradingPlan{Cycles: []TradeCycle{committed, later}},
-		automaticCycleCommit: &committed,
-		todayPrices:          []nordpool.Price{{Time: now, Value: .45}},
-	}
-
-	if reservation := s.chargeReservationLocked(now, 50); !reservation.Deadline.IsZero() {
-		t.Fatalf("later cycle leaked into the committed cycle's pre-discharge interval: %+v", reservation)
-	}
-	if solarEconomicalAt(s, now, 50) {
-		t.Fatal("later reservation bypassed the earlier committed cycle's solar ceiling")
-	}
-	if !s.solarBlockedLocked(now, 50) {
-		t.Fatal("physical solar entry was not blocked by the committed cycle ceiling")
+	if s.solarBlockedLocked(now, 50) {
+		t.Fatal("without a reservation or discharge, solar must remain eligible")
 	}
 }
 
@@ -262,26 +154,6 @@ func TestReservationRejectsZeroProfitSliceAtZeroThreshold(t *testing.T) {
 	reservation := s.chargeReservationLocked(now, 90)
 	if len(reservation.Windows) != 0 || !reservation.LimitedByEconomics {
 		t.Fatalf("zero-profit slice was reserved: %+v", reservation)
-	}
-}
-
-func TestSolarRejectsZeroProfitAtZeroThreshold(t *testing.T) {
-	now := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
-	cycle := TradeCycle{
-		ChargeWindow:    TimeWindow{Start: now.Add(-time.Hour), End: now},
-		DischargeWindow: TimeWindow{Start: now.Add(time.Hour), End: now.Add(2 * time.Hour), Price: decimal.NewFromFloat(.20)},
-	}
-	s := &Service{
-		loc:                  time.UTC,
-		cfg:                  &config.Config{BatteryCapacityKWh: 1, BatteryEfficiency: .5, MinPriceSpread: 0, ChargePowerW: 1000},
-		nowFunc:              func() time.Time { return now },
-		currentPlan:          &TradingPlan{Cycles: []TradeCycle{cycle}},
-		automaticCycleCommit: &cycle,
-		todayPrices:          []nordpool.Price{{Time: now, Value: .10}},
-	}
-
-	if solarEconomicalAt(s, now, 50) {
-		t.Fatal("solar with exact break-even opportunity cost was accepted")
 	}
 }
 
@@ -441,17 +313,6 @@ func TestReservationUsesCheapestCrossMidnightSlotsAndActualSolar(t *testing.T) {
 	}
 }
 
-func TestSolarOpportunityCostPrefersCheaperFutureGrid(t *testing.T) {
-	s, now := reservationFixture()
-	if solarEconomicalAt(s, now, 50) {
-		t.Fatal("charging from 30ct export surplus instead of reserving 5/10ct grid energy")
-	}
-	s.todayPrices[0].Value = .01
-	if !solarEconomicalAt(s, now, 50) {
-		t.Fatal("cheap solar should replace more expensive grid energy")
-	}
-}
-
 func TestReservationReportsTaperInfeasibleWithoutInventingEnergy(t *testing.T) {
 	s, now := reservationFixture()
 	s.state = StateCharging
@@ -463,29 +324,6 @@ func TestReservationReportsTaperInfeasibleWithoutInventingEnergy(t *testing.T) {
 	}
 	if !s.gridReservedLocked(now, 50) {
 		t.Fatal("infeasible deadline must use remaining available time best effort")
-	}
-	if !solarEconomicalAt(s, now, 50) {
-		t.Fatal("taper-only infeasibility must continue capturing solar")
-	}
-}
-
-func TestSolarRetentionCeilingStartsAtChargeDeadline(t *testing.T) {
-	now := time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC)
-	cycle := &TradeCycle{
-		ChargeWindow:    TimeWindow{Start: now.Add(-time.Hour), End: now.Add(time.Hour)},
-		DischargeWindow: TimeWindow{Start: now.Add(2 * time.Hour), End: now.Add(3 * time.Hour), Price: decimal.NewFromFloat(.30)},
-	}
-	s := &Service{
-		cfg:                 &config.Config{BatteryEfficiency: .90, MinPriceSpread: .05},
-		solarCycleRetention: cycle,
-	}
-	reservation := chargingReservation{Deadline: cycle.ChargeWindow.End, Feasible: false, LimitedByEconomics: false}
-
-	if !s.solarEconomicalForReservationLocked(now, reservation) {
-		t.Fatal("live retention overrode time/taper-only solar admission before the charge deadline")
-	}
-	if s.solarEconomicalForReservationLocked(cycle.ChargeWindow.End, reservation) {
-		t.Fatal("retained cycle ceiling was not enforced after the charge deadline with no known tariff")
 	}
 }
 
@@ -608,28 +446,6 @@ func TestReservationDoesNotExtendSingleReservedSlice(t *testing.T) {
 	}
 	if !reservation.Windows[0].End.Equal(now.Add(3 * time.Minute)) {
 		t.Errorf("window end = %s, want the truncated %s", reservation.Windows[0].End, now.Add(3*time.Minute))
-	}
-}
-
-func TestSolarAdmittedWhenExportPriceIsBelowMarginalReservedImportPrice(t *testing.T) {
-	s, now := reservationFixture()
-	// Symmetric baseline: a 30ct surplus loses to 5/10ct reserved grid energy.
-	if solarEconomicalAt(s, now, 50) {
-		t.Fatal("symmetric 30ct solar should not displace cheaper reserved grid energy")
-	}
-
-	// Asymmetric export: the surplus is only worth 5ct if exported, at or below
-	// the cheapest reserved slice, while importing it still costs 30ct.
-	s.todayPrices[0].ExportValue = .05
-	s.todayPrices[0].HasExportValue = true
-	if !solarEconomicalAt(s, now, 50) {
-		t.Fatal("solar worth only its export value should displace equally priced reserved grid energy")
-	}
-
-	// Above the marginal reserved price it is rejected again.
-	s.todayPrices[0].ExportValue = .11
-	if solarEconomicalAt(s, now, 50) {
-		t.Fatal("export value above every reserved slice price should reject solar")
 	}
 }
 

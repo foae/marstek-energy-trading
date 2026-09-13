@@ -22,21 +22,31 @@ const (
 	ActionSolarCharge TradeAction = "solar_charge"
 )
 
+// ChargeSourceAttribution identifies how a scheduled charge's source was measured.
+// Empty is the historical all-grid interpretation.
+type ChargeSourceAttribution string
+
+const (
+	ChargeSourceMeasuredP1Split ChargeSourceAttribution = "measured_p1_split"
+)
+
 // Trade represents a single trade record.
 type Trade struct {
-	Timestamp          time.Time       `json:"timestamp"`
-	Action             TradeAction     `json:"action"`
-	PriceEUR           decimal.Decimal `json:"price_eur"`            // EUR/kWh
-	PowerW             int             `json:"power_w"`              // Watts
-	DurationS          int             `json:"duration_s"`           // Seconds
-	EnergyKWh          decimal.Decimal `json:"energy_kwh"`           // kWh battery input/output
-	GridEnergyKWh      decimal.Decimal `json:"grid_energy_kwh"`      // Grid portion of a solar charge
-	GridCostEUR        decimal.Decimal `json:"grid_cost_eur"`        // Interval-priced grid cost of a solar charge
-	GridUnpricedKWh    decimal.Decimal `json:"grid_unpriced_kwh"`    // Grid portion without an available price
-	StartSOC           int             `json:"start_soc"`            // SOC at start
-	EndSOC             int             `json:"end_soc"`              // SOC at end
-	UnpricedKWh        decimal.Decimal `json:"unpriced_kwh"`         // Battery energy without an interval price
-	OpportunityCostEUR decimal.Decimal `json:"opportunity_cost_eur"` // Estimated value of solar energy not exported
+	Timestamp               time.Time               `json:"timestamp"`
+	Action                  TradeAction             `json:"action"`
+	PriceEUR                decimal.Decimal         `json:"price_eur"`               // EUR/kWh
+	PowerW                  int                     `json:"power_w"`                 // Watts
+	DurationS               int                     `json:"duration_s"`              // Seconds
+	EnergyKWh               decimal.Decimal         `json:"energy_kwh"`              // kWh battery input/output
+	GridEnergyKWh           decimal.Decimal         `json:"grid_energy_kwh"`         // Measured grid portion of a source-split charge
+	GridCostEUR             decimal.Decimal         `json:"grid_cost_eur"`           // Interval-priced measured grid cost
+	GridUnpricedKWh         decimal.Decimal         `json:"grid_unpriced_kwh"`       // Measured grid portion without an available price
+	UnattributedEnergyKWh   decimal.Decimal         `json:"unattributed_energy_kwh"` // Charge energy before the first usable P1 observation
+	StartSOC                int                     `json:"start_soc"`               // SOC at start
+	EndSOC                  int                     `json:"end_soc"`                 // SOC at end
+	UnpricedKWh             decimal.Decimal         `json:"unpriced_kwh"`            // Battery energy without an interval price
+	OpportunityCostEUR      decimal.Decimal         `json:"opportunity_cost_eur"`    // Estimated value of solar energy not exported
+	ChargeSourceAttribution ChargeSourceAttribution `json:"charge_source_attribution,omitempty"`
 	// EnergyBasis records how EnergyKWh was estimated: "measured_ac_power" for
 	// current records, "measured_battery_power" for historical DC-based records,
 	// blank for historic trades written before the field existed.
@@ -44,48 +54,57 @@ type Trade struct {
 	DayAllocations []TradeDayAllocation `json:"day_allocations,omitempty"`
 }
 
+func (t Trade) hasMeasuredP1SourceSplit() bool {
+	return t.Action == ActionCharge && t.ChargeSourceAttribution == ChargeSourceMeasuredP1Split
+}
+
 // TradeDayAllocation preserves exact accounting when a session crosses a local day boundary.
 type TradeDayAllocation struct {
-	Timestamp          time.Time       `json:"timestamp"`
-	DurationS          int             `json:"duration_s"`
-	EnergyKWh          decimal.Decimal `json:"energy_kwh"`
-	GridEnergyKWh      decimal.Decimal `json:"grid_energy_kwh"`
-	GridCostEUR        decimal.Decimal `json:"grid_cost_eur"`
-	GridUnpricedKWh    decimal.Decimal `json:"grid_unpriced_kwh"`
-	UnpricedKWh        decimal.Decimal `json:"unpriced_kwh"`
-	OpportunityCostEUR decimal.Decimal `json:"opportunity_cost_eur"`
-	PricedValueEUR     decimal.Decimal `json:"priced_value_eur"`
+	Timestamp             time.Time       `json:"timestamp"`
+	DurationS             int             `json:"duration_s"`
+	EnergyKWh             decimal.Decimal `json:"energy_kwh"`
+	GridEnergyKWh         decimal.Decimal `json:"grid_energy_kwh"`
+	GridCostEUR           decimal.Decimal `json:"grid_cost_eur"`
+	GridUnpricedKWh       decimal.Decimal `json:"grid_unpriced_kwh"`
+	UnattributedEnergyKWh decimal.Decimal `json:"unattributed_energy_kwh"`
+	UnpricedKWh           decimal.Decimal `json:"unpriced_kwh"`
+	OpportunityCostEUR    decimal.Decimal `json:"opportunity_cost_eur"`
+	PricedValueEUR        decimal.Decimal `json:"priced_value_eur"`
 }
 
 // DailySummary contains the daily trading summary.
 type DailySummary struct {
-	Date                    string          `json:"date"`
-	ChargedKWh              decimal.Decimal `json:"charged_kwh"`
-	DischargedKWh           decimal.Decimal `json:"discharged_kwh"`
-	ChargeCycles            int             `json:"charge_cycles"`
-	DischargeCycles         int             `json:"discharge_cycles"`
-	SolarChargedKWh         decimal.Decimal `json:"solar_charged_kwh"`
-	GridChargedKWh          decimal.Decimal `json:"grid_charged_kwh"`
-	UnpricedGridKWh         decimal.Decimal `json:"unpriced_grid_kwh"`
-	UnpricedKWh             decimal.Decimal `json:"unpriced_kwh"`
-	CashFlowUnpricedKWh     decimal.Decimal `json:"cash_flow_unpriced_kwh"`
-	SolarChargeCycles       int             `json:"solar_charge_cycles"`
-	SolarOpportunityCostEUR decimal.Decimal `json:"solar_opportunity_cost_eur"`
-	PnLEUR                  decimal.Decimal `json:"pnl_eur"` // Cash flow, not inventory-matched trading profit
-	AvgChargePrice          decimal.Decimal `json:"avg_charge_price"`
-	MinChargePrice          decimal.Decimal `json:"min_charge_price"`
-	AvgDischargePrice       decimal.Decimal `json:"avg_discharge_price"`
-	MaxDischargePrice       decimal.Decimal `json:"max_discharge_price"`
-	Trades                  []Trade         `json:"trades"`
+	Date                      string          `json:"date"`
+	ChargedKWh                decimal.Decimal `json:"charged_kwh"`
+	DischargedKWh             decimal.Decimal `json:"discharged_kwh"`
+	ChargeCycles              int             `json:"charge_cycles"`
+	DischargeCycles           int             `json:"discharge_cycles"`
+	SolarChargedKWh           decimal.Decimal `json:"solar_charged_kwh"`
+	GridChargedKWh            decimal.Decimal `json:"grid_charged_kwh"`
+	UnpricedGridKWh           decimal.Decimal `json:"unpriced_grid_kwh"`
+	UnpricedKWh               decimal.Decimal `json:"unpriced_kwh"`
+	CashFlowUnpricedKWh       decimal.Decimal `json:"cash_flow_unpriced_kwh"`
+	UnattributedChargeKWh     decimal.Decimal `json:"unattributed_charge_kwh"`
+	SolarChargeCycles         int             `json:"solar_charge_cycles"`
+	SolarOpportunityCostEUR   decimal.Decimal `json:"solar_opportunity_cost_eur"`
+	OpportunityAdjustedPnLEUR decimal.Decimal `json:"opportunity_adjusted_pnl_eur"`
+	PnLEUR                    decimal.Decimal `json:"pnl_eur"` // Cash flow, not inventory-matched trading profit
+	AvgChargePrice            decimal.Decimal `json:"avg_charge_price"`
+	MinChargePrice            decimal.Decimal `json:"min_charge_price"`
+	AvgDischargePrice         decimal.Decimal `json:"avg_discharge_price"`
+	MaxDischargePrice         decimal.Decimal `json:"max_discharge_price"`
+	Trades                    []Trade         `json:"trades"`
 }
 
 // History contains the full trading history.
 type History struct {
-	Days       []DailySummary  `json:"days"`
-	TotalPnL   decimal.Decimal `json:"total_pnl_eur"`
-	TotalDays  int             `json:"total_days"`
-	FirstTrade *time.Time      `json:"first_trade,omitempty"`
-	LastTrade  *time.Time      `json:"last_trade,omitempty"`
+	Days                           []DailySummary  `json:"days"`
+	TotalPnL                       decimal.Decimal `json:"total_pnl_eur"`
+	TotalOpportunityAdjustedPnLEUR decimal.Decimal `json:"total_opportunity_adjusted_pnl_eur"`
+	TotalUnattributedChargeKWh     decimal.Decimal `json:"total_unattributed_charge_kwh"`
+	TotalDays                      int             `json:"total_days"`
+	FirstTrade                     *time.Time      `json:"first_trade,omitempty"`
+	LastTrade                      *time.Time      `json:"last_trade,omitempty"`
 }
 
 // Recorder records trades and calculates P&L.
@@ -148,7 +167,7 @@ func validateTradeDayAllocations(trade Trade) error {
 	tradeEnd := trade.Timestamp.Add(time.Duration(trade.DurationS) * time.Second)
 	totalDurationS := 0
 	var previousAllocationEnd time.Time
-	var energy, gridEnergy, gridCost, gridUnpriced, unpriced, opportunityCost, pricedValue decimal.Decimal
+	var energy, gridEnergy, gridCost, gridUnpriced, unattributed, unpriced, opportunityCost, pricedValue decimal.Decimal
 	for i, allocation := range trade.DayAllocations {
 		if allocation.Timestamp.IsZero() || (i > 0 && !allocation.Timestamp.After(trade.DayAllocations[i-1].Timestamp)) {
 			return fmt.Errorf("trade day allocations are not strictly chronological")
@@ -164,16 +183,19 @@ func validateTradeDayAllocations(trade Trade) error {
 		totalDurationS += allocation.DurationS
 		for name, value := range map[string]decimal.Decimal{
 			"energy": allocation.EnergyKWh, "grid energy": allocation.GridEnergyKWh,
-			"unpriced grid energy": allocation.GridUnpricedKWh, "unpriced energy": allocation.UnpricedKWh,
+			"unpriced grid energy": allocation.GridUnpricedKWh, "unattributed energy": allocation.UnattributedEnergyKWh,
+			"unpriced energy": allocation.UnpricedKWh,
 		} {
 			if value.IsNegative() {
 				return fmt.Errorf("trade day allocation has negative %s", name)
 			}
 		}
 		energyComponentsInvalid := allocation.GridEnergyKWh.GreaterThan(allocation.EnergyKWh) ||
-			allocation.GridUnpricedKWh.GreaterThan(allocation.GridEnergyKWh) || allocation.UnpricedKWh.GreaterThan(allocation.EnergyKWh)
-		if trade.Action == ActionSolarCharge {
-			energyComponentsInvalid = energyComponentsInvalid || allocation.UnpricedKWh.GreaterThan(allocation.EnergyKWh.Sub(allocation.GridEnergyKWh))
+			allocation.GridUnpricedKWh.GreaterThan(allocation.GridEnergyKWh) ||
+			allocation.UnattributedEnergyKWh.GreaterThan(allocation.EnergyKWh.Sub(allocation.GridEnergyKWh)) ||
+			allocation.UnpricedKWh.GreaterThan(allocation.EnergyKWh)
+		if trade.Action == ActionSolarCharge || trade.hasMeasuredP1SourceSplit() {
+			energyComponentsInvalid = energyComponentsInvalid || allocation.UnpricedKWh.GreaterThan(allocation.EnergyKWh.Sub(allocation.GridEnergyKWh).Sub(allocation.UnattributedEnergyKWh))
 		}
 		if energyComponentsInvalid {
 			return fmt.Errorf("trade day allocation energy components are inconsistent")
@@ -182,6 +204,7 @@ func validateTradeDayAllocations(trade Trade) error {
 		gridEnergy = gridEnergy.Add(allocation.GridEnergyKWh)
 		gridCost = gridCost.Add(allocation.GridCostEUR)
 		gridUnpriced = gridUnpriced.Add(allocation.GridUnpricedKWh)
+		unattributed = unattributed.Add(allocation.UnattributedEnergyKWh)
 		unpriced = unpriced.Add(allocation.UnpricedKWh)
 		opportunityCost = opportunityCost.Add(allocation.OpportunityCostEUR)
 		pricedValue = pricedValue.Add(allocation.PricedValueEUR)
@@ -194,10 +217,15 @@ func validateTradeDayAllocations(trade Trade) error {
 	}
 	if !closeEnough(energy, trade.EnergyKWh) || !closeEnough(gridEnergy, trade.GridEnergyKWh) ||
 		!closeEnough(gridCost, trade.GridCostEUR) || !closeEnough(gridUnpriced, trade.GridUnpricedKWh) ||
-		!closeEnough(unpriced, trade.UnpricedKWh) || !closeEnough(opportunityCost, trade.OpportunityCostEUR) {
+		!closeEnough(unattributed, trade.UnattributedEnergyKWh) || !closeEnough(unpriced, trade.UnpricedKWh) ||
+		!closeEnough(opportunityCost, trade.OpportunityCostEUR) {
 		return fmt.Errorf("trade day allocations do not match aggregate accounting")
 	}
-	if trade.Action != ActionSolarCharge {
+	if trade.hasMeasuredP1SourceSplit() {
+		if !closeEnough(pricedValue, trade.GridCostEUR) {
+			return fmt.Errorf("split scheduled charge day allocation priced value does not match grid cost")
+		}
+	} else if trade.Action != ActionSolarCharge {
 		expectedValue := trade.PriceEUR.Mul(trade.EnergyKWh.Sub(trade.UnpricedKWh))
 		if !closeEnough(pricedValue, expectedValue) {
 			return fmt.Errorf("trade day allocation priced value does not match aggregate accounting")
@@ -259,6 +287,8 @@ func (r *Recorder) GetHistory() History {
 
 	var days []DailySummary
 	totalPnL := decimal.Zero
+	totalOpportunityAdjustedPnL := decimal.Zero
+	totalUnattributedChargeKWh := decimal.Zero
 
 	for i := len(dayKeys) - 1; i >= 0; i-- {
 		dayKey := dayKeys[i]
@@ -273,6 +303,7 @@ func (r *Recorder) GetHistory() History {
 		unpricedGridKWh := decimal.Zero
 		unpricedKWh := decimal.Zero
 		cashFlowUnpricedKWh := decimal.Zero
+		unattributedChargeKWh := decimal.Zero
 		solarOpportunityCostEUR := decimal.Zero
 		pricedChargeKWh := decimal.Zero
 		pricedDischargeKWh := decimal.Zero
@@ -288,17 +319,38 @@ func (r *Recorder) GetHistory() History {
 
 			switch t.Action {
 			case ActionCharge:
-				pricedEnergyKWh := t.EnergyKWh.Sub(t.UnpricedKWh)
-				chargedKWh = chargedKWh.Add(t.EnergyKWh)
-				gridChargedKWh = gridChargedKWh.Add(t.EnergyKWh)
-				unpricedKWh = unpricedKWh.Add(t.UnpricedKWh)
-				cashFlowUnpricedKWh = cashFlowUnpricedKWh.Add(t.UnpricedKWh)
-				chargeCost = chargeCost.Add(t.PriceEUR.Mul(pricedEnergyKWh))
-				pricedChargeKWh = pricedChargeKWh.Add(pricedEnergyKWh)
-				if pricedEnergyKWh.GreaterThan(decimal.Zero) {
-					if !seenCharge || t.PriceEUR.LessThan(minChargePrice) {
-						minChargePrice = t.PriceEUR
-						seenCharge = true
+				if t.hasMeasuredP1SourceSplit() {
+					pricedGridKWh := t.GridEnergyKWh.Sub(t.GridUnpricedKWh)
+					chargedKWh = chargedKWh.Add(t.EnergyKWh)
+					solarChargedKWh = solarChargedKWh.Add(t.EnergyKWh.Sub(t.GridEnergyKWh).Sub(t.UnattributedEnergyKWh))
+					gridChargedKWh = gridChargedKWh.Add(t.GridEnergyKWh)
+					unpricedGridKWh = unpricedGridKWh.Add(t.GridUnpricedKWh)
+					unpricedKWh = unpricedKWh.Add(t.UnpricedKWh).Add(t.GridUnpricedKWh)
+					cashFlowUnpricedKWh = cashFlowUnpricedKWh.Add(t.GridUnpricedKWh)
+					unattributedChargeKWh = unattributedChargeKWh.Add(t.UnattributedEnergyKWh)
+					solarOpportunityCostEUR = solarOpportunityCostEUR.Add(t.OpportunityCostEUR)
+					chargeCost = chargeCost.Add(t.GridCostEUR)
+					pricedChargeKWh = pricedChargeKWh.Add(pricedGridKWh)
+					if pricedGridKWh.IsPositive() {
+						gridPrice := t.GridCostEUR.Div(pricedGridKWh)
+						if !seenCharge || gridPrice.LessThan(minChargePrice) {
+							minChargePrice = gridPrice
+							seenCharge = true
+						}
+					}
+				} else {
+					pricedEnergyKWh := t.EnergyKWh.Sub(t.UnpricedKWh)
+					chargedKWh = chargedKWh.Add(t.EnergyKWh)
+					gridChargedKWh = gridChargedKWh.Add(t.EnergyKWh)
+					unpricedKWh = unpricedKWh.Add(t.UnpricedKWh)
+					cashFlowUnpricedKWh = cashFlowUnpricedKWh.Add(t.UnpricedKWh)
+					chargeCost = chargeCost.Add(t.PriceEUR.Mul(pricedEnergyKWh))
+					pricedChargeKWh = pricedChargeKWh.Add(pricedEnergyKWh)
+					if pricedEnergyKWh.GreaterThan(decimal.Zero) {
+						if !seenCharge || t.PriceEUR.LessThan(minChargePrice) {
+							minChargePrice = t.PriceEUR
+							seenCharge = true
+						}
 					}
 				}
 				if fragment.startsTrade {
@@ -354,36 +406,43 @@ func (r *Recorder) GetHistory() History {
 		}
 
 		pnl := dischargeRevenue.Sub(chargeCost)
+		opportunityAdjustedPnL := pnl.Sub(solarOpportunityCostEUR)
 		totalPnL = totalPnL.Add(pnl)
+		totalOpportunityAdjustedPnL = totalOpportunityAdjustedPnL.Add(opportunityAdjustedPnL)
+		totalUnattributedChargeKWh = totalUnattributedChargeKWh.Add(unattributedChargeKWh)
 
 		days = append(days, DailySummary{
-			Date:                    dayKey,
-			ChargedKWh:              chargedKWh,
-			DischargedKWh:           dischargedKWh,
-			ChargeCycles:            chargeCycles,
-			DischargeCycles:         dischargeCycles,
-			SolarChargedKWh:         solarChargedKWh,
-			GridChargedKWh:          gridChargedKWh,
-			UnpricedGridKWh:         unpricedGridKWh,
-			UnpricedKWh:             unpricedKWh,
-			CashFlowUnpricedKWh:     cashFlowUnpricedKWh,
-			SolarChargeCycles:       solarChargeCycles,
-			SolarOpportunityCostEUR: solarOpportunityCostEUR,
-			PnLEUR:                  pnl,
-			AvgChargePrice:          avgChargePrice,
-			MinChargePrice:          minChargePrice,
-			AvgDischargePrice:       avgDischargePrice,
-			MaxDischargePrice:       maxDischargePrice,
-			Trades:                  trades,
+			Date:                      dayKey,
+			ChargedKWh:                chargedKWh,
+			DischargedKWh:             dischargedKWh,
+			ChargeCycles:              chargeCycles,
+			DischargeCycles:           dischargeCycles,
+			SolarChargedKWh:           solarChargedKWh,
+			GridChargedKWh:            gridChargedKWh,
+			UnpricedGridKWh:           unpricedGridKWh,
+			UnpricedKWh:               unpricedKWh,
+			CashFlowUnpricedKWh:       cashFlowUnpricedKWh,
+			UnattributedChargeKWh:     unattributedChargeKWh,
+			SolarChargeCycles:         solarChargeCycles,
+			SolarOpportunityCostEUR:   solarOpportunityCostEUR,
+			OpportunityAdjustedPnLEUR: opportunityAdjustedPnL,
+			PnLEUR:                    pnl,
+			AvgChargePrice:            avgChargePrice,
+			MinChargePrice:            minChargePrice,
+			AvgDischargePrice:         avgDischargePrice,
+			MaxDischargePrice:         maxDischargePrice,
+			Trades:                    trades,
 		})
 	}
 
 	return History{
-		Days:       days,
-		TotalPnL:   totalPnL,
-		TotalDays:  len(days),
-		FirstTrade: &firstTrade,
-		LastTrade:  &lastTrade,
+		Days:                           days,
+		TotalPnL:                       totalPnL,
+		TotalOpportunityAdjustedPnLEUR: totalOpportunityAdjustedPnL,
+		TotalUnattributedChargeKWh:     totalUnattributedChargeKWh,
+		TotalDays:                      len(days),
+		FirstTrade:                     &firstTrade,
+		LastTrade:                      &lastTrade,
 	}
 }
 
@@ -407,11 +466,19 @@ func splitTradeByLocalDay(trade Trade, loc *time.Location) []tradeFragment {
 			fragment.GridEnergyKWh = allocation.GridEnergyKWh
 			fragment.GridCostEUR = allocation.GridCostEUR
 			fragment.GridUnpricedKWh = allocation.GridUnpricedKWh
+			fragment.UnattributedEnergyKWh = allocation.UnattributedEnergyKWh
 			fragment.UnpricedKWh = allocation.UnpricedKWh
 			fragment.OpportunityCostEUR = allocation.OpportunityCostEUR
 			fragment.DayAllocations = nil
 			pricedEnergyKWh := allocation.EnergyKWh.Sub(allocation.UnpricedKWh)
-			if trade.Action != ActionSolarCharge && pricedEnergyKWh.IsPositive() {
+			if trade.hasMeasuredP1SourceSplit() {
+				pricedEnergyKWh = allocation.GridEnergyKWh.Sub(allocation.GridUnpricedKWh)
+				if pricedEnergyKWh.IsPositive() {
+					fragment.PriceEUR = allocation.PricedValueEUR.Div(pricedEnergyKWh)
+				} else {
+					fragment.PriceEUR = decimal.Zero
+				}
+			} else if trade.Action != ActionSolarCharge && pricedEnergyKWh.IsPositive() {
 				fragment.PriceEUR = allocation.PricedValueEUR.Div(pricedEnergyKWh)
 			} else if trade.Action != ActionSolarCharge {
 				fragment.PriceEUR = decimal.Zero
@@ -436,6 +503,7 @@ func splitTradeByLocalDay(trade Trade, loc *time.Location) []tradeFragment {
 	allocatedGridEnergyKWh := decimal.Zero
 	allocatedGridCostEUR := decimal.Zero
 	allocatedGridUnpricedKWh := decimal.Zero
+	allocatedUnattributedEnergyKWh := decimal.Zero
 	allocatedUnpricedKWh := decimal.Zero
 	allocatedOpportunityCostEUR := decimal.Zero
 	fragments := make([]tradeFragment, 0, 2)
@@ -463,6 +531,7 @@ func splitTradeByLocalDay(trade Trade, loc *time.Location) []tradeFragment {
 			fragment.GridEnergyKWh = trade.GridEnergyKWh.Sub(allocatedGridEnergyKWh)
 			fragment.GridCostEUR = trade.GridCostEUR.Sub(allocatedGridCostEUR)
 			fragment.GridUnpricedKWh = trade.GridUnpricedKWh.Sub(allocatedGridUnpricedKWh)
+			fragment.UnattributedEnergyKWh = trade.UnattributedEnergyKWh.Sub(allocatedUnattributedEnergyKWh)
 			fragment.UnpricedKWh = trade.UnpricedKWh.Sub(allocatedUnpricedKWh)
 			fragment.OpportunityCostEUR = trade.OpportunityCostEUR.Sub(allocatedOpportunityCostEUR)
 		} else {
@@ -470,12 +539,14 @@ func splitTradeByLocalDay(trade Trade, loc *time.Location) []tradeFragment {
 			fragment.GridEnergyKWh = trade.GridEnergyKWh.Mul(portion)
 			fragment.GridCostEUR = trade.GridCostEUR.Mul(portion)
 			fragment.GridUnpricedKWh = trade.GridUnpricedKWh.Mul(portion)
+			fragment.UnattributedEnergyKWh = trade.UnattributedEnergyKWh.Mul(portion)
 			fragment.UnpricedKWh = trade.UnpricedKWh.Mul(portion)
 			fragment.OpportunityCostEUR = trade.OpportunityCostEUR.Mul(portion)
 			allocatedEnergyKWh = allocatedEnergyKWh.Add(fragment.EnergyKWh)
 			allocatedGridEnergyKWh = allocatedGridEnergyKWh.Add(fragment.GridEnergyKWh)
 			allocatedGridCostEUR = allocatedGridCostEUR.Add(fragment.GridCostEUR)
 			allocatedGridUnpricedKWh = allocatedGridUnpricedKWh.Add(fragment.GridUnpricedKWh)
+			allocatedUnattributedEnergyKWh = allocatedUnattributedEnergyKWh.Add(fragment.UnattributedEnergyKWh)
 			allocatedUnpricedKWh = allocatedUnpricedKWh.Add(fragment.UnpricedKWh)
 			allocatedOpportunityCostEUR = allocatedOpportunityCostEUR.Add(fragment.OpportunityCostEUR)
 		}
@@ -516,7 +587,11 @@ func (r *Recorder) GetTotalPnL() decimal.Decimal {
 	for _, t := range r.trades {
 		switch t.Action {
 		case ActionCharge:
-			totalCost = totalCost.Add(t.PriceEUR.Mul(t.EnergyKWh.Sub(t.UnpricedKWh)))
+			if t.hasMeasuredP1SourceSplit() {
+				totalCost = totalCost.Add(t.GridCostEUR)
+			} else {
+				totalCost = totalCost.Add(t.PriceEUR.Mul(t.EnergyKWh.Sub(t.UnpricedKWh)))
+			}
 		case ActionSolarCharge:
 			totalCost = totalCost.Add(t.GridCostEUR)
 		case ActionDischarge:

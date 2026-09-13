@@ -21,7 +21,7 @@ All settings are environment variables, typically provided through a `.env` file
 | `BATTERY_CHARGE_EFFICIENCY` | `0.95` | Charging (AC input to stored) efficiency in `(0, 1]`, at least `BATTERY_EFFICIENCY`; the discharge efficiency is `BATTERY_EFFICIENCY / BATTERY_CHARGE_EFFICIENCY` |
 | `BATTERY_CAPACITY_KWH` | `5.12` | Nominal battery capacity |
 | `BATTERY_MIN_SOC` | `0.11` | Minimum SOC fraction |
-| `MAX_CYCLES_PER_DAY` | `2` | Maximum new cycles selected over the loaded planning horizon; stored-energy discharge recovery does not consume this allowance |
+| `MAX_CYCLES_PER_DAY` | `2` | Maximum new grid cycles selected over the loaded planning horizon; an inventory-only sale is exempt from this allowance |
 | `ESPHOME_URL` | required | Absolute URL of the ESPHome bridge |
 | `ESPHOME_RESTART_BUTTON` | empty | Optional restart-button name exposed by ESPHome |
 | `CHARGE_POWER_W` | `2500` | Charge target, 75-2500 W |
@@ -46,3 +46,5 @@ The default tax, VAT, fee, area, timezone, battery capacity, and efficiency valu
 
 Despite the environment variable's historical name, `MIN_PRICE_SPREAD` is an efficiency-adjusted expected-profit threshold in EUR/kWh, not a raw price-spread threshold. See [Methodology](methodology.md) for how it is applied.
 Setting it to zero still rejects exact break-even cycles because expected profit must be strictly positive.
+
+`MIN_PRICE_SPREAD` applies to grid purchases, not to qualified solar capture or an inventory-only sale. The latter needs a known positive export price but has no arbitrary wear-cost floor. The planner does not forecast solar or tariffs beyond its known horizon.

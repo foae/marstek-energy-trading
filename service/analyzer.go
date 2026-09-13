@@ -49,6 +49,10 @@ type TradeCycle struct {
 	ChargeWindow    TimeWindow
 	DischargeWindow TimeWindow
 	Profit          decimal.Decimal // Expected profit per kWh (accounting for efficiency)
+	// ExportPriceMode records the export tariff mode the persisted windows were
+	// priced under. Empty means symmetric, so pre-existing commitments written
+	// before the mode existed restore unchanged.
+	ExportPriceMode string `json:"export_price_mode,omitempty"`
 }
 
 // TradingPlan contains the charge and discharge windows for a day.
@@ -124,11 +128,11 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 	// discharging delivers less than it. Round-trip = charge * discharge, so the
 	// discharge side is Efficiency / ChargeEfficiency.
 	chargeEff := cfg.ChargeEfficiency
-	if chargeEff <= 0 || chargeEff > 1 {
+	if !(chargeEff > 0 && chargeEff <= 1) {
 		chargeEff = 1
 	}
 	roundTrip := cfg.Efficiency
-	if roundTrip <= 0 || roundTrip > 1 {
+	if !(roundTrip > 0 && roundTrip <= 1) {
 		roundTrip = 1
 	}
 	chargeWindowSize := calculateWindowSize(usableCapacity/chargeEff, cfg.ChargePowerW)

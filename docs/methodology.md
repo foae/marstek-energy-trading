@@ -57,7 +57,7 @@ Failed reads, detected stale telemetry, gaps longer than 30 seconds, skipped SOC
 Solar charging is enabled only when `HOMEWIZARD_P1_URL` is an explicit meter URL or `auto`.
 
 - A session starts after 30 seconds of sustained raw surplus above `SOLAR_MIN_SURPLUS_W`.
-- During charging, effective surplus compensates for the AC-coupled feedback loop: `measured surplus + measured battery charge power`.
+- During charging, effective surplus compensates for the AC-coupled feedback loop: `measured surplus + measured AC charge power`, the draw the P1 meter actually sees.
 - An elapsed-time EMA smooths the target, with a five-second settling period after power changes.
 - Surplus below `max(75 W, SOLAR_MIN_SURPLUS_W / 4)` enters a 60-second grace period at 75 W before stopping.
 - Adaptive cooldowns reduce short-session cycling.

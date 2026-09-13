@@ -515,3 +515,33 @@ func TestLoad_RejectsInvalidSafetyValues(t *testing.T) {
 		})
 	}
 }
+
+func TestValidate_ExportFeeBounds(t *testing.T) {
+	for _, fee := range []string{"-1", "0", "1", "0.25"} {
+		cfg := validConfig()
+		cfg.ExportPriceMode = "wholesale"
+		cfg.ExportFeeEURPerKWh = decimal.RequireFromString(fee)
+		if err := cfg.validate(); err != nil {
+			t.Errorf("EXPORT_FEE_EUR_PER_KWH %s: unexpected error: %v", fee, err)
+		}
+	}
+	for _, fee := range []string{"-1.01", "1.01", "12"} {
+		cfg := validConfig()
+		cfg.ExportPriceMode = "wholesale"
+		cfg.ExportFeeEURPerKWh = decimal.RequireFromString(fee)
+		if err := cfg.validate(); err == nil {
+			t.Errorf("EXPORT_FEE_EUR_PER_KWH %s: validate() error = nil, want rejection", fee)
+		}
+	}
+}
+
+func TestLoad_DefaultChargeEfficiency(t *testing.T) {
+	t.Setenv("ESPHOME_URL", "http://localhost:8080")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.BatteryChargeEfficiency != 0.95 {
+		t.Errorf("BATTERY_CHARGE_EFFICIENCY default = %v, want 0.95", cfg.BatteryChargeEfficiency)
+	}
+}

@@ -632,3 +632,89 @@ func TestSolarAdmittedWhenExportPriceIsBelowMarginalReservedImportPrice(t *testi
 		t.Fatal("export value above every reserved slice price should reject solar")
 	}
 }
+
+// continuationFixtureAt mirrors continuationFixture but places "now" at an
+// arbitrary offset inside the first slot, so the energy left in the running
+// slice can be chosen exactly.
+func continuationFixtureAt(state State, prices []float64, offset time.Duration) (*Service, time.Time) {
+	s, _ := continuationFixture(state, prices)
+	slotStart := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+	now := slotStart.Add(offset)
+	s.nowFunc = func() time.Time { return now }
+	return s, now
+}
+
+func TestReservationReAddsRunningSliceEjectedByRisingSOC(t *testing.T) {
+	// The two cheaper slices alone cover the 0.5 kWh requirement, so the running
+	// slice is no longer selected at all. Re-adding it costs 0.09 EUR/kWh on
+	// 0.1 kWh = 0.009 EUR, under the one-cent tolerance.
+	s, now := continuationFixtureAt(StateCharging, []float64{.19, .10, .10}, 9*time.Minute)
+	s.cfg.BatteryCapacityKWh = 1
+	slotEnd := now.Add(6 * time.Minute)
+
+	reservation := s.chargeReservationLocked(now, 50)
+
+	if math.Abs(reservation.RequiredKWh-0.5) > 0.000001 {
+		t.Fatalf("fixture sanity: RequiredKWh = %f, want 0.5", reservation.RequiredKWh)
+	}
+	if !reservation.contains(now) {
+		t.Fatalf("running slice was not re-added to the reservation: %+v", reservation.Windows)
+	}
+	running := reservation.Windows[0]
+	if !running.Start.Equal(now) || !running.End.Equal(slotEnd) {
+		t.Errorf("running window = %s-%s, want %s-%s", running.Start, running.End, now, slotEnd)
+	}
+	if math.Abs(reservation.ReservedKWh-0.5) > 0.000001 {
+		t.Errorf("ReservedKWh = %f, want 0.5", reservation.ReservedKWh)
+	}
+}
+
+func TestReservationDoesNotReAddEjectedRunningSliceAboveTolerance(t *testing.T) {
+	// Same ejection, but the price gap makes continuation cost 0.015 EUR.
+	s, now := continuationFixtureAt(StateCharging, []float64{.25, .10, .10}, 9*time.Minute)
+	s.cfg.BatteryCapacityKWh = 1
+
+	reservation := s.chargeReservationLocked(now, 50)
+
+	if reservation.contains(now) {
+		t.Fatalf("expensive running slice was re-added anyway: %+v", reservation.Windows)
+	}
+	if math.Abs(reservation.ReservedKWh-0.5) > 0.000001 {
+		t.Errorf("ReservedKWh = %f, want 0.5", reservation.ReservedKWh)
+	}
+}
+
+func TestReservationRejectsContinuationCostingExactlyOneCent(t *testing.T) {
+	// 0.10 EUR/kWh on 0.1 kWh is exactly one cent: the tolerance is "under a
+	// cent", so the running slice stays out.
+	s, now := continuationFixtureAt(StateCharging, []float64{.20, .10, .10}, 9*time.Minute)
+	s.cfg.BatteryCapacityKWh = 1
+
+	reservation := s.chargeReservationLocked(now, 50)
+
+	if reservation.contains(now) {
+		t.Fatalf("continuation costing exactly one cent was accepted: %+v", reservation.Windows)
+	}
+}
+
+func TestReservationKeepsTruncationWhenCheaperSlicesCannotAbsorbExtension(t *testing.T) {
+	// The only cheaper reserved slice holds 0.1 kWh but the extension needs
+	// 0.2333 kWh. Extending anyway would reserve more than the requirement.
+	s, now := continuationFixture(StateCharging, []float64{.13, .12})
+	slotStart := now.Add(-5 * time.Minute)
+	s.currentPlan.Cycles[0].ChargeWindow.End = slotStart.Add(21 * time.Minute)
+	s.cfg.BatteryCapacityKWh = 0.3
+
+	reservation := s.chargeReservationLocked(now, 50)
+
+	if math.Abs(reservation.RequiredKWh-0.15) > 0.000001 {
+		t.Fatalf("fixture sanity: RequiredKWh = %f, want 0.15", reservation.RequiredKWh)
+	}
+	running := reservation.Windows[0]
+	if delta := running.End.Sub(now.Add(3 * time.Minute)); delta > time.Second || delta < -time.Second {
+		t.Errorf("running window end = %s, want the truncated %s", running.End, now.Add(3*time.Minute))
+	}
+	if reservation.ReservedKWh > reservation.RequiredKWh+1e-9 {
+		t.Errorf("over-reserved: ReservedKWh = %f, RequiredKWh = %f", reservation.ReservedKWh, reservation.RequiredKWh)
+	}
+}

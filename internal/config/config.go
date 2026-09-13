@@ -127,6 +127,9 @@ func (c *Config) validate() error {
 	if c.ExportPriceMode != "symmetric" && c.ExportPriceMode != "wholesale" {
 		return fmt.Errorf("EXPORT_PRICE_MODE must be one of symmetric, wholesale, got %q", c.ExportPriceMode)
 	}
+	if c.ExportFeeEURPerKWh.LessThan(decimal.NewFromInt(-1)) || c.ExportFeeEURPerKWh.GreaterThan(decimal.NewFromInt(1)) {
+		return fmt.Errorf("EXPORT_FEE_EUR_PER_KWH must be in [-1.0, 1.0], got %s", c.ExportFeeEURPerKWh)
+	}
 	if c.DischargePowerW < MinDischargePowerW || c.DischargePowerW > MaxDischargePowerW {
 		return fmt.Errorf("DISCHARGE_POWER_W must be between %d and %d, got %d", MinDischargePowerW, MaxDischargePowerW, c.DischargePowerW)
 	}

@@ -49,7 +49,7 @@ func (s *Service) chargeReservationLocked(now time.Time, soc int) chargingReserv
 		return chargingReservation{}
 	}
 	chargeEff := s.cfg.BatteryChargeEfficiency
-	if chargeEff <= 0 || chargeEff > 1 {
+	if !(chargeEff > 0 && chargeEff <= 1) {
 		chargeEff = 1
 	}
 	result.RequiredKWh = s.cfg.BatteryCapacityKWh * float64(100-soc) / 100 / chargeEff
@@ -128,28 +128,63 @@ func (s *Service) chargeReservationLocked(now time.Time, soc int) chargingReserv
 // of charging and extra Modbus writes.
 const chargeContinuationToleranceEUR = 0.01
 
-// extendRunningReservationSlice keeps a charge session that is running inside the
-// marginal (most expensive selected) reservation slice alive until that slice's
-// tariff boundary, displacing the same energy from the next most expensive
-// selected slices. Falling afternoon prices otherwise re-truncate the running
-// slice on every tick, producing a stop/start pair per slot.
+// extendRunningReservationSlice keeps a charge session that is running inside a
+// reservation slice alive until that slice's tariff boundary, displacing the
+// same energy from the next most expensive selected slices. Falling afternoon
+// prices otherwise re-truncate the running slice on every tick, producing a
+// stop/start pair per slot.
 //
-// windows must be the price-sorted selection; it is mutated in place. Returns
+// The running slice is located anywhere in the full price-sorted slice, not only
+// within the current selection: rising SOC can shrink the requirement until the
+// cheaper future slices cover it alone and the running slice drops out of the
+// selection entirely. In that case it is re-added as the marginal slice with
+// zero energy before the extension is priced, so a still-running charge is never
+// silently stopped mid-slot.
+//
+// windows must be the price-sorted selection; it is mutated in place only once
+// the displacement is known to be both affordable and fully absorbable. Returns
 // the new selected count and whether the displacement was applied.
 func (s *Service) extendRunningReservationSlice(now time.Time, windows []TimeWindow, count int, powerKW float64, deadline time.Time) (int, bool) {
-	if s.state != StateCharging || count < 2 || powerKW <= 0 {
+	if s.state != StateCharging || powerKW <= 0 {
 		return count, false
 	}
-	marginal := &windows[count-1]
+	index := -1
+	for i := range windows {
+		slotStart := windows[i].Start.Truncate(15 * time.Minute)
+		if !now.Before(slotStart) && now.Before(slotStart.Add(15*time.Minute)) {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return count, false
+	}
+	marginal := &windows[index]
 	slotStart := marginal.Start.Truncate(15 * time.Minute)
 	slotEnd := slotStart.Add(15 * time.Minute)
 	if !deadline.IsZero() && slotEnd.After(deadline) {
 		slotEnd = deadline
 	}
-	if now.Before(slotStart) || !now.Before(slotEnd) || !marginal.End.Before(slotEnd) {
+	if now.Before(slotStart) || !now.Before(slotEnd) {
 		return count, false
 	}
-	extraKWh := powerKW * slotEnd.Sub(marginal.End).Hours()
+	// An unselected running slice re-enters the selection with zero energy; a
+	// selected one extends from where the sizing loop truncated it.
+	reAdd := index >= count
+	newCount := count
+	currentEnd := marginal.End
+	if reAdd {
+		newCount = count + 1
+		currentEnd = marginal.Start
+	}
+	// There must be at least one cheaper selected slice to displace energy onto.
+	if newCount < 2 {
+		return count, false
+	}
+	if !currentEnd.Before(slotEnd) {
+		return count, false
+	}
+	extraKWh := powerKW * slotEnd.Sub(currentEnd).Hours()
 	if extraKWh <= 0 {
 		return count, false
 	}
@@ -160,7 +195,7 @@ func (s *Service) extendRunningReservationSlice(now time.Time, windows []TimeWin
 	var displacements []displacement
 	penalty := decimal.Zero
 	remaining := extraKWh
-	for i := count - 2; i >= 0 && remaining > 0; i-- {
+	for i := newCount - 2; i >= 0 && remaining > 0; i-- {
 		available := powerKW * windows[i].End.Sub(windows[i].Start).Hours()
 		take := min(remaining, available)
 		if take <= 0 {
@@ -170,8 +205,20 @@ func (s *Service) extendRunningReservationSlice(now time.Time, windows []TimeWin
 		displacements = append(displacements, displacement{index: i, kWh: take})
 		remaining -= take
 	}
-	if penalty.GreaterThan(decimal.NewFromFloat(chargeContinuationToleranceEUR)) {
+	// Exactly one cent is already too expensive: the tolerance is "under a cent".
+	if !penalty.LessThan(decimal.NewFromFloat(chargeContinuationToleranceEUR)) {
 		return count, false
+	}
+	// The cheaper slices cannot absorb the whole extension; extending anyway would
+	// reserve more energy than the requirement. Keep the truncation instead.
+	if remaining > 1e-9 {
+		return count, false
+	}
+	if reAdd {
+		marginal.End = marginal.Start
+		windows[index], windows[count] = windows[count], windows[index]
+		marginal = &windows[count]
+		count = newCount
 	}
 	marginal.End = slotEnd
 	drop := make(map[int]bool, len(displacements))
@@ -194,7 +241,7 @@ func (s *Service) extendRunningReservationSlice(now time.Time, windows []TimeWin
 		count = kept
 	}
 	slog.Debug("extending running reservation slice to tariff boundary",
-		"slot_end", slotEnd, "penalty_eur", penalty.String())
+		"slot_end", slotEnd, "penalty_eur", penalty.String(), "re_added", reAdd)
 	return count, true
 }
 

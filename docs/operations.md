@@ -7,6 +7,7 @@ Requirements, setup, and day-to-day operation of the service.
 - Go 1.26.6 or newer, or Docker.
 - A Marstek Venus E with a compatible ESPHome HTTP bridge on a trusted local network.
 - ESPHome entities matching the names used in `clients/esphome/client.go`, including battery SOC/power sensors, forcible charge/discharge numbers, RS485 control mode, and forcible charge/discharge select.
+- An `AC Power` sensor on the ESPHome bridge. It is required, not optional: trade and solar energy accounting and the solar P1 feedback compensation all read AC-side power, not only the round-trip efficiency sampler.
 - Network access to NordPool's data portal API.
 - Optional HomeWizard P1 meter with its local API enabled.
 - Optional Telegram bot and private chat.
@@ -104,5 +105,7 @@ The script does not rotate its output. Use `logrotate` or another bounded-retent
 ## Commitment Recovery
 
 An invalid or corrupt `automatic-cycle-commitment.json` makes startup attempt to stop the battery and refuse to trade. A system clock more than 72 hours behind the commitment can also trigger this fail-closed check, so verify time synchronization before treating the file as invalid. If the connection or stop command also fails, a prior forced operation may remain active. Inspect the reported file and confirm the battery is physically idle before removing it from `DATA_DIR`; restarting then rebuilds the plan from current prices.
+
+Changing `EXPORT_PRICE_MODE` while a commitment is persisted retains only the discharge obligation: the stored windows were priced under the previous mode, so the restored cycle is never re-authorized for further grid charging. Changing `BATTERY_EFFICIENCY` re-evaluates the restored cycle against the new expected-profit floor at startup, which can likewise demote it to discharge-only.
 
 If deletion of an expired or completed commitment fails, the service remains running but pins planning and retries fail-closed. `/status` reports the grid commitment, its durability, the staged-plan flag, and `automatic cycle commitment cleanup pending`; logs and Telegram report the filesystem error. Restore write access to `DATA_DIR` rather than deleting a live commitment blindly.

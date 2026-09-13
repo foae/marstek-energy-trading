@@ -24,21 +24,24 @@ const (
 
 // Trade represents a single trade record.
 type Trade struct {
-	Timestamp          time.Time            `json:"timestamp"`
-	Action             TradeAction          `json:"action"`
-	PriceEUR           decimal.Decimal      `json:"price_eur"`            // EUR/kWh
-	PowerW             int                  `json:"power_w"`              // Watts
-	DurationS          int                  `json:"duration_s"`           // Seconds
-	EnergyKWh          decimal.Decimal      `json:"energy_kwh"`           // kWh battery input/output
-	GridEnergyKWh      decimal.Decimal      `json:"grid_energy_kwh"`      // Grid portion of a solar charge
-	GridCostEUR        decimal.Decimal      `json:"grid_cost_eur"`        // Interval-priced grid cost of a solar charge
-	GridUnpricedKWh    decimal.Decimal      `json:"grid_unpriced_kwh"`    // Grid portion without an available price
-	StartSOC           int                  `json:"start_soc"`            // SOC at start
-	EndSOC             int                  `json:"end_soc"`              // SOC at end
-	UnpricedKWh        decimal.Decimal      `json:"unpriced_kwh"`         // Battery energy without an interval price
-	OpportunityCostEUR decimal.Decimal      `json:"opportunity_cost_eur"` // Estimated value of solar energy not exported
-	EnergyBasis        string               `json:"energy_basis"`         // Method used to estimate EnergyKWh; blank for historic trades
-	DayAllocations     []TradeDayAllocation `json:"day_allocations,omitempty"`
+	Timestamp          time.Time       `json:"timestamp"`
+	Action             TradeAction     `json:"action"`
+	PriceEUR           decimal.Decimal `json:"price_eur"`            // EUR/kWh
+	PowerW             int             `json:"power_w"`              // Watts
+	DurationS          int             `json:"duration_s"`           // Seconds
+	EnergyKWh          decimal.Decimal `json:"energy_kwh"`           // kWh battery input/output
+	GridEnergyKWh      decimal.Decimal `json:"grid_energy_kwh"`      // Grid portion of a solar charge
+	GridCostEUR        decimal.Decimal `json:"grid_cost_eur"`        // Interval-priced grid cost of a solar charge
+	GridUnpricedKWh    decimal.Decimal `json:"grid_unpriced_kwh"`    // Grid portion without an available price
+	StartSOC           int             `json:"start_soc"`            // SOC at start
+	EndSOC             int             `json:"end_soc"`              // SOC at end
+	UnpricedKWh        decimal.Decimal `json:"unpriced_kwh"`         // Battery energy without an interval price
+	OpportunityCostEUR decimal.Decimal `json:"opportunity_cost_eur"` // Estimated value of solar energy not exported
+	// EnergyBasis records how EnergyKWh was estimated: "measured_ac_power" for
+	// current records, "measured_battery_power" for historical DC-based records,
+	// blank for historic trades written before the field existed.
+	EnergyBasis    string               `json:"energy_basis"`
+	DayAllocations []TradeDayAllocation `json:"day_allocations,omitempty"`
 }
 
 // TradeDayAllocation preserves exact accounting when a session crosses a local day boundary.

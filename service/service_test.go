@@ -5618,3 +5618,84 @@ func TestSolarAccountingUsesImportForGridAndExportForOpportunity(t *testing.T) {
 		t.Errorf("opportunity cost = %s, want %s at the export price", opportunityCost, wantOpportunity)
 	}
 }
+
+// TestActiveChargeSurvivesTariffBoundaryWhenRisingSOCEjectsRunningSlice covers
+// the harder variant: SOC climbs while the charge runs until the cheaper future
+// slices alone cover the remaining requirement, so the running slice drops out
+// of the reservation entirely instead of merely being truncated.
+func TestActiveChargeSurvivesTariffBoundaryWhenRisingSOCEjectsRunningSlice(t *testing.T) {
+	base := time.Date(2024, 1, 15, 13, 0, 0, 0, time.UTC)
+	prices := makePrices(base, .13, .12, .11, .10)
+	cfg := testConfigSmallBattery()
+	// The three cheaper slices hold 1.5 kWh at 2 kW. At 52% SOC only 1.4592 kWh
+	// is still required, so they cover it without the running slice.
+	cfg.BatteryCapacityKWh = 3.04
+	cfg.BatteryChargeEfficiency = 1
+	battery := NewMockBattery(50)
+	battery.CurrentPower = 2000
+
+	clock := base.Add(5 * time.Minute)
+	svc := newTestService(cfg, battery, prices, clock)
+	svc.nowFunc = func() time.Time { return clock }
+	setReservedChargePlan(svc, base, decimal.NewFromFloat(.13))
+	svc.state = StateCharging
+	svc.currentTradeStart = base
+	svc.currentTradeSOC = 50
+	svc.currentTradeLastSOC = 50
+	svc.currentTradePowerW = cfg.ChargePowerW
+	svc.beginMeasuredTradeLocked(2000)
+
+	for _, step := range []struct {
+		at  time.Duration
+		soc int
+	}{{5 * time.Minute, 50}, {10 * time.Minute, 51}, {14 * time.Minute, 52}, {16 * time.Minute, 52}} {
+		clock = base.Add(step.at)
+		battery.SOC = step.soc
+		if step.at == 14*time.Minute {
+			// Premise: without the re-add the running slice is no longer selected.
+			svc.mu.Lock()
+			svc.state = StateIdle
+			ejected := svc.chargeReservationLocked(clock, step.soc)
+			svc.state = StateCharging
+			svc.mu.Unlock()
+			if ejected.contains(clock) {
+				t.Fatalf("premise failed: running slice still selected at %s: %+v", clock, ejected.Windows)
+			}
+		}
+		svc.tick(context.Background())
+		if svc.state != StateCharging {
+			t.Fatalf("charge interrupted at %s (soc %d): state=%s idle=%d", clock, step.soc, svc.state, battery.IdleCalls)
+		}
+	}
+
+	if battery.IdleCalls != 0 || battery.ChargeAttempts != 0 {
+		t.Fatalf("battery was stopped and restarted across the tariff boundary: idle=%d charge_attempts=%d",
+			battery.IdleCalls, battery.ChargeAttempts)
+	}
+}
+
+func TestRestoreUnderDifferentExportModeRetainsDischargeOnly(t *testing.T) {
+	now := time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC)
+	cycle := &TradeCycle{
+		ChargeWindow:    TimeWindow{Start: now.Add(-5 * time.Minute), End: now.Add(10 * time.Minute), Price: decimal.NewFromFloat(.10)},
+		DischargeWindow: TimeWindow{Start: now.Add(time.Hour), End: now.Add(2 * time.Hour), Price: decimal.NewFromFloat(.30)},
+		ExportPriceMode: "symmetric",
+	}
+	recorder := NewRecorder(t.TempDir(), .90, time.UTC)
+	if err := recorder.SaveAutomaticCycleCommitment(cycle); err != nil {
+		t.Fatalf("save commitment: %v", err)
+	}
+	cfg := testConfigSmallBattery()
+	cfg.ExportPriceMode = "wholesale"
+	svc := &Service{cfg: cfg, recorder: recorder, loc: time.UTC, nowFunc: func() time.Time { return now }}
+
+	if err := svc.restoreAutomaticCycleCommitment(); err != nil {
+		t.Fatalf("restore commitment: %v", err)
+	}
+	if svc.currentPlan == nil || !svc.currentPlan.DischargeOnly || len(svc.currentPlan.Cycles) != 0 {
+		t.Fatalf("cycle priced under another export mode stayed charge-eligible: plan=%+v", svc.currentPlan)
+	}
+	if !svc.currentPlan.IsInDischargeWindow(cycle.DischargeWindow.Start) {
+		t.Fatal("cycle priced under another export mode lost its discharge obligation")
+	}
+}

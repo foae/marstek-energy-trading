@@ -76,6 +76,10 @@ func run() int {
 		"export_price_mode", cfg.ExportPriceMode,
 		"export_fee_eur_kwh", cfg.ExportFeeEURPerKWh,
 	)
+	if cfg.ExportPriceMode == "symmetric" && !cfg.ExportFeeEURPerKWh.IsZero() {
+		slog.Warn("EXPORT_FEE_EUR_PER_KWH is ignored in symmetric mode",
+			"export_fee_eur_kwh", cfg.ExportFeeEURPerKWh)
+	}
 
 	// Initialize clients with configured timezone and all-in pricing.
 	nordpoolClient := nordpool.NewWithLocation(

@@ -283,10 +283,7 @@ func (s *Service) analyzerConfig() AnalyzerConfig {
 	}
 }
 
-const (
-	measuredBatteryPowerEnergyBasis = "measured_battery_power"
-	measuredACPowerEnergyBasis      = "measured_ac_power"
-)
+const measuredACPowerEnergyBasis = "measured_ac_power"
 
 // snapshotSessionPricesLocked retains every price slot seen while a session is
 // active. Fetches may replace the live day slices at midnight, but settlement
@@ -652,8 +649,12 @@ func (s *Service) tick(ctx context.Context) {
 
 	s.mu.Lock()
 	s.currentTradeLastSOC = batStatus.SOC
-	if powerErr == nil && acPowerErr == nil {
+	// DC telemetry stands on its own: cache it whenever it was read, even if the
+	// AC read failed and the session below has to stop.
+	if powerErr == nil {
 		s.cacheBatteryTelemetryLocked(batStatus.SOC, measuredPowerW)
+	}
+	if powerErr == nil && acPowerErr == nil {
 		switch s.state {
 		case StateCharging:
 			s.observedChargePowerW = max(measuredACPowerW, 0)
@@ -765,6 +766,11 @@ func (s *Service) tick(ctx context.Context) {
 			(s.automaticCycleCommit != nil || s.solarCycleRetention != nil)
 		if retainedDischarge {
 			currentPrice = dischargeWindow.Price
+			if !exportOK {
+				// Value the retained obligation at its planned price rather than
+				// zero; exportOK stays false so callers still see it as unpriced.
+				currentExportPrice = dischargeWindow.Price
+			}
 			slot := now.Truncate(15 * time.Minute)
 			if !slot.Equal(s.lastUnpricedDischargeSlot) {
 				s.lastUnpricedDischargeSlot = slot
@@ -1108,10 +1114,10 @@ func (s *Service) solarTick(ctx context.Context) {
 		// Attribute only the part of battery draw covered by net grid import.
 		s.solarGridPowerW = min(max(activePowerW, 0), measuredACChargePowerW)
 
-		// Compensate for feedback loop: the battery's charge power is visible on
-		// the P1 meter as consumption, so measured surplus is artificially low.
-		// Real surplus = what P1 sees + what the battery is currently drawing.
-		effectiveSurplus := surplus + measuredChargePowerW
+		// Compensate for feedback loop: the battery's AC draw is what the P1 meter
+		// sees as consumption, so measured surplus is artificially low. Real
+		// surplus = what P1 sees + the battery's AC-side charge power.
+		effectiveSurplus := surplus + measuredACChargePowerW
 
 		s.updateSolarSurplusEMALocked(effectiveSurplus, now)
 
@@ -1127,7 +1133,8 @@ func (s *Service) solarTick(ctx context.Context) {
 				slog.Info("solar charging: sustained insufficient surplus",
 					"ema_w", s.solarSurplusEMA, "stop_threshold_w", stopThreshold,
 					"measured_surplus_w", surplus, "charge_power_w", s.solarChargePower,
-					"measured_battery_power_w", measuredChargePowerW, "effective_surplus_w", effectiveSurplus,
+					"measured_battery_power_w", measuredChargePowerW,
+					"measured_ac_power_w", measuredACChargePowerW, "effective_surplus_w", effectiveSurplus,
 					"grace", solarLowSurplusGrace)
 				s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonSurplusGone)
 				return
@@ -1160,7 +1167,7 @@ func (s *Service) solarTick(ctx context.Context) {
 			slog.Info("solar charging: adjusting power",
 				"old_w", s.solarChargePower, "new_w", targetPower,
 				"measured_surplus_w", surplus, "measured_battery_power_w", measuredChargePowerW,
-				"effective_surplus_w", effectiveSurplus)
+				"measured_ac_power_w", measuredACChargePowerW, "effective_surplus_w", effectiveSurplus)
 
 			// Release lock during network I/O
 			s.mu.Unlock()
@@ -1275,8 +1282,16 @@ func (s *Service) startSolarChargingLocked(ctx context.Context, powerW int, soc 
 		measuredPowerW, err = s.waitForBatteryPower(ctx, true, powerW)
 	}
 	if err == nil {
-		// Accounting integrates AC-side power; seed the session with it.
-		measuredACPowerW, err = s.battery.GetACPower(ctx)
+		// Accounting integrates AC-side power, but the battery is already charging
+		// at this point: a telemetry gap must not abort a physically running
+		// session. Seed from DC power instead and let the next tick correct it.
+		acPowerW, acErr := s.battery.GetACPower(ctx)
+		if acErr != nil {
+			l.Warn("AC power telemetry unavailable at session start; seeding accounting from DC power", "error", acErr)
+			measuredACPowerW = measuredPowerW
+		} else {
+			measuredACPowerW = acPowerW
+		}
 	}
 	if err != nil {
 		if idleErr = s.idleBattery(ctx); idleErr != nil {
@@ -1586,6 +1601,9 @@ func (s *Service) startChargingLocked(ctx context.Context, price decimal.Decimal
 
 	// Persist before battery control, then re-check after the filesystem I/O so
 	// an expired reservation cannot issue a physical command.
+	// Record the export tariff mode the windows were priced under so a restart
+	// under a different mode cannot re-authorize charging on stale economics.
+	committedCycle.ExportPriceMode = s.cfg.ExportPriceMode
 	s.mu.Unlock()
 	var err error
 	if persistedThisAttempt {
@@ -1660,8 +1678,16 @@ func (s *Service) startChargingLocked(ctx context.Context, price decimal.Decimal
 		measuredPowerW, err = s.waitForBatteryPower(commandCtx, true, s.cfg.ChargePowerW)
 	}
 	if err == nil {
-		// Accounting integrates AC-side power; seed the session with it.
-		measuredACPowerW, err = s.battery.GetACPower(commandCtx)
+		// Accounting integrates AC-side power, but the battery is already charging
+		// at this point: a telemetry gap must not abort a physically running
+		// session. Seed from DC power instead and let the next tick correct it.
+		acPowerW, acErr := s.battery.GetACPower(commandCtx)
+		if acErr != nil {
+			l.Warn("AC power telemetry unavailable at session start; seeding accounting from DC power", "error", acErr)
+			measuredACPowerW = measuredPowerW
+		} else {
+			measuredACPowerW = acPowerW
+		}
 	}
 	cancelCommand()
 	s.mu.Lock()
@@ -1718,8 +1744,7 @@ func (s *Service) startChargingLocked(ctx context.Context, price decimal.Decimal
 	s.currentTradeLastSOC = soc
 	s.beginMeasuredTradeLocked(measuredACPowerW)
 	s.cacheBatteryTelemetryLocked(soc, measuredPowerW)
-	// DC seed for the taper; the next tick overrides it with the AC reading.
-	s.observedChargePowerW = max(measuredPowerW, 0)
+	s.observedChargePowerW = max(measuredACPowerW, 0)
 	_, _, priceKnown := s.sessionPriceAtLocked(s.currentTradeStart, s.currentTradeStart.Add(time.Nanosecond), false)
 	if priceKnown {
 		s.lastChargePrice = price // Track the known start price for profitability.
@@ -1843,8 +1868,16 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 		measuredPowerW, err = s.waitForBatteryPower(controlCtx, false, powerW)
 	}
 	if err == nil {
-		// Accounting integrates AC-side power; seed the session with it.
-		measuredACPowerW, err = s.battery.GetACPower(controlCtx)
+		// Accounting integrates AC-side power, but the battery is already
+		// discharging at this point: a telemetry gap must not abort a physically
+		// running session. Seed from DC power instead; the next tick corrects it.
+		acPowerW, acErr := s.battery.GetACPower(controlCtx)
+		if acErr != nil {
+			l.Warn("AC power telemetry unavailable at session start; seeding accounting from DC power", "error", acErr)
+			measuredACPowerW = measuredPowerW
+		} else {
+			measuredACPowerW = acPowerW
+		}
 	}
 	cancelControl()
 	if err != nil {
@@ -2585,6 +2618,24 @@ func (s *Service) restoreAutomaticCycleCommitment() error {
 		Sub(cycle.ChargeWindow.Price)
 	minProfit := decimal.NewFromFloat(s.cfg.MinPriceSpread)
 	chargeEligible := profit.IsPositive() && !profit.LessThan(minProfit)
+	// Commitments written before the field existed were priced symmetrically.
+	storedExportMode := cycle.ExportPriceMode
+	if storedExportMode == "" {
+		storedExportMode = "symmetric"
+	}
+	configuredExportMode := s.cfg.ExportPriceMode
+	if configuredExportMode == "" {
+		configuredExportMode = "symmetric"
+	}
+	exportModeMismatch := storedExportMode != configuredExportMode
+	if exportModeMismatch {
+		chargeEligible = false
+		slog.Warn(
+			"restored cycle was priced under a different export tariff mode; retained for discharge only",
+			"stored_export_price_mode", storedExportMode,
+			"configured_export_price_mode", configuredExportMode,
+		)
+	}
 	planCycle := *cycle
 	planCycle.Profit = profit
 	plan := &TradingPlan{
@@ -2599,7 +2650,7 @@ func (s *Service) restoreAutomaticCycleCommitment() error {
 	if chargeEligible {
 		plan.ChargeWindows = []TimeWindow{cycle.ChargeWindow}
 		plan.Cycles = []TradeCycle{planCycle}
-	} else {
+	} else if !exportModeMismatch {
 		slog.Warn(
 			"restored cycle retained for discharge but blocked from further grid charging",
 			"expected_profit_eur_kwh", profit,

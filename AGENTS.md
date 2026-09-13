@@ -155,7 +155,7 @@ When the HomeWizard P1 meter is enabled, the service captures solar surplus by c
 - **Power tracking**: Charges at the EMA-smoothed surplus power, dynamically adjusted with 50W deadband outside low-surplus grace.
 - **Priority**: Active grid reservations and discharge windows override solar charging.
 - **Fault priority**: Read battery status and evaluate full/window stops before reading P1. Failed adjustments immediately request a confirmed stop; retained failure state retries only through the throttled stop path, with a five-minute cooldown after success.
-- **Energy accounting**: Integrate measured battery input from AC power and the grid-attributable portion (`min(acChargePower, max(netGridImport, 0))`) separately; control compensation still uses DC battery power. Price grid intervals at their applicable slot, exposing missing-price energy rather than labelling it free solar. Estimates retain last observed power across telemetry gaps; historical unsplit records remain all-solar.
+- **Energy accounting**: Integrate measured battery input from AC power and the grid-attributable portion (`min(acChargePower, max(netGridImport, 0))`) separately; control compensation uses the same measured AC charge power. Price grid intervals at their applicable slot, exposing missing-price energy rather than labelling it free solar. Estimates retain last observed power across telemetry gaps; historical unsplit records remain all-solar.
 
 ### Scheduled window priority
 Solar charging and scheduled trading never conflict — three rules enforce strict priority:
@@ -174,11 +174,11 @@ Without compensation, this causes oscillation (start→surplus drops→stop→su
 
 **Fix**: When already in `StateSolarCharging`, the stop-threshold and power adjustment use the **effective surplus**:
 ```
-effectiveSurplus = measuredSurplus + measuredBatteryChargePower
+effectiveSurplus = measuredSurplus + measuredACChargePower
 ```
 
 ### Battery ramp-up cooldown
-The battery takes ~3 seconds to ramp to a new power target. Compensation uses measured battery power rather than the command target. A **5-second cooldown** after any power change (start or adjust) prevents re-adjustment until the battery has settled.
+The battery takes ~3 seconds to ramp to a new power target. Compensation uses measured AC charge power rather than the command target. A **5-second cooldown** after any power change (start or adjust) prevents re-adjustment until the battery has settled.
 
 ### State machine
 ```
@@ -200,7 +200,7 @@ If `AGENTS.local.md` exists, read it before making changes. It contains ignored 
 4. **Timezone issues**: Use explicit `time.Location` for all time operations
 5. **Non-atomic file writes**: Use temp file + rename pattern
 6. **Notification spam**: Rate limit error notifications
-7. **P1 meter feedback loop**: AC-coupled battery draw is visible on the P1 meter — compensate with measured battery charge power, not the command target, during active charging.
+7. **P1 meter feedback loop**: AC-coupled battery draw is visible on the P1 meter — compensate with measured AC charge power (what the meter actually sees), not the DC battery power and not the command target, during active charging.
 8. **Battery ramp-up transients**: Don't re-adjust power within 5s of a change — the battery hasn't reached the target yet and readings are unreliable
 9. **Solar micro-cycling**: Anti-cycling constants (`solarLowSurplusGrace`, `solarRestartCooldown`, `solarShortSessionCooldown`, `solarLongBackoffCooldown`, `solarShortSessionThreshold`, `solarShortSessionBackoffCount`, `solarStartQualification`, `solarMinChargePowerW`, `solarEMAAlpha`) are package-level implementation details, not env vars.
 10. **RS485 link freeze**: the ESPHome Modbus hub can wedge mid-session; only an ESP32 reboot recovers it. Never add write retries faster than the poll interval; keep Modbus write volume minimal; keep the staleness check and the restart-button path working.

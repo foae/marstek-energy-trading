@@ -60,7 +60,7 @@ A Go service that controls a Marstek Venus E battery with NordPool day-ahead pri
    ```
    It is a real, finite input to the plan, not a reconstructed historical grid charge.
 
-2. **Evaluate grid pairs.** A contiguous grid charge window must end before its contiguous discharge window begins. Its expected profit per input kWh is `discharge_average * efficiency - charge_average`; it must be strictly positive and meet `MIN_PRICE_SPREAD`.
+2. **Evaluate grid pairs.** A contiguous discharge window is paired with the cheapest executable, individually eligible charge slices before it; the charge slices need not be contiguous. Expected profit per input kWh is `discharge_average * efficiency - charge_average`; it must be strictly positive and meet `MIN_PRICE_SPREAD`.
 
 3. **Compare total-EUR alternatives using the initial inventory once.** The planner can hold inventory, leave it available to reduce the first grid purchase, or sell it in one contiguous known-positive-export-price window followed by non-overlapping grid cycles. The sale can be shorter than the available inventory or end partway through a tariff interval. It uses integrated prices and actual energy, not average-slot economics. Following grid reservations cannot start before the selected inventory sale ends.
 
@@ -128,8 +128,12 @@ Stop intent is retained until an authoritative stop confirmation. The service ke
 ### Data Persistence
 - File-based JSON storage in `DATA_DIR`
 - `trades.json` - trade history
-- `automatic-cycle-commitment.json` - the discharge pairing for grid energy already purchased
+- `automatic-cycle-commitment.json` - paired grid-cycle intent, persisted before charging; not proof that energy was purchased
+- `retired-discharge-windows.json` - completed automatic discharge windows that must not be selected again after restart; markers older than the current local day are pruned
+- `measured-efficiency.json` - completed measured AC-efficiency aggregates, not incomplete measurement windows
 - Uses `decimal` library for monetary precision
+
+Invalid retirement state blocks startup after a safe-stop attempt. Failed retirement writes block automatic control until persistence succeeds. Uncommitted inventory plans are rebuilt from fresh SOC and known tariffs; partial active-session energy is not persisted. See [Operations](operations.md#commitment-recovery) before repairing or removing state.
 
 ### Logging
 - Structured JSON logs to stdout
@@ -146,6 +150,8 @@ Stop intent is retained until an authoritative stop confirmation. The service ke
 | `GET /status` | Current state, reservation, commitment/pending-plan state, and full history (JSON) |
 
 ### Status Response
+
+Illustrative subset of `/status` (trade details and other fields omitted). Accounting field semantics and Prometheus metric names are documented in [Operations](operations.md#accounting-metrics).
 
 ```json
 {
@@ -172,10 +178,15 @@ Stop intent is retained until an authoritative stop confirmation. The service ke
         "charge_cycles": 1,
         "discharge_cycles": 1,
         "pnl_eur": "0.0325",
-        "trades": [...]
+        "opportunity_adjusted_pnl_eur": "0.0325",
+        "cash_flow_unpriced_kwh": "0",
+        "unpriced_kwh": "0",
+        "unattributed_charge_kwh": "0"
       }
     ],
     "total_pnl_eur": "0.0325",
+    "total_opportunity_adjusted_pnl_eur": "0.0325",
+    "total_unattributed_charge_kwh": "0",
     "total_days": 1,
     "first_trade": "2026-02-02T08:00:00Z",
     "last_trade": "2026-02-02T18:30:00Z"
@@ -226,31 +237,9 @@ Total P&L: 0.0325 EUR
 
 ## Configuration
 
-Load from `.env` file with fallback to environment variables.
+See [Configuration](configuration.md) for the canonical environment-variable reference, defaults, and validation requirements.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SERVICE_NAME` | `energy-trader` | Service identifier |
-| `LOG_LEVEL` | `info` | debug/info/warn/error |
-| `HTTP_LISTEN_ADDR` | `127.0.0.1:8080` | HTTP server address; API has no authentication or TLS |
-| `DATA_DIR` | `./data` | Data storage directory |
-| `TZ` | `Europe/Amsterdam` | Timezone |
-| `NORDPOOL_AREA` | `NL` | Price area code |
-| `NORDPOOL_CURRENCY` | `EUR` | Currency |
-| `MIN_PRICE_SPREAD` | `0.05` | Minimum expected profit after efficiency loss (EUR/kWh; historical name) |
-| `BATTERY_EFFICIENCY` | `0.90` | Round-trip efficiency |
-| `BATTERY_CAPACITY_KWH` | `5.12` | Battery capacity (kWh) |
-| `BATTERY_MIN_SOC` | `0.11` | Minimum SOC (0.0-1.0) |
-| `MAX_CYCLES_PER_DAY` | `2` | Max cycles selected over the loaded planning horizon |
-| `ESPHOME_URL` | required | ESPHome device URL |
-| `BATTERY_UDP_ADDR` | - | Unwired legacy library configuration |
-| `CHARGE_POWER_W` | `2500` | Charge power (watts) |
-| `DISCHARGE_POWER_W` | `2500` | Discharge power (watts) |
-| `PASSIVE_MODE_TIMEOUT_S` | `300` | Service refresh basis; not a battery-side command expiry |
-| `HOMEWIZARD_P1_URL` | - | Empty disables P1; URL selects a meter; `auto` opts into discovery and LAN scanning |
-| `SOLAR_MIN_SURPLUS_W` | `100` | Min surplus watts to start solar charging |
-| `TELEGRAM_BOT_TOKEN` | - | Telegram bot token (enables notifications and command registration) |
-| `TELEGRAM_CHAT_ID` | - | Private Telegram chat allowed to issue commands |
+Planning uses `BATTERY_EFFICIENCY` for round-trip economics and `BATTERY_CHARGE_EFFICIENCY` for AC-to-stored input sizing. Export valuation is selected by `EXPORT_PRICE_MODE` and, in wholesale mode, the signed `EXPORT_FEE_EUR_PER_KWH`. `MAX_CYCLES_PER_DAY` limits new grid cycles over the known horizon; inventory-only sales are exempt.
 
 ## Scheduling
 
@@ -258,6 +247,7 @@ Load from `.env` file with fallback to environment variables.
 |------|--------|
 | Every 1 sec | Solar tick: read P1 meter, manage solar charging (when enabled) |
 | Every 1 min | Check battery, execute trades |
+| Selected automatic discharge endpoint | Request idle, including partial-slot endpoints, independently of the minute tick |
 | Every 5 sec | Poll Telegram commands |
 | Every 15 min | Check if prices need fetching |
 | 13:00 CET | Fetch next day's prices |
@@ -272,6 +262,8 @@ marstek-energy-trading/
 ├── service/
 │   ├── service.go               # Trading engine
 │   ├── analyzer.go              # Price analysis
+│   ├── planner.go               # Joint stored-inventory and grid-cycle optimization
+│   ├── charging_reservations.go # SOC-aware executable grid slices
 │   ├── recorder.go              # Trade recording (decimal)
 │   ├── charge_accounting.go     # Scheduled-charge source attribution and value metrics
 │   └── interfaces.go            # BatteryController interface

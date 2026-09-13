@@ -512,11 +512,14 @@ func TestAnalyzePrices_NowKeepsInProgressWindowsEligible(t *testing.T) {
 
 func TestAnalyzePrices_NowExcludesWindowsEndingExactlyNow(t *testing.T) {
 	baseTime := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
-	values := make([]float64, 16)
+	// 8 cheap + 7 expensive slots: the only charge window that does not end at
+	// Now starts at 00:15, and the horizon then cannot hold a full discharge
+	// window after it.
+	values := make([]float64, 15)
 	for i := 0; i < 8; i++ {
 		values[i] = 0.05
 	}
-	for i := 8; i < 16; i++ {
+	for i := 8; i < 15; i++ {
 		values[i] = 0.50
 	}
 
@@ -793,5 +796,83 @@ func TestTradingPlan_ShouldTrade(t *testing.T) {
 				t.Errorf("ShouldTrade() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestAnalyzePrices_WindowSizesUseACSideEnergy pins the AC-side window sizing:
+// charging must draw usable capacity divided by the charge efficiency, while
+// discharging can only deliver usable capacity times the round-trip efficiency
+// divided by that same charge efficiency.
+func TestAnalyzePrices_WindowSizesUseACSideEnergy(t *testing.T) {
+	baseTime := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+	values := make([]float64, 16)
+	for i := 0; i < 9; i++ {
+		values[i] = 0.05
+	}
+	for i := 9; i < 16; i++ {
+		values[i] = 0.50
+	}
+
+	cfg := AnalyzerConfig{
+		Efficiency:         0.79,
+		ChargeEfficiency:   0.95,
+		MinPriceSpread:     0.05,
+		BatteryCapacityKWh: 5.12,
+		BatteryMinSOC:      0.11,
+		ChargePowerW:       2200,
+		DischargePowerW:    2200,
+		MaxCyclesPerDay:    1,
+	}
+
+	plan := AnalyzePrices(makePrices(baseTime, values...), cfg)
+	if len(plan.Cycles) != 1 {
+		t.Fatalf("expected one cycle, got %+v", plan.Cycles)
+	}
+	cycle := plan.Cycles[0]
+	if got := cycle.ChargeWindow.End.Sub(cycle.ChargeWindow.Start); got != 9*15*time.Minute {
+		t.Errorf("charge window = %s, want 9 slots (%s)", got, 9*15*time.Minute)
+	}
+	if got := cycle.DischargeWindow.End.Sub(cycle.DischargeWindow.Start); got != 7*15*time.Minute {
+		t.Errorf("discharge window = %s, want 7 slots (%s)", got, 7*15*time.Minute)
+	}
+}
+
+// TestAnalyzePrices_UnsetChargeEfficiencyKeepsSymmetricWindows proves an unset
+// charge efficiency is treated as 1.0, so with a lossless round trip both
+// windows stay sized from the usable DC capacity alone.
+func TestAnalyzePrices_UnsetChargeEfficiencyKeepsSymmetricWindows(t *testing.T) {
+	baseTime := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+	values := make([]float64, 18)
+	for i := 0; i < 9; i++ {
+		values[i] = 0.05
+	}
+	for i := 9; i < 18; i++ {
+		values[i] = 0.50
+	}
+
+	cfg := AnalyzerConfig{
+		Efficiency:         1,
+		MinPriceSpread:     0.05,
+		BatteryCapacityKWh: 5.12,
+		BatteryMinSOC:      0.11,
+		ChargePowerW:       2200,
+		DischargePowerW:    2200,
+		MaxCyclesPerDay:    1,
+	}
+
+	plan := AnalyzePrices(makePrices(baseTime, values...), cfg)
+	if len(plan.Cycles) != 1 {
+		t.Fatalf("expected one cycle, got %+v", plan.Cycles)
+	}
+	cycle := plan.Cycles[0]
+	want := time.Duration(calculateWindowSize(5.12*0.89, 2200)) * 15 * time.Minute
+	if want != 9*15*time.Minute {
+		t.Fatalf("fixture sanity: legacy window size = %s, want 9 slots", want)
+	}
+	if got := cycle.ChargeWindow.End.Sub(cycle.ChargeWindow.Start); got != want {
+		t.Errorf("charge window = %s, want %s", got, want)
+	}
+	if got := cycle.DischargeWindow.End.Sub(cycle.DischargeWindow.Start); got != want {
+		t.Errorf("discharge window = %s, want %s", got, want)
 	}
 }

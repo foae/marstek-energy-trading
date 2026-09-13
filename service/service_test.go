@@ -5479,3 +5479,43 @@ func TestPriceRefreshRetainsKnownSuffixAfterShorterPublication(t *testing.T) {
 		})
 	}
 }
+
+// TestActiveChargeSurvivesTariffBoundaryWithFallingPrices covers the stop/start
+// churn that falling afternoon prices used to cause: every tick re-truncated the
+// running reservation slice, so the service stopped the inverter inside the slot
+// and restarted it in the next one.
+func TestActiveChargeSurvivesTariffBoundaryWithFallingPrices(t *testing.T) {
+	base := time.Date(2024, 1, 15, 13, 0, 0, 0, time.UTC)
+	prices := makePrices(base, .13, .12, .11, .10)
+	cfg := testConfigSmallBattery()
+	// 1.52 kWh required at 50% SOC: the three cheaper slices hold 1.5 kWh, so the
+	// running slice is the marginal one and is truncated to well under a minute.
+	cfg.BatteryCapacityKWh = 3.04
+	cfg.BatteryChargeEfficiency = 1
+	battery := NewMockBattery(50)
+	battery.CurrentPower = 2000
+
+	clock := base.Add(5 * time.Minute)
+	svc := newTestService(cfg, battery, prices, clock)
+	svc.nowFunc = func() time.Time { return clock }
+	setReservedChargePlan(svc, base, decimal.NewFromFloat(.13))
+	svc.state = StateCharging
+	svc.currentTradeStart = base
+	svc.currentTradeSOC = 50
+	svc.currentTradeLastSOC = 50
+	svc.currentTradePowerW = cfg.ChargePowerW
+	svc.beginMeasuredTradeLocked(2000)
+
+	for _, at := range []time.Duration{5 * time.Minute, 10 * time.Minute, 14 * time.Minute, 16 * time.Minute} {
+		clock = base.Add(at)
+		svc.tick(context.Background())
+		if svc.state != StateCharging {
+			t.Fatalf("charge interrupted at %s: state=%s idle=%d", clock, svc.state, battery.IdleCalls)
+		}
+	}
+
+	if battery.IdleCalls != 0 || battery.ChargeAttempts != 0 {
+		t.Fatalf("battery was stopped and restarted across the tariff boundary: idle=%d charge_attempts=%d",
+			battery.IdleCalls, battery.ChargeAttempts)
+	}
+}

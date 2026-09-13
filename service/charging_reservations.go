@@ -1,6 +1,7 @@
 package service
 
 import (
+	"log/slog"
 	"sort"
 	"time"
 
@@ -8,8 +9,9 @@ import (
 )
 
 // chargingReservation uses no forecast: only energy already reflected in SOC
-// reduces the grid requirement. Efficiency is a conservative charging estimate,
-// not a claim that round-trip loss is entirely on the charging side.
+// reduces the grid requirement. Charge efficiency converts the DC shortfall
+// into the AC input that must be drawn from the grid; the remaining round-trip
+// loss sits on the discharge side and is not reserved for here.
 type chargingReservation struct {
 	Deadline            time.Time
 	RequiredKWh         float64
@@ -46,7 +48,11 @@ func (s *Service) chargeReservationLocked(now time.Time, soc int) chargingReserv
 	if now.Before(earliest) {
 		return chargingReservation{}
 	}
-	result.RequiredKWh = s.cfg.BatteryCapacityKWh * float64(100-soc) / 100 / s.cfg.BatteryEfficiency
+	chargeEff := s.cfg.BatteryChargeEfficiency
+	if chargeEff <= 0 || chargeEff > 1 {
+		chargeEff = 1
+	}
+	result.RequiredKWh = s.cfg.BatteryCapacityKWh * float64(100-soc) / 100 / chargeEff
 	powerKW := float64(s.cfg.ChargePowerW) / 1000
 	// Observed taper can only reduce assumed deliverability, never promise more
 	// than nameplate. Fresh samples are supplied by the serialized control owner.
@@ -101,12 +107,95 @@ func (s *Service) chargeReservationLocked(now time.Time, soc int) chargingReserv
 		result.ReservedKWh += energy
 		count++
 	}
+	if newCount, applied := s.extendRunningReservationSlice(now, result.Windows, count, powerKW, result.Deadline); applied {
+		count = newCount
+		result.ReservedKWh = 0
+		for _, window := range result.Windows[:count] {
+			result.ReservedKWh += powerKW * window.End.Sub(window.Start).Hours()
+		}
+	}
 	result.Windows = result.Windows[:count]
 	result.Feasible = remaining <= 0.000001
 	result.LimitedByEconomics = eligibleCapacityKWh+0.000001 < result.RequiredKWh &&
 		eligibleCapacityKWh+0.000001 < totalCapacityKWh
 	sort.Slice(result.Windows, func(i, j int) bool { return result.Windows[i].Start.Before(result.Windows[j].Start) })
 	return result
+}
+
+// chargeContinuationToleranceEUR bounds the extra energy cost accepted to keep a
+// running charge going to its tariff boundary: never stop and restart the
+// inverter to save less than one cent. Each stop/start costs about two minutes
+// of charging and extra Modbus writes.
+const chargeContinuationToleranceEUR = 0.01
+
+// extendRunningReservationSlice keeps a charge session that is running inside the
+// marginal (most expensive selected) reservation slice alive until that slice's
+// tariff boundary, displacing the same energy from the next most expensive
+// selected slices. Falling afternoon prices otherwise re-truncate the running
+// slice on every tick, producing a stop/start pair per slot.
+//
+// windows must be the price-sorted selection; it is mutated in place. Returns
+// the new selected count and whether the displacement was applied.
+func (s *Service) extendRunningReservationSlice(now time.Time, windows []TimeWindow, count int, powerKW float64, deadline time.Time) (int, bool) {
+	if s.state != StateCharging || count < 2 || powerKW <= 0 {
+		return count, false
+	}
+	marginal := &windows[count-1]
+	slotStart := marginal.Start.Truncate(15 * time.Minute)
+	slotEnd := slotStart.Add(15 * time.Minute)
+	if !deadline.IsZero() && slotEnd.After(deadline) {
+		slotEnd = deadline
+	}
+	if now.Before(slotStart) || !now.Before(slotEnd) || !marginal.End.Before(slotEnd) {
+		return count, false
+	}
+	extraKWh := powerKW * slotEnd.Sub(marginal.End).Hours()
+	if extraKWh <= 0 {
+		return count, false
+	}
+	type displacement struct {
+		index int
+		kWh   float64
+	}
+	var displacements []displacement
+	penalty := decimal.Zero
+	remaining := extraKWh
+	for i := count - 2; i >= 0 && remaining > 0; i-- {
+		available := powerKW * windows[i].End.Sub(windows[i].Start).Hours()
+		take := min(remaining, available)
+		if take <= 0 {
+			continue
+		}
+		penalty = penalty.Add(marginal.Price.Sub(windows[i].Price).Mul(decimal.NewFromFloat(take)))
+		displacements = append(displacements, displacement{index: i, kWh: take})
+		remaining -= take
+	}
+	if penalty.GreaterThan(decimal.NewFromFloat(chargeContinuationToleranceEUR)) {
+		return count, false
+	}
+	marginal.End = slotEnd
+	drop := make(map[int]bool, len(displacements))
+	for _, d := range displacements {
+		window := &windows[d.index]
+		window.End = window.End.Add(-time.Duration(d.kWh / powerKW * float64(time.Hour)))
+		if !window.Start.Before(window.End) {
+			drop[d.index] = true
+		}
+	}
+	if len(drop) > 0 {
+		kept := 0
+		for i := 0; i < count; i++ {
+			if drop[i] {
+				continue
+			}
+			windows[kept] = windows[i]
+			kept++
+		}
+		count = kept
+	}
+	slog.Debug("extending running reservation slice to tariff boundary",
+		"slot_end", slotEnd, "penalty_eur", penalty.String())
+	return count, true
 }
 
 func (s *Service) gridReservedLocked(now time.Time, soc int) bool {

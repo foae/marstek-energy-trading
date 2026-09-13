@@ -33,11 +33,14 @@ type Config struct {
 	SupplierFeeEURPerKWh decimal.Decimal `env:"SUPPLIER_FEE_EUR_PER_KWH" envDefault:"0.02"`
 
 	// Trading
-	MinPriceSpread     float64 `env:"MIN_PRICE_SPREAD" envDefault:"0.05"` // Historical name: minimum expected profit after efficiency loss.
-	BatteryEfficiency  float64 `env:"BATTERY_EFFICIENCY" envDefault:"0.90"`
-	BatteryCapacityKWh float64 `env:"BATTERY_CAPACITY_KWH" envDefault:"5.12"`
-	BatteryMinSOC      float64 `env:"BATTERY_MIN_SOC" envDefault:"0.11"`
-	MaxCyclesPerDay    int     `env:"MAX_CYCLES_PER_DAY" envDefault:"2"`
+	MinPriceSpread    float64 `env:"MIN_PRICE_SPREAD" envDefault:"0.05"` // Historical name: minimum expected profit after efficiency loss.
+	BatteryEfficiency float64 `env:"BATTERY_EFFICIENCY" envDefault:"0.90"`
+	// Charging (AC input to stored energy) efficiency; the discharge side is
+	// BatteryEfficiency / BatteryChargeEfficiency.
+	BatteryChargeEfficiency float64 `env:"BATTERY_CHARGE_EFFICIENCY" envDefault:"0.95"`
+	BatteryCapacityKWh      float64 `env:"BATTERY_CAPACITY_KWH" envDefault:"5.12"`
+	BatteryMinSOC           float64 `env:"BATTERY_MIN_SOC" envDefault:"0.11"`
+	MaxCyclesPerDay         int     `env:"MAX_CYCLES_PER_DAY" envDefault:"2"`
 
 	// Battery
 	BatteryUDPAddr       string `env:"BATTERY_UDP_ADDR"` // No default (optional, for UDP client)
@@ -78,6 +81,10 @@ func (c *Config) validate() error {
 	}
 	if !isFinite(c.BatteryEfficiency) || c.BatteryEfficiency <= 0 || c.BatteryEfficiency > 1.0 {
 		return fmt.Errorf("BATTERY_EFFICIENCY must be finite and in (0.0, 1.0], got %f", c.BatteryEfficiency)
+	}
+	if !isFinite(c.BatteryChargeEfficiency) || c.BatteryChargeEfficiency <= 0 || c.BatteryChargeEfficiency > 1.0 ||
+		c.BatteryChargeEfficiency < c.BatteryEfficiency {
+		return fmt.Errorf("BATTERY_CHARGE_EFFICIENCY must be finite, in (0.0, 1.0] and >= BATTERY_EFFICIENCY, got %f", c.BatteryChargeEfficiency)
 	}
 	if !isFinite(c.BatteryMinSOC) || c.BatteryMinSOC < 0 || c.BatteryMinSOC >= 1.0 {
 		return fmt.Errorf("BATTERY_MIN_SOC must be finite and in [0.0, 1.0), got %f", c.BatteryMinSOC)

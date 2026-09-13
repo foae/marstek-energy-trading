@@ -64,19 +64,21 @@ func TestLocation_EmptyTimezone(t *testing.T) {
 
 func validConfig() Config {
 	return Config{
-		DataDir:             "./data",
-		TZ:                  "Europe/Amsterdam",
-		ESPHomeURL:          "http://192.168.1.50",
-		NordPoolCurrency:    "EUR",
-		MinPriceSpread:      0.05,
-		BatteryEfficiency:   0.90,
-		BatteryCapacityKWh:  5.12,
-		BatteryMinSOC:       0.11,
-		MaxCyclesPerDay:     2,
-		ChargePowerW:        2500,
-		DischargePowerW:     2500,
-		PassiveModeTimeoutS: 300,
-		SolarMinSurplusW:    100,
+		DataDir:           "./data",
+		TZ:                "Europe/Amsterdam",
+		ESPHomeURL:        "http://192.168.1.50",
+		NordPoolCurrency:  "EUR",
+		MinPriceSpread:    0.05,
+		BatteryEfficiency: 0.90,
+		// 1.0 keeps every BatteryEfficiency case in range for the >= constraint.
+		BatteryChargeEfficiency: 1.0,
+		BatteryCapacityKWh:      5.12,
+		BatteryMinSOC:           0.11,
+		MaxCyclesPerDay:         2,
+		ChargePowerW:            2500,
+		DischargePowerW:         2500,
+		PassiveModeTimeoutS:     300,
+		SolarMinSurplusW:        100,
 	}
 }
 
@@ -95,6 +97,8 @@ func TestValidate_RejectsNonFiniteFloatValues(t *testing.T) {
 	}{
 		{"NaN battery efficiency", func(cfg *Config) { cfg.BatteryEfficiency = math.NaN() }},
 		{"infinite battery efficiency", func(cfg *Config) { cfg.BatteryEfficiency = math.Inf(1) }},
+		{"NaN charge efficiency", func(cfg *Config) { cfg.BatteryChargeEfficiency = math.NaN() }},
+		{"infinite charge efficiency", func(cfg *Config) { cfg.BatteryChargeEfficiency = math.Inf(1) }},
 		{"NaN battery minimum SOC", func(cfg *Config) { cfg.BatteryMinSOC = math.NaN() }},
 		{"infinite battery minimum SOC", func(cfg *Config) { cfg.BatteryMinSOC = math.Inf(1) }},
 		{"NaN price spread", func(cfg *Config) { cfg.MinPriceSpread = math.NaN() }},
@@ -161,6 +165,35 @@ func TestValidate_BatteryEfficiency(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := validConfig()
 			cfg.BatteryEfficiency = tt.value
+			err := cfg.validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidate_BatteryChargeEfficiency(t *testing.T) {
+	tests := []struct {
+		name       string
+		value      float64
+		efficiency float64
+		wantErr    bool
+	}{
+		{"valid 0.95 above round-trip", 0.95, 0.79, false},
+		{"valid 1.0", 1.0, 0.90, false},
+		{"valid equal to round-trip", 0.90, 0.90, false},
+		{"invalid 0", 0, 0.90, true},
+		{"invalid negative", -0.5, 0.90, true},
+		{"invalid >1", 1.1, 0.90, true},
+		{"invalid below round-trip", 0.80, 0.90, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.BatteryEfficiency = tt.efficiency
+			cfg.BatteryChargeEfficiency = tt.value
 			err := cfg.validate()
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validate() error = %v, wantErr %v", err, tt.wantErr)
@@ -392,6 +425,9 @@ func TestLoad_RejectsInvalidSafetyValues(t *testing.T) {
 	}{
 		{"NaN battery efficiency", "BATTERY_EFFICIENCY", "NaN"},
 		{"infinite battery efficiency", "BATTERY_EFFICIENCY", "Inf"},
+		{"NaN charge efficiency", "BATTERY_CHARGE_EFFICIENCY", "NaN"},
+		{"infinite charge efficiency", "BATTERY_CHARGE_EFFICIENCY", "Inf"},
+		{"charge efficiency below round-trip", "BATTERY_CHARGE_EFFICIENCY", "0.5"},
 		{"NaN battery minimum SOC", "BATTERY_MIN_SOC", "NaN"},
 		{"infinite battery minimum SOC", "BATTERY_MIN_SOC", "Inf"},
 		{"NaN price spread", "MIN_PRICE_SPREAD", "NaN"},

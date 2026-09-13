@@ -16,6 +16,7 @@ All settings are environment variables, typically provided through a `.env` file
 | `SUPPLIER_FEE_EUR_PER_KWH` | `0.02` | VAT-inclusive supplier fee |
 | `MIN_PRICE_SPREAD` | `0.05` | Minimum expected profit after efficiency loss in EUR/kWh (historical name) |
 | `BATTERY_EFFICIENCY` | `0.90` | Round-trip efficiency in `(0, 1]` |
+| `BATTERY_CHARGE_EFFICIENCY` | `0.95` | Charging (AC input to stored) efficiency in `(0, 1]`, at least `BATTERY_EFFICIENCY`; the discharge efficiency is `BATTERY_EFFICIENCY / BATTERY_CHARGE_EFFICIENCY` |
 | `BATTERY_CAPACITY_KWH` | `5.12` | Nominal battery capacity |
 | `BATTERY_MIN_SOC` | `0.11` | Minimum SOC fraction |
 | `MAX_CYCLES_PER_DAY` | `2` | Maximum new cycles selected over the loaded planning horizon; stored-energy discharge recovery does not consume this allowance |

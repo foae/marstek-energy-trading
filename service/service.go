@@ -273,6 +273,7 @@ func (s *Service) meterEnabled() bool {
 func (s *Service) analyzerConfig() AnalyzerConfig {
 	return AnalyzerConfig{
 		Efficiency:         s.cfg.BatteryEfficiency,
+		ChargeEfficiency:   s.cfg.BatteryChargeEfficiency,
 		MinPriceSpread:     s.cfg.MinPriceSpread,
 		BatteryCapacityKWh: s.cfg.BatteryCapacityKWh,
 		BatteryMinSOC:      s.cfg.BatteryMinSOC,

@@ -129,6 +129,8 @@ The analyzer (`service/analyzer.go`) selects globally optimal non-overlapping ch
 
 Execution (`service/service.go`, `service/charging_reservations.go`):
 - Reserve the cheapest remaining known grid slots to reach 100% by the next cheap-window deadline, recalculating from actual SOC with zero future solar forecast. Exclude every grid slice that would individually violate the configured expected-profit floor.
+- Size charge windows from usable capacity divided by `BATTERY_CHARGE_EFFICIENCY` and discharge windows from usable capacity times `BATTERY_EFFICIENCY` divided by it, so both are AC-side energies; reserve the AC input as the SOC shortfall divided by the charge-side efficiency, not the round-trip figure.
+- Extend a running, truncated reservation slice to its 15-minute tariff boundary when displacing that energy onto cheaper reserved slices costs under one cent, so falling prices cannot force a stop/start at every boundary.
 - Do not start or refresh automatic control in the final minute of its window; bind ESPHome control and battery-power verification to the active window deadline.
 - Solar replaces reserved grid energy only when its forgone export value is no greater than the marginal reservation price. If economics makes the reservation infeasible, solar must still satisfy the paired cycle's per-slice expected-profit ceiling; that ceiling remains active between the charge deadline and paired discharge. Import/export use the same tariff.
 - Measured taper reduces available delivery capacity; expose infeasibility and attempt best effort rather than guaranteeing 100%.

@@ -66,6 +66,7 @@ type TradingPlan struct {
 // AnalyzerConfig contains parameters for price analysis.
 type AnalyzerConfig struct {
 	Efficiency              float64      // Battery round-trip efficiency (0.0-1.0)
+	ChargeEfficiency        float64      // Charging efficiency; values outside (0, 1] are treated as 1.0
 	MinPriceSpread          float64      // Minimum expected profit in EUR/kWh after efficiency loss
 	BatteryCapacityKWh      float64      // Battery capacity in kWh
 	BatteryMinSOC           float64      // Minimum SOC (0.0-1.0), e.g., 0.11 for 11%
@@ -113,9 +114,19 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 	// Calculate usable capacity accounting for min SOC protection
 	usableCapacity := cfg.BatteryCapacityKWh * (1.0 - cfg.BatteryMinSOC)
 
-	// Calculate window size based on usable capacity and power
-	chargeWindowSize := calculateWindowSize(usableCapacity, cfg.ChargePowerW)
-	dischargeWindowSize := calculateWindowSize(usableCapacity, cfg.DischargePowerW)
+	// Window sizes are AC-side: charging must draw more than the stored energy,
+	// discharging delivers less than it. Round-trip = charge * discharge, so the
+	// discharge side is Efficiency / ChargeEfficiency.
+	chargeEff := cfg.ChargeEfficiency
+	if chargeEff <= 0 || chargeEff > 1 {
+		chargeEff = 1
+	}
+	roundTrip := cfg.Efficiency
+	if roundTrip <= 0 || roundTrip > 1 {
+		roundTrip = 1
+	}
+	chargeWindowSize := calculateWindowSize(usableCapacity/chargeEff, cfg.ChargePowerW)
+	dischargeWindowSize := calculateWindowSize(usableCapacity*roundTrip/chargeEff, cfg.DischargePowerW)
 
 	// Handle case where we don't have enough data points
 	if len(slots) < chargeWindowSize || len(slots) < dischargeWindowSize {
@@ -349,6 +360,8 @@ func isRetiredWindow(start, end time.Time, retiredWindows []TimeWindow) bool {
 }
 
 // calculateWindowSize calculates the number of 15-minute slots needed for a full charge/discharge.
+// The caller passes AC-side energy (grid draw when charging, grid delivery when
+// discharging), not stored DC energy.
 // windowSize = (capacity_kWh / power_kW) * 4 slots_per_hour
 func calculateWindowSize(capacityKWh float64, powerW int) int {
 	if powerW <= 0 {

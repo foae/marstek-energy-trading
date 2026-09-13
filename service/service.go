@@ -995,8 +995,8 @@ func (s *Service) solarTick(ctx context.Context) {
 	}
 	batterySOC := esStatus.BatterySOC
 	measuredChargePowerW := max(esStatus.BatteryPower, 0)
-	// Control compensation uses DC battery power; accounting and grid attribution
-	// use the AC-side power the meter actually sees.
+	// Accounting, grid attribution and P1 feedback compensation all use the
+	// AC-side power the meter actually sees; the DC value is kept for logging.
 	measuredACChargePowerW := max(esStatus.ACPowerW, 0)
 	s.mu.Lock()
 	s.currentTradeLastSOC = batterySOC

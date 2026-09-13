@@ -141,7 +141,8 @@ const chargeContinuationToleranceEUR = 0.01
 // zero energy before the extension is priced, so a still-running charge is never
 // silently stopped mid-slot.
 //
-// windows must be the price-sorted selection; it is mutated in place only once
+// windows must be the full price-sorted eligible list, of which the first
+// count entries are the selection; it is mutated in place only once
 // the displacement is known to be both affordable and fully absorbable. Returns
 // the new selected count and whether the displacement was applied.
 func (s *Service) extendRunningReservationSlice(now time.Time, windows []TimeWindow, count int, powerKW float64, deadline time.Time) (int, bool) {
@@ -215,7 +216,6 @@ func (s *Service) extendRunningReservationSlice(now time.Time, windows []TimeWin
 		return count, false
 	}
 	if reAdd {
-		marginal.End = marginal.Start
 		windows[index], windows[count] = windows[count], windows[index]
 		marginal = &windows[count]
 		count = newCount

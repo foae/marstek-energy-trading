@@ -151,3 +151,87 @@ func TestSolarSessionRecordsACMeasuredEnergy(t *testing.T) {
 		t.Fatalf("energy basis = %q, want %q", trade.EnergyBasis, measuredACPowerEnergyBasis)
 	}
 }
+
+func TestChargeStartSeedsFromDCWhenACReadFails(t *testing.T) {
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	now := baseTime
+	battery := NewMockBattery(50)
+	battery.IgnorePowerCommands = true
+	battery.CurrentPower = 2000
+	battery.ACPower = 2100
+	battery.ACPowerSet = true
+	// Fail only the start-of-session AC read: the tick-level read before the
+	// charge command must succeed so the session is allowed to start.
+	battery.ChargeHook = func() { battery.GetACPowerErr = errors.New("AC power unavailable") }
+	svc := newTestService(testConfigSmallBattery(), battery, makePrices(baseTime, 0.05, 0.05, 0.05, 0.05), now)
+	svc.nowFunc = func() time.Time { return now }
+	svc.recorder = NewRecorder(t.TempDir(), svc.cfg.BatteryEfficiency, time.UTC)
+	setReservedChargePlan(svc, baseTime, decimal.NewFromFloat(0.05))
+
+	svc.tick(context.Background())
+	battery.GetACPowerErr = nil
+
+	if svc.state != StateCharging {
+		t.Fatalf("state after AC read failure at start = %s, want charging", svc.state)
+	}
+	if battery.IdleCalls != 0 {
+		t.Fatalf("failed start-of-session AC read idled the battery: idle=%d", battery.IdleCalls)
+	}
+	if svc.observedChargePowerW != 2000 {
+		t.Fatalf("observed charge power = %v, want 2000 (DC verification power seed)", svc.observedChargePowerW)
+	}
+
+	now = now.Add(30 * time.Second)
+	svc.tick(context.Background())
+
+	if svc.state != StateCharging {
+		t.Fatalf("state after recovered AC read = %s, want charging", svc.state)
+	}
+}
+
+func TestCommittedCycleRecordsExportPriceMode(t *testing.T) {
+	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	dir := t.TempDir()
+	cfg := testConfigSmallBattery()
+	cfg.ExportPriceMode = "wholesale"
+
+	battery := NewMockBattery(50)
+	battery.IgnorePowerCommands = true
+	battery.CurrentPower = 2000
+	battery.ACPower = 2100
+	battery.ACPowerSet = true
+	svc := newTestService(cfg, battery, makePrices(baseTime, 0.05, 0.05, 0.05, 0.05), baseTime)
+	svc.recorder = NewRecorder(dir, cfg.BatteryEfficiency, time.UTC)
+	setReservedChargePlan(svc, baseTime, decimal.NewFromFloat(0.05))
+
+	svc.tick(context.Background())
+	if svc.state != StateCharging {
+		t.Fatalf("state after charge start = %s, want charging", svc.state)
+	}
+
+	commitment, err := svc.recorder.LoadAutomaticCycleCommitment()
+	if err != nil {
+		t.Fatalf("load persisted commitment: %v", err)
+	}
+	if commitment == nil {
+		t.Fatal("charge start did not persist an automatic cycle commitment")
+	}
+	if commitment.ExportPriceMode != "wholesale" {
+		t.Fatalf("persisted export price mode = %q, want %q", commitment.ExportPriceMode, "wholesale")
+	}
+
+	// Pin the persistence half: a restart under the same export mode must restore
+	// the cycle as chargeable, not discharge-only.
+	restartBattery := NewMockBattery(50)
+	restarted := newTestService(cfg, restartBattery, makePrices(baseTime, 0.05, 0.05, 0.05, 0.05), baseTime)
+	restarted.recorder = NewRecorder(dir, cfg.BatteryEfficiency, time.UTC)
+	if err := restarted.restoreAutomaticCycleCommitment(); err != nil {
+		t.Fatalf("restore persisted commitment: %v", err)
+	}
+	if restarted.currentPlan == nil {
+		t.Fatal("restore did not install a plan")
+	}
+	if restarted.currentPlan.DischargeOnly {
+		t.Fatal("cycle persisted and restored under the same export mode was demoted to discharge-only")
+	}
+}

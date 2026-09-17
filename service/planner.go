@@ -186,6 +186,7 @@ type gridPlanner struct {
 	roundTrip           float64
 	usableDCKWh         float64
 	fullDeliveryKWh     float64
+	initialTrustedDCKWh float64
 	chargePowerKW       float64
 	dischargePowerKW    float64
 	planningStart       time.Time
@@ -210,10 +211,9 @@ func newGridPlanner(slots []priceSlot, cfg AnalyzerConfig) *gridPlanner {
 	if dischargePowerKW <= 0 {
 		dischargePowerKW = 2.5
 	}
-	usableDCKWh := cfg.BatteryCapacityKWh * (1 - cfg.BatteryMinSOC)
-	if usableDCKWh < 0 {
-		usableDCKWh = 0
-	}
+	physicalUsable := physicalUsableDCKWh(cfg)
+	initialTrustedDCKWh, quarantinedDCKWh := inventoryBudgetDCKWh(cfg, physicalUsable)
+	usableDCKWh := physicalUsable - quarantinedDCKWh
 	planningStart := cfg.Now
 	if planningStart.IsZero() && len(slots) > 0 {
 		planningStart = slots[0].Time
@@ -226,17 +226,18 @@ func newGridPlanner(slots []priceSlot, cfg AnalyzerConfig) *gridPlanner {
 		return chargeSlots[i].Value.LessThan(chargeSlots[j].Value)
 	})
 	planner := &gridPlanner{
-		slots:            slots,
-		cfg:              cfg,
-		chargeEfficiency: chargeEfficiency,
-		roundTrip:        roundTrip,
-		usableDCKWh:      usableDCKWh,
-		fullDeliveryKWh:  usableDCKWh * roundTrip / chargeEfficiency,
-		chargePowerKW:    chargePowerKW,
-		dischargePowerKW: dischargePowerKW,
-		planningStart:    planningStart,
-		memo:             make(map[gridMemoKey]valuePlan),
-		allocationMemo:   make(map[chargeAllocationMemoKey]chargeAllocation),
+		slots:               slots,
+		cfg:                 cfg,
+		chargeEfficiency:    chargeEfficiency,
+		roundTrip:           roundTrip,
+		usableDCKWh:         usableDCKWh,
+		fullDeliveryKWh:     usableDCKWh * roundTrip / chargeEfficiency,
+		initialTrustedDCKWh: initialTrustedDCKWh,
+		chargePowerKW:       chargePowerKW,
+		dischargePowerKW:    dischargePowerKW,
+		planningStart:       planningStart,
+		memo:                make(map[gridMemoKey]valuePlan),
+		allocationMemo:      make(map[chargeAllocationMemoKey]chargeAllocation),
 	}
 	planner.dischargeCandidates = make([]dischargeCandidate, len(slots))
 	for start := range slots {

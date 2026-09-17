@@ -54,11 +54,11 @@ A Go service that controls a Marstek Venus E battery with NordPool day-ahead pri
 
 ### Joint inventory and grid planning
 
-1. **Determine usable observed inventory.** A fresh SOC observation supplies usable stored DC energy above the configured minimum SOC:
+1. **Determine trusted inventory.** A durable DC ledger is replenished only by consecutive valid measured charging samples while the service controls charging. Fresh SOC supplies a downward cap:
    ```
-   usable_inventory_kWh = max(0, capacity_kWh * (observed_soc - min_soc))
+   trusted_inventory_kWh = min(ledger_kWh, max(0, capacity_kWh * (observed_soc - min_soc)))
    ```
-   It is a real, finite input to the plan, not a reconstructed historical grid charge.
+   Observed energy above that allowance is quarantined: it reduces available purchase capacity but cannot generate planned discharge revenue. Missing, interrupted, or configuration-mismatched ledgers start at zero; telemetry gaps cannot earn credit.
 
 2. **Evaluate grid pairs.** A contiguous discharge window is paired with the cheapest executable, individually eligible charge slices before it; the charge slices need not be contiguous. Expected profit per input kWh is `discharge_average * efficiency - charge_average`; it must be strictly positive and meet `MIN_PRICE_SPREAD`.
 
@@ -74,7 +74,7 @@ For the next unfinished grid charge cycle, the service derives a deadline from i
 
 Executed charge and discharge energy is integrated from measured AC-power samples and priced across retained 15-minute rate slots. Energy without an applicable retained rate is explicitly unpriced. New split scheduled-charge records carry an explicit source-attribution marker and record separately attributed grid and solar portions: priced grid cost remains in cash flow, while forgone solar export is priced as opportunity cost. Records without that marker retain their legacy interpretation. Cash-flow P&L is priced discharge value minus priced grid cost. The separately reported opportunity-cost-adjusted metric also deducts priced solar opportunity cost; neither is inventory-matched trading profit.
 
-Scheduled discharge starts in its planned window when SOC is above its configured minimum. An active inventory sale can continue while a tariff sample is temporarily missing, recording that energy as unpriced, but stops on a confirmed nonpositive export tariff. This is separate from a durable grid-cycle commitment, whose existing discharge obligation remains conservative through unavailable current prices. `lastChargePrice` remains informational logging only and does not gate discharge.
+Scheduled discharge starts in its planned window only with sufficient trusted inventory above the SOC minimum and time for a conservative stop. A durable in-flight marker precedes every discharge attempt. DC debit uses the greater of efficiency-adjusted commanded demand and observed draw through confirmed idle; higher draw can shorten the automatic deadline. An active inventory sale can continue through a missing tariff, recording unpriced energy, but stops on confirmed nonpositive export value. Durable grid-cycle obligations retain their distinct tariff handling but do not bypass the inventory gate. `lastChargePrice` remains informational.
 
 ### Solar Self-Consumption
 
@@ -219,7 +219,7 @@ Commands are accepted only from the configured private `TELEGRAM_CHAT_ID`; group
 | `/discharge 800` | Start manual discharge at a chosen power from 800-2500 W |
 | `/auto` | Stop manual discharge and return control to automatic trading and solar charging |
 
-Manual discharge stops at the configured minimum SOC, when battery status or command refresh fails, or after two hours. The completed discharge is included in trade history and P&L.
+Manual discharge stops at the configured minimum SOC, when battery status or command refresh fails, or after two hours. It bypasses the automatic inventory-allowance gate but still debits the ledger and requires durable intent and confirmed-idle settlement. The completed discharge is included in trade history and P&L.
 
 ### Status Command Response
 

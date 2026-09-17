@@ -74,6 +74,7 @@ type AnalyzerConfig struct {
 	RetiredDischargeWindows []TimeWindow // Completed discharge windows excluded from new cycles
 	InitialSOC              int          // Fresh observed SOC; meaningful only when InitialSOCKnown
 	InitialSOCKnown         bool         // Explicitly distinguishes no observation from empty inventory
+	AvailableInventoryDCKWh *float64     // Trusted measured DC inventory; non-nil quarantines other observed energy
 }
 
 // AnalyzePrices selects executable chronological grid cycles by total EUR. A
@@ -123,8 +124,7 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 		maxCycles = 2
 	}
 
-	initialDCKWh := observedUsableDCKWh(cfg, planner.usableDCKWh)
-	best, inventorySale := planner.bestWithInventory(initialDCKWh, maxCycles)
+	best, inventorySale := planner.bestWithInventory(planner.initialTrustedDCKWh, maxCycles)
 
 	plan.Cycles = best.cycles
 	for _, cycle := range plan.Cycles {
@@ -138,6 +138,30 @@ func AnalyzePrices(prices []nordpool.Price, cfg AnalyzerConfig) *TradingPlan {
 	}
 	plan.IsProfitable = len(plan.Cycles) > 0 || plan.InventorySale != nil
 	return plan
+}
+
+func physicalUsableDCKWh(cfg AnalyzerConfig) float64 {
+	usable := cfg.BatteryCapacityKWh * (1 - cfg.BatteryMinSOC)
+	if usable < 0 {
+		return 0
+	}
+	return usable
+}
+
+func inventoryBudgetDCKWh(cfg AnalyzerConfig, physicalUsableDCKWh float64) (trusted, quarantined float64) {
+	observed := observedUsableDCKWh(cfg, physicalUsableDCKWh)
+	if cfg.AvailableInventoryDCKWh == nil {
+		return observed, 0
+	}
+	if !cfg.InitialSOCKnown {
+		return 0, 0
+	}
+	available := *cfg.AvailableInventoryDCKWh
+	if math.IsNaN(available) || math.IsInf(available, 0) || available < 0 {
+		available = 0
+	}
+	trusted = math.Min(observed, available)
+	return trusted, observed - trusted
 }
 
 func observedUsableDCKWh(cfg AnalyzerConfig, capacity float64) float64 {

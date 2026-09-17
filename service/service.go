@@ -151,6 +151,7 @@ type Service struct {
 	lastBridgeRestart            time.Time // rate limit ESPHome bridge restarts
 	retiredDischargeWindows      []TimeWindow
 	retiredDischargeWindowsDirty bool
+	inventory                    dischargeInventory
 
 	// Battery telemetry is sampled only by the serialized control loop. Status
 	// readers expose this cache together with its observation time.
@@ -340,6 +341,7 @@ func (s *Service) cacheBatteryTelemetryLocked(soc int, powerW float64) {
 	s.batteryTelemetrySOC = soc
 	s.batteryTelemetryPowerW = powerW
 	s.batteryTelemetryUpdatedAt = s.now()
+	s.observeDischargeInventoryLocked(soc, powerW)
 }
 
 func (s *Service) beginMeasuredTradeLocked(measuredPowerW float64) {
@@ -528,7 +530,10 @@ func (s *Service) Start(ctx context.Context) error {
 		s.state = StateStopping
 		s.lastStopAttempt = s.now()
 		s.mu.Unlock()
-		slog.Error("failed to reset battery control on startup; will retry", "error", err)
+		return fmt.Errorf("reset battery control on startup: %w", err)
+	}
+	if err := s.restoreDischargeInventory(); err != nil {
+		return fmt.Errorf("restore discharge inventory: %w", err)
 	}
 
 	// Discover battery
@@ -577,6 +582,8 @@ func (s *Service) Start(ctx context.Context) error {
 	// Telegram command polling (every 5 seconds)
 	cmdTicker := time.NewTicker(5 * time.Second)
 	defer cmdTicker.Stop()
+	inventoryTicker := time.NewTicker(time.Second)
+	defer inventoryTicker.Stop()
 
 	// Solar ticker: 1s interval when P1 meter enabled, nil channel when disabled
 	var solarTickCh <-chan time.Time
@@ -631,6 +638,9 @@ func (s *Service) Start(ctx context.Context) error {
 		case <-cmdTicker.C:
 			s.handleTelegramCommands(ctx)
 
+		case <-inventoryTicker.C:
+			s.sampleDischargeInventory(ctx)
+
 		case <-solarTickCh:
 			s.solarTick(ctx)
 		}
@@ -643,13 +653,13 @@ func (s *Service) automaticDischargeDeadlineLocked() time.Time {
 	if s.state != StateDischarging || s.stopPending {
 		return time.Time{}
 	}
+	var windowEnd time.Time
 	if s.activeInventorySale != nil {
-		return s.activeInventorySale.End
+		windowEnd = s.activeInventorySale.End
+	} else if s.automaticCycleCommit != nil {
+		windowEnd = s.automaticCycleCommit.DischargeWindow.End
 	}
-	if s.automaticCycleCommit != nil {
-		return s.automaticCycleCommit.DischargeWindow.End
-	}
-	return time.Time{}
+	return s.dischargeInventoryDeadlineLocked(windowEnd)
 }
 
 func durationUntilNextPriceBoundary(now time.Time) time.Duration {
@@ -668,6 +678,7 @@ func (s *Service) tick(ctx context.Context) {
 	if err != nil {
 		s.mu.Lock()
 		s.batteryTelemetryAvailable = false
+		s.invalidateDischargeInventoryLocked()
 		switch s.state {
 		case StateCharging:
 			s.stopChargingLocked(ctx, s.currentTradeLastSOC)
@@ -705,6 +716,7 @@ func (s *Service) tick(ctx context.Context) {
 		}
 	} else {
 		s.batteryTelemetryAvailable = false
+		s.invalidateDischargeInventoryLocked()
 		switch s.state {
 		case StateCharging:
 			s.stopChargingLocked(ctx, batStatus.SOC)
@@ -935,8 +947,12 @@ func (s *Service) tick(ctx context.Context) {
 
 	case StateDischarging:
 		minSOC := s.cfg.MinSOCPercent()
+		dischargeDeadline := s.dischargeInventoryDeadlineLocked(dischargeWindow.End)
 		if !inDischargeWindow {
 			l.Info("decision: stop discharging - left discharge window")
+			s.stopDischargingLocked(ctx, batStatus.SOC)
+		} else if !now.Before(dischargeDeadline) {
+			l.Info("decision: stop discharging - inventory deadline reached", "deadline", dischargeDeadline)
 			s.stopDischargingLocked(ctx, batStatus.SOC)
 		} else if batStatus.SOC <= minSOC {
 			l.Info("decision: stop discharging - battery at min SOC", "min_soc", minSOC)
@@ -947,17 +963,18 @@ func (s *Service) tick(ctx context.Context) {
 				s.stopDischargingLocked(ctx, batStatus.SOC)
 				return
 			}
-			if dischargeWindow.End.Sub(now) <= minimumAutomaticControlWindow {
-				l.Debug("skipping discharge refresh near window end", "window_end", dischargeWindow.End)
+			if dischargeDeadline.Sub(now) <= minimumAutomaticControlWindow {
+				l.Debug("skipping discharge refresh near deadline", "deadline", dischargeDeadline)
 				return
 			}
-			refreshCtx, cancelRefresh := context.WithTimeout(ctx, dischargeWindow.End.Sub(now))
+			refreshCtx, cancelRefresh := context.WithTimeout(ctx, dischargeDeadline.Sub(now))
 			refreshed := s.refreshPassiveModeLocked(refreshCtx, s.cfg.DischargePowerW)
 			cancelRefresh()
 			if !refreshed {
 				s.stopDischargingLocked(ctx, batStatus.SOC)
-			} else if _, active := s.dischargeWindowAtLocked(s.now()); !active {
-				l.Info("decision: stop discharging - discharge window expired during refresh")
+			} else if _, active := s.dischargeWindowAtLocked(s.now()); !active ||
+				!s.now().Before(s.dischargeInventoryDeadlineLocked(dischargeWindow.End)) {
+				l.Info("decision: stop discharging - discharge deadline expired during refresh")
 				s.stopDischargingLocked(ctx, batStatus.SOC)
 			}
 		}
@@ -1059,6 +1076,7 @@ func (s *Service) solarTick(ctx context.Context) {
 	if err != nil {
 		s.mu.Lock()
 		s.batteryTelemetryAvailable = false
+		s.invalidateDischargeInventoryLocked()
 		s.mu.Unlock()
 		s.handleSolarStatusFailure(ctx, err)
 		return
@@ -1968,6 +1986,15 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 	priceF, _ := price.Float64()
 	lastChargeF, _ := s.lastChargePrice.Float64()
 	l := slog.With("action", "discharge", "price_eur_kwh", priceF, "price_known", currentPriceKnown, "soc", soc, "power_w", powerW, "last_charge_price", lastChargeF, "target_state", targetState)
+	windowEnd := time.Time{}
+	if automatic {
+		windowEnd = dischargeWindow.End
+	}
+	dischargeDeadline, err := s.prepareDischargeInventoryLocked(soc, powerW, automatic, windowEnd)
+	if err != nil {
+		l.Warn("discharge start blocked by inventory ledger", "error", err)
+		return
+	}
 	l.Info("starting discharge session")
 
 	// Release lock during network I/O
@@ -1975,9 +2002,9 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 	controlCtx := ctx
 	cancelControl := func() {}
 	if automatic {
-		controlCtx, cancelControl = context.WithTimeout(ctx, dischargeWindow.End.Sub(s.now()))
+		controlCtx, cancelControl = context.WithTimeout(ctx, max(dischargeDeadline.Sub(s.now()), 0))
 	}
-	err := s.battery.DischargeContext(controlCtx, powerW, s.cfg.PassiveModeTimeoutS)
+	err = s.battery.DischargeContext(controlCtx, powerW, s.cfg.PassiveModeTimeoutS)
 	var measuredPowerW float64
 	var idleErr error
 	var measuredACPowerW float64
@@ -2004,11 +2031,17 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 	}
 	s.mu.Lock()
 	_, dischargeStillActive := s.dischargeWindowAtLocked(s.now())
-	windowExpired := err == nil && automatic && !dischargeStillActive
+	windowExpired := err == nil && automatic &&
+		(!dischargeStillActive || !s.now().Before(dischargeDeadline))
 
 	if err != nil {
 		if idleErr != nil {
 			s.state = StateStopping
+			s.stopPending = true
+			s.lastStopAttempt = s.now()
+		} else if !s.settleDischargeInventoryLocked() {
+			s.state = StateStopping
+			s.stopPending = true
 			s.lastStopAttempt = s.now()
 		}
 		l.Error("failed to start discharging", "error", err, "link_down", errors.Is(err, marstek.ErrLinkDown))
@@ -2082,6 +2115,7 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 	previousState := s.state
 	tradePowerW := s.currentTradePowerW
+	inventoryDeadlineReached := !s.inventory.deadline.IsZero() && !s.now().Before(s.inventory.deadline)
 	var uncommittedSessionWindow TimeWindow
 	hasUncommittedSessionWindow := false
 	if previousState == StateDischarging && s.automaticCycleCommit == nil {
@@ -2090,6 +2124,7 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 	if !s.transitionToIdleLocked(ctx, endSOC) {
 		return
 	}
+	inventoryExhausted := s.inventory.remainingDCKWh <= 0
 	stopTime := s.now()
 	s.accumulateMeasuredTradeEnergyAtLocked(s.currentTradeLastPowerW, stopTime, false)
 	duration := stopTime.Sub(s.currentTradeStart)
@@ -2137,7 +2172,9 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 		completedWindow, hasAutomaticWindow = uncommittedSessionWindow, hasUncommittedSessionWindow
 	}
 	completedAutomaticCycle := hasAutomaticWindow &&
-		(!stopTime.Before(completedWindow.End) || endSOC <= s.cfg.MinSOCPercent())
+		(!stopTime.Before(completedWindow.End) ||
+			endSOC <= s.cfg.MinSOCPercent() ||
+			(previousState == StateDischarging && (inventoryDeadlineReached || inventoryExhausted)))
 	retirements := retainedDischargeWindows(s.retiredDischargeWindows, stopTime)
 	if completedAutomaticCycle {
 		retiredKnown := false
@@ -2255,7 +2292,17 @@ func (s *Service) transitionToIdleLocked(ctx context.Context, soc int) bool {
 		return false
 	}
 	s.mu.Lock()
+	if s.state == StateCharging || s.state == StateDischarging || s.state == StateManualDischarging {
+		s.accumulateMeasuredTradeEnergyAtLocked(0, s.now(), s.state == StateCharging)
+	}
 
+	if !s.settleDischargeInventoryLocked() {
+		s.stopPending = true
+		s.mu.Unlock()
+		s.notifyError(ctx, "Battery is idle but inventory settlement failed; control remains blocked until persistence recovers")
+		s.mu.Lock()
+		return false
+	}
 	s.state = StateIdle
 	s.stopPending = false
 	s.lastStopAttempt = time.Time{}
@@ -2315,6 +2362,7 @@ func (s *Service) retryStopping(ctx context.Context) bool {
 		endSOC = status.SOC
 	} else {
 		s.batteryTelemetryAvailable = false
+		s.invalidateDischargeInventoryLocked()
 	}
 
 	if s.state != StateStopping && !s.stopPending {
@@ -2653,6 +2701,11 @@ func (s *Service) refreshCurrentPlanLocked(now time.Time) *TradingPlan {
 	}
 	cfg.InitialSOC = s.batteryTelemetrySOC
 	cfg.InitialSOCKnown = s.batteryTelemetryAvailable
+	availableInventoryDCKWh := s.inventory.remainingDCKWh
+	if s.inventory.blocked {
+		availableInventoryDCKWh = 0
+	}
+	cfg.AvailableInventoryDCKWh = &availableInventoryDCKWh
 	prices := s.futurePriceHorizonLocked(localMidnight(now))
 	cfg.RetiredDischargeWindows = append([]TimeWindow(nil), cfg.RetiredDischargeWindows...)
 	s.planRevision++
@@ -3113,6 +3166,7 @@ func (s *Service) checkLinkDuringSession(ctx context.Context) {
 	if s.linkDownSince.IsZero() {
 		s.linkDownSince = s.now()
 	}
+	s.invalidateDischargeInventoryLocked()
 	downSince := s.linkDownSince
 	state := s.state
 	powerW := s.currentTradePowerW
@@ -3306,6 +3360,7 @@ func (s *Service) handleManualDischargeCommand(ctx context.Context, args []strin
 	batStatus, err := s.battery.GetBatteryStatusContext(ctx)
 	if err != nil {
 		s.mu.Lock()
+		s.invalidateDischargeInventoryLocked()
 		s.batteryTelemetryAvailable = false
 		s.mu.Unlock()
 		s.sendTelegramCommandResponse(ctx, "Manual discharge not started: battery status is unavailable.")
@@ -3351,6 +3406,7 @@ func (s *Service) handleManualDischargeCommand(ctx context.Context, args []strin
 		batStatus, err = s.battery.GetBatteryStatusContext(ctx)
 		s.mu.Lock()
 		if err != nil {
+			s.invalidateDischargeInventoryLocked()
 			s.batteryTelemetryAvailable = false
 			s.mu.Unlock()
 			s.sendTelegramCommandResponse(ctx, "Manual discharge not started: fresh battery status is unavailable after stopping the previous operation.")
@@ -3424,6 +3480,7 @@ func (s *Service) handleAutoCommand(ctx context.Context) {
 		endSOC = batStatus.SOC
 	} else {
 		s.mu.Lock()
+		s.invalidateDischargeInventoryLocked()
 		s.batteryTelemetryAvailable = false
 		s.mu.Unlock()
 	}
@@ -3532,6 +3589,9 @@ type CurrentStatus struct {
 	CommitmentDischargeWindowEnd *time.Time               `json:"commitment_discharge_window_end,omitempty"`
 	NextAction                   string                   `json:"next_action,omitempty"`
 	MeasuredEfficiency           efficiencySummary        `json:"measured_efficiency"`
+	InventoryAvailableDCKWh      float64                  `json:"inventory_available_dc_kwh"`
+	InventoryDischargeInFlight   bool                     `json:"inventory_discharge_in_flight"`
+	InventoryPersistenceBlocked  bool                     `json:"inventory_persistence_blocked"`
 }
 
 // GetCurrentStatus returns cached control-loop telemetry and current trading
@@ -3544,13 +3604,16 @@ func (s *Service) GetCurrentStatus(ctx context.Context) CurrentStatus {
 
 	now := s.now()
 	status := CurrentStatus{
-		State:              s.state,
-		BatteryAvailable:   s.batteryTelemetryAvailable,
-		BatterySOC:         s.batteryTelemetrySOC,
-		BatteryPowerW:      s.batteryTelemetryPowerW,
-		BatteryObservedAt:  s.batteryTelemetryUpdatedAt,
-		PlanPending:        s.pendingPlan != nil,
-		MeasuredEfficiency: s.measuredEfficiencySummary(),
+		State:                       s.state,
+		BatteryAvailable:            s.batteryTelemetryAvailable,
+		BatterySOC:                  s.batteryTelemetrySOC,
+		BatteryPowerW:               s.batteryTelemetryPowerW,
+		BatteryObservedAt:           s.batteryTelemetryUpdatedAt,
+		PlanPending:                 s.pendingPlan != nil,
+		MeasuredEfficiency:          s.measuredEfficiencySummary(),
+		InventoryAvailableDCKWh:     s.inventory.remainingDCKWh,
+		InventoryDischargeInFlight:  s.inventory.inFlight,
+		InventoryPersistenceBlocked: s.inventory.blocked,
 	}
 	if s.currentPlan != nil {
 		status.PlanDischargeOnly = s.currentPlan.DischargeOnly

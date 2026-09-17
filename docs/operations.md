@@ -126,7 +126,7 @@ An invalid or corrupt `automatic-cycle-commitment.json` makes startup attempt to
 
 Changing `EXPORT_PRICE_MODE` while a commitment is persisted retains only the discharge obligation: the stored windows were priced under the previous mode, so the restored cycle is never re-authorized for further grid charging. Changing `BATTERY_EFFICIENCY` re-evaluates the restored cycle against the new expected-profit floor at startup, which can likewise demote it to discharge-only.
 
-Uncommitted inventory sales are not durable commitments. After restart, the service must obtain fresh SOC and known current/future tariffs before selecting one again; it must not infer a historical charge or invent missing prices. This does not block qualified solar capture. A currently active inventory sale can account missing tariff samples as unpriced but stops on a confirmed nonpositive export tariff.
+Uncommitted inventory sale windows are not durable commitments. After restart, the service confirms idle, restores the measured inventory allowance, and obtains fresh SOC and known tariffs before selecting one again. SOC cannot recreate spent or unmeasured inventory. This does not block qualified solar capture. A currently active inventory sale can account missing tariffs as unpriced but stops on a confirmed nonpositive export tariff.
 
 If deletion of an expired or completed commitment fails, the service remains running but pins planning and retries fail-closed. `/status` reports the grid commitment, its durability, the staged-plan flag, and `automatic cycle commitment cleanup pending`; logs and Telegram report the filesystem error. Restore write access to `DATA_DIR` rather than deleting a live commitment blindly.
 
@@ -137,6 +137,12 @@ If deletion of an expired or completed commitment fails, the service remains run
 An unreadable, malformed, or invalid retirement file makes startup attempt a safe stop and refuse to trade. As with a commitment-file failure, failed battery communication can leave a prior forced operation active. Stop the service and confirm physical idle before repairing state. Preserve the original file, check filesystem permissions, and restore a valid backup where available; do not replace it with an empty list merely to bypass the error, because that removes completed-window protection.
 
 If saving or pruning retirement markers fails at runtime, `/status` reports `completed sale persistence pending; automatic control blocked`. Automatic grid starts and discharge selection remain blocked while persistence is dirty. Restore write access to `DATA_DIR` and allow the normal retry path to clear the condition; do not restart repeatedly or delete markers to force a new plan.
+
+### Measured Inventory Recovery
+
+`inventory-ledger.json` stores the remaining measured DC allowance and an in-flight discharge marker. Preserve it with the other files in `DATA_DIR`. Startup first confirms physical idle. A missing file (including migration), an in-flight marker after an interrupted discharge, or changed capacity/minimum SOC initializes zero trusted inventory. Only subsequently measured service-controlled charging replenishes it; an unchanged or rebounding SOC cannot authorize another sale.
+
+Malformed or unreadable inventory blocks startup. A publication failure blocks discharge; failed stop settlement retains the session and retries without authorizing another command. Restore filesystem access rather than inserting an SOC-derived balance. `/status` exposes `inventory_available_dc_kwh`, `inventory_persistence_blocked`, and `inventory_discharge_in_flight`. Manual discharge remains an explicit override but is debited and protected by the same durable marker.
 
 ### Automatic Control Deadlines
 

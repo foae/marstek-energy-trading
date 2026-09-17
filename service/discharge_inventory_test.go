@@ -16,7 +16,7 @@ func TestInventoryStaleSOCDoesNotReauthorizeSpentEnergy(t *testing.T) {
 	cfg.BatteryEfficiency = 0.79
 	cfg.BatteryChargeEfficiency = 0.95
 	cfg.DischargePowerW = 2200
-	battery := NewMockBattery(13)
+	battery := NewMockBattery(30)
 	prices := make([]nordpool.Price, 8)
 	for i := range prices {
 		prices[i] = nordpool.Price{Time: now.Add(time.Duration(i) * 15 * time.Minute), Value: 0.4}
@@ -28,7 +28,9 @@ func TestInventoryStaleSOCDoesNotReauthorizeSpentEnergy(t *testing.T) {
 		t.Fatalf("first measured inventory sale did not start: %+v", battery.DischargeCalls)
 	}
 	battery.CurrentPower = -2510
-	for i := 0; i < 100; i++ {
+	// 19% usable at 2200 W AC is roughly 22 minutes; SOC never moves, so the
+	// allowance is never replenished and the budget must stop the sale.
+	for i := 0; i < 30*60; i++ {
 		now = now.Add(time.Second)
 		svc.sampleDischargeInventory(context.Background())
 	}

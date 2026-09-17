@@ -11,19 +11,49 @@ import (
 // The bridge has no hardware command expiry. This margin reserves time for a
 // normal confirmed stop; an unreachable bridge can still exceed it. In that
 // case the allowance is quarantined, not reconstructed from integer SOC.
-const inventoryStopMargin = 45 * time.Second
+const (
+	inventoryStopMargin = 45 * time.Second
+	// Service-controlled charging earns credit for the interval between two
+	// valid DC samples at the lower of the two readings. ESPHome HTTP polls
+	// regularly take longer than the nominal second; a longer gap earns nothing
+	// (a frozen link invalidates the allowance before this tolerance matters).
+	inventoryCreditGapTolerance = time.Minute
+	// A SOC that moved this recently on a link the check reports live is a
+	// fresh measurement of what is in the battery: it may raise the in-flight
+	// allowance up to its cap. A frozen SOC never moves and never replenishes.
+	inventorySOCLiveWindow = 10 * time.Minute
+)
 
 type dischargeInventory struct {
 	remainingDCKWh     float64
 	inFlight           bool
 	blocked            bool
 	deadline           time.Time
+	windowEnd          time.Time
 	debitAt            time.Time
 	debitPowerW        float64
 	sampleAt           time.Time
 	chargePowerW       float64
 	sampleCharging     bool
+	lastSOC            int
+	lastSOCKnown       bool
+	socLiveAt          time.Time
 	lastPersistAttempt time.Time
+}
+
+// dischargeEfficiency is the configured DC-to-AC share: round-trip divided by
+// the charge-side efficiency. AC watts divided by it give the DC draw.
+func (s *Service) dischargeEfficiency() float64 {
+	roundTrip := s.cfg.BatteryEfficiency
+	charge := s.cfg.BatteryChargeEfficiency
+	if !(roundTrip > 0 && roundTrip <= 1) || !(charge > 0 && charge <= 1) {
+		return 0.5
+	}
+	efficiency := roundTrip / charge
+	if !(efficiency > 0) || math.IsNaN(efficiency) {
+		return 0.5
+	}
+	return min(efficiency, 1)
 }
 
 func (s *Service) inventorySOCCap(soc int) float64 {
@@ -78,8 +108,12 @@ func (s *Service) debitDischargeInventoryLocked(now time.Time, powerW float64) {
 	}
 }
 
-// Only consecutive, timely DC samples during service-controlled charging earn
-// inventory. A gap earns nothing. SOC is exclusively a downward cap.
+// Consecutive valid DC samples during service-controlled charging earn
+// inventory; a gap beyond the tolerance earns nothing. SOC caps the allowance
+// downward, and while a sale is in flight a SOC that is demonstrably moving on
+// a live link also raises it back up to that cap. A SOC frozen by a dead link
+// cannot: it does not move, and the link check has already invalidated the
+// allowance.
 func (s *Service) observeDischargeInventoryLocked(soc int, powerW float64) {
 	if math.IsNaN(powerW) || math.IsInf(powerW, 0) {
 		s.invalidateDischargeInventoryLocked()
@@ -88,12 +122,29 @@ func (s *Service) observeDischargeInventoryLocked(soc int, powerW float64) {
 	now := s.now()
 	inv := &s.inventory
 	s.debitDischargeInventoryLocked(now, powerW)
+	if inv.lastSOCKnown && soc != inv.lastSOC {
+		inv.socLiveAt = now
+	}
+	inv.lastSOC = soc
+	inv.lastSOCKnown = true
 	charging := !inv.inFlight && !s.stopPending && s.linkDownSince.IsZero() && (s.state == StateCharging || s.state == StateSolarCharging)
 	elapsed := now.Sub(inv.sampleAt)
-	if !inv.blocked && charging && inv.sampleCharging && elapsed > 0 && elapsed <= solarTelemetryGapTolerance {
+	if !inv.blocked && charging && inv.sampleCharging && elapsed > 0 && elapsed <= inventoryCreditGapTolerance {
 		inv.remainingDCKWh += min(inv.chargePowerW, max(0, powerW)) * elapsed.Hours() / 1000
 	}
-	inv.remainingDCKWh = min(inv.remainingDCKWh, s.inventorySOCCap(soc))
+	socCap := s.inventorySOCCap(soc)
+	socLive := !inv.socLiveAt.IsZero() && now.Sub(inv.socLiveAt) <= inventorySOCLiveWindow
+	if inv.inFlight && !inv.blocked && socLive && s.linkDownSince.IsZero() && socCap > inv.remainingDCKWh {
+		inv.remainingDCKWh = socCap
+		if !inv.deadline.IsZero() && inv.debitPowerW > 0 {
+			deadline := now.Add(time.Duration(inv.remainingDCKWh*3_600_000/inv.debitPowerW*float64(time.Second)) - inventoryStopMargin)
+			if !inv.windowEnd.IsZero() && inv.windowEnd.Before(deadline) {
+				deadline = inv.windowEnd
+			}
+			inv.deadline = deadline
+		}
+	}
+	inv.remainingDCKWh = min(inv.remainingDCKWh, socCap)
 	inv.sampleAt = now
 	inv.chargePowerW = max(0, powerW)
 	inv.sampleCharging = charging
@@ -103,6 +154,8 @@ func (s *Service) invalidateDischargeInventoryLocked() {
 	s.inventory.remainingDCKWh = 0
 	s.inventory.sampleCharging = false
 	s.inventory.sampleAt = time.Time{}
+	// Liveness must be proven again by a SOC change after the invalidation.
+	s.inventory.socLiveAt = time.Time{}
 	if s.inventory.inFlight && !s.inventory.deadline.IsZero() {
 		s.inventory.deadline = s.now()
 	}
@@ -114,13 +167,9 @@ func (s *Service) prepareDischargeInventoryLocked(soc, powerW int, automatic boo
 		return time.Time{}, fmt.Errorf("discharge inventory persistence or settlement pending")
 	}
 	inv.remainingDCKWh = min(inv.remainingDCKWh, s.inventorySOCCap(soc))
-	// Use the less favorable configured efficiency, never AC watts as DC watts.
-	// Actual observed draw may increase this estimate but never decrease it.
-	efficiency := min(s.cfg.BatteryEfficiency, s.cfg.BatteryChargeEfficiency)
-	if !(efficiency > 0 && efficiency <= 1) {
-		efficiency = 0.5
-	}
-	rate := float64(powerW) / efficiency
+	// AC watts over the discharge-side efficiency estimate the DC draw; actual
+	// observed draw may increase this estimate but never decrease it.
+	rate := float64(powerW) / s.dischargeEfficiency()
 	if s.batteryTelemetryAvailable {
 		rate = max(rate, -s.batteryTelemetryPowerW)
 	}
@@ -139,6 +188,7 @@ func (s *Service) prepareDischargeInventoryLocked(soc, powerW int, automatic boo
 	}
 	inv.inFlight = true
 	inv.deadline = deadline
+	inv.windowEnd = windowEnd
 	inv.debitAt = s.now()
 	inv.debitPowerW = rate
 	inv.sampleCharging = false
@@ -186,6 +236,7 @@ func (s *Service) settleDischargeInventoryLocked() bool {
 	inv.inFlight = false
 	inv.blocked = false
 	inv.deadline = time.Time{}
+	inv.windowEnd = time.Time{}
 	inv.debitAt = time.Time{}
 	s.lastPlanSlot = time.Time{}
 	return true

@@ -54,15 +54,15 @@ A Go service that controls a Marstek Venus E battery with NordPool day-ahead pri
 
 ### Joint inventory and grid planning
 
-1. **Determine trusted inventory.** A durable DC ledger is replenished only by consecutive valid measured charging samples while the service controls charging. Fresh SOC supplies a downward cap:
+1. **Determine trusted inventory.** A durable DC ledger is replenished only by valid measured charging samples while the service controls charging; sample gaps up to 60 seconds are tolerated and longer gaps earn nothing. Fresh SOC supplies a downward cap:
    ```
    trusted_inventory_kWh = min(ledger_kWh, max(0, capacity_kWh * (observed_soc - min_soc)))
    ```
-   Observed energy above that allowance is quarantined: it reduces available purchase capacity but cannot generate planned discharge revenue. Missing, interrupted, or configuration-mismatched ledgers start at zero; telemetry gaps cannot earn credit.
+   Observed energy above that allowance is quarantined: it reduces available purchase capacity but cannot generate planned discharge revenue. Missing, interrupted, or configuration-mismatched ledgers start at zero; gaps longer than 60 seconds cannot earn credit. While a sale is in flight and the link check reports the link live, a SOC that has changed within the last 10 minutes can raise the allowance back up to the SOC cap and recompute the inventory deadline within the sale window; a SOC frozen by a dead link cannot.
 
 2. **Evaluate grid pairs.** A contiguous discharge window is paired with the cheapest executable, individually eligible charge slices before it; the charge slices need not be contiguous. Expected profit per input kWh is `discharge_average * efficiency - charge_average`; it must be strictly positive and meet `MIN_PRICE_SPREAD`.
 
-3. **Compare total-EUR alternatives using the initial inventory once.** The planner can hold inventory, leave it available to reduce the first grid purchase, or sell it in one contiguous known-positive-export-price window followed by non-overlapping grid cycles. The sale can be shorter than the available inventory or end partway through a tariff interval. It uses integrated prices and actual energy, not average-slot economics. Following grid reservations cannot start before the selected inventory sale ends.
+3. **Compare total-EUR alternatives using the initial inventory once.** The planner can hold inventory, leave it available to reduce the first grid purchase, or sell it in one contiguous known-positive-export-price window followed by non-overlapping grid cycles. The sale can be shorter than the available inventory or end partway through a tariff interval, but it must span at least one minute and deliver at least 5% of a full delivery, about 0.19 kWh AC on a 5.12 kWh battery, so sliver sales below about 17% integer SOC are not selected. It uses integrated prices and actual energy, not average-slot economics. Following grid reservations cannot start before the selected inventory sale ends.
 
 4. **Select the plan.** Grid cycles are selected chronologically to maximize total EUR over the known tariff horizon and stay within `MAX_CYCLES_PER_DAY`; the inventory-only sale is exempt from that grid-cycle allowance. Equal values prefer fewer control sessions and then earlier choices. This is the best contiguous sale under known prices, not a guarantee of arbitrary-slot optimization, future prices, or hindsight revenue. Unknown or nonpositive export prices do not trigger an uncommitted inventory sale; remaining energy is held. There is no solar forecast or made-up battery-wear floor.
 
@@ -74,7 +74,7 @@ For the next unfinished grid charge cycle, the service derives a deadline from i
 
 Executed charge and discharge energy is integrated from measured AC-power samples and priced across retained 15-minute rate slots. Energy without an applicable retained rate is explicitly unpriced. New split scheduled-charge records carry an explicit source-attribution marker and record separately attributed grid and solar portions: priced grid cost remains in cash flow, while forgone solar export is priced as opportunity cost. Records without that marker retain their legacy interpretation. Cash-flow P&L is priced discharge value minus priced grid cost. The separately reported opportunity-cost-adjusted metric also deducts priced solar opportunity cost; neither is inventory-matched trading profit.
 
-Scheduled discharge starts in its planned window only with sufficient trusted inventory above the SOC minimum and time for a conservative stop. A durable in-flight marker precedes every discharge attempt. DC debit uses the greater of efficiency-adjusted commanded demand and observed draw through confirmed idle; higher draw can shorten the automatic deadline. An active inventory sale can continue through a missing tariff, recording unpriced energy, but stops on confirmed nonpositive export value. Durable grid-cycle obligations retain their distinct tariff handling but do not bypass the inventory gate. `lastChargePrice` remains informational.
+Scheduled discharge starts in its planned window only with sufficient trusted inventory above the SOC minimum and time for a conservative stop. A durable in-flight marker precedes every discharge attempt. DC debit uses the greater of measured AC power divided by the discharge-side efficiency (`BATTERY_EFFICIENCY / BATTERY_CHARGE_EFFICIENCY`) and observed draw through confirmed idle; higher draw can shorten the automatic deadline. An active inventory sale can continue through a missing tariff, recording unpriced energy, but stops on confirmed nonpositive export value. Durable grid-cycle obligations retain their distinct tariff handling but do not bypass the inventory gate. `lastChargePrice` remains informational.
 
 ### Solar Self-Consumption
 
@@ -123,11 +123,11 @@ Time    Price   Action
 
 The ESPHome client first reads each select value and writes only when it differs. It accepts a mode change only after reading the requested value back: it polls for up to 35 seconds and may retry the write once after 15 seconds, the ESPHome publication interval. The service then verifies signed measured battery power before declaring a charge or discharge session active.
 
-Stop intent is retained until an authoritative stop confirmation. The service keeps the active session and retries throttled stop requests instead of recording a completed trade or issuing a new forced action. Scheduled-session telemetry loss, and repeated solar P1 or battery telemetry failures, initiate that same fail-safe stop path.
+Stop intent is retained until an authoritative stop confirmation. The service keeps the active session and retries throttled stop requests instead of recording a completed trade or issuing a new forced action. A stop that failed on a dead RS485 link is retried no sooner than five minutes later, keeping the bus quiet, until the link check sees live telemetry again and restores the normal five-second cadence; the bridge is restarted only after five minutes of link-down and at most once per hour, and a restart does not trigger an immediate stop retry. Scheduled-session telemetry loss, and repeated solar P1 or battery telemetry failures, initiate that same fail-safe stop path.
 
 ### Data Persistence
 - File-based JSON storage in `DATA_DIR`
-- `trades.json` - trade history
+- `trades.json` - trade history; the optional `telemetry_gap_s` field records seconds in which the RS485 link was detected down during the session, omitted when zero
 - `automatic-cycle-commitment.json` - paired grid-cycle intent, persisted before charging; not proof that energy was purchased
 - `retired-discharge-windows.json` - completed automatic discharge windows that must not be selected again after restart; markers older than the current local day are pruned
 - `measured-efficiency.json` - completed measured AC-efficiency aggregates, not incomplete measurement windows

@@ -11,7 +11,7 @@ The default ESPHome control path:
 - limits a new grid-charge control operation to the exact reserved interval and revalidates the same paired cycle after persistence;
 - keeps stop intent pending until the stop is confirmed;
 - retries failed stops without starting a conflicting action;
-- checks telemetry staleness throughout active sessions;
+- checks telemetry staleness throughout active sessions, books zero energy while the RS485 link is detected down, and keeps the bus quiet during that time: at most one stop retry every five minutes and a bridge restart only after five minutes down and at most once per hour;
 - attempts to stop the battery during startup and graceful shutdown.
 
 These measures do not create an independent fail-safe. The ESPHome backend has no battery-side command expiry: `PASSIVE_MODE_TIMEOUT_S` controls the service's refresh cadence but is not a hardware dead-man timer. If the process, host, network, or bridge fails while a forced command is active, the battery can continue until its own BMS limit or until control is restored. Use the software only after verifying the battery's built-in protections and provide independent supervision where required.
@@ -31,7 +31,7 @@ An ESPHome control operation has a 45-second overall budget, while each changed 
 ## Limitations
 
 - No independent hardware watchdog or forced-command expiry is provided by the ESPHome backend.
-- Unstarted inventory windows, partial-session financial accounting, and daily-summary delivery state are not persisted. Discharge authorization is separate: a durable measured-only DC ledger marks every attempted discharge in flight and settles only after confirmed idle. An interrupted discharge, missing ledger, or changed capacity/minimum SOC restores zero allowance; SOC cannot recreate it. The paired grid commitment records intent, not proof of charging, and does not bypass the allowance gate.
+- Unstarted inventory windows, partial-session financial accounting, and daily-summary delivery state are not persisted. Discharge authorization is separate: a durable measured-only DC ledger marks every attempted discharge in flight and settles only after confirmed idle. An interrupted discharge, missing ledger, or changed capacity/minimum SOC restores zero allowance; SOC cannot recreate it, and it can only raise the allowance back up to the SOC cap while a sale is in flight and the link is demonstrably live. The paired grid commitment records intent, not proof of charging, and does not bypass the allowance gate.
 - An invalid commitment file blocks startup rather than guessing. A valid restored cycle that fails the current profit floor retains its discharge obligation but cannot resume grid charging. Confirm the battery is physically idle before following the recovery procedure in [Operations](operations.md).
 - The ESPHome bridge configuration and firmware compatibility matrix are not included.
 - Solar power-number writes use ESPHome's optimistic number state; measured power is observed on subsequent ticks rather than transactionally confirmed for every adjustment.

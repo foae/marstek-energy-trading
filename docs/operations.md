@@ -111,6 +111,10 @@ Manual discharge stops at minimum SOC, on telemetry/control failure, or after tw
 
 If the ESPHome bridge exposes a restart button, set `ESPHOME_RESTART_BUTTON` to its web-server name, for example `Restart`. Verify its read endpoint while idle before allowing automatic restart. A manual restart-button POST may require `Content-Length: 0`.
 
+A frozen link is usually a battery-side Modbus stall, not an ESP32 fault: it recovers after a few minutes of bus silence, while continued write bursts can keep it dead for hours and bridge reboots rarely revive it. While the link is down the service reads only ESPHome's cached HTTP values and sends no Modbus writes except one stop attempt every five minutes. The bridge is restarted only after the link has been down for five minutes, and at most once per hour, on every path that can reach the restart (in-session check, failed stop, failed start); a restart does not trigger an immediate stop retry and does not shorten a start cooldown armed by a failed command. Post-reboot reads that repeat the frozen values keep the link-down verdict; only a battery-sourced value that actually changes clears it. Graceful shutdown retries the stop every 15 seconds inside its 60-second budget. As soon as the in-session link check sees live telemetry again, the stop retry returns to its normal five-second cadence.
+
+Time spent with the link down during a scheduled charge or discharge books zero energy instead of integrating the last reading the bridge keeps serving; energy through the moment of detection is settled at that reading. The affected seconds appear on the trade as `telemetry_gap_s` in `trades.json`, omitted when zero.
+
 The diagnostic script records ESPHome's `/events` stream and reconnects after bridge restarts:
 
 ```bash
@@ -140,7 +144,7 @@ If saving or pruning retirement markers fails at runtime, `/status` reports `com
 
 ### Measured Inventory Recovery
 
-`inventory-ledger.json` stores the remaining measured DC allowance and an in-flight discharge marker. Preserve it with the other files in `DATA_DIR`. Startup first confirms physical idle. A missing file (including migration), an in-flight marker after an interrupted discharge, or changed capacity/minimum SOC initializes zero trusted inventory. Only subsequently measured service-controlled charging replenishes it; an unchanged or rebounding SOC cannot authorize another sale.
+`inventory-ledger.json` stores the remaining measured DC allowance and an in-flight discharge marker. Preserve it with the other files in `DATA_DIR`. Startup first confirms physical idle. A missing file (including migration), an in-flight marker after an interrupted discharge, or changed capacity/minimum SOC initializes zero trusted inventory. Only subsequently measured service-controlled charging replenishes it; an unchanged or rebounding SOC cannot authorize another sale. While a sale is in flight and the link check reports the link live, a SOC that has changed within the last 10 minutes can raise the allowance back up to the SOC cap and recompute the inventory deadline within the sale window; a SOC frozen by a dead link never moves and cannot do this.
 
 Malformed or unreadable inventory blocks startup. A publication failure blocks discharge; failed stop settlement retains the session and retries without authorizing another command. Restore filesystem access rather than inserting an SOC-derived balance. `/status` exposes `inventory_available_dc_kwh`, `inventory_persistence_blocked`, and `inventory_discharge_in_flight`. Manual discharge remains an explicit override but is debited and protected by the same durable marker.
 

@@ -14,7 +14,7 @@ This project is for technically experienced owners of a compatible battery and E
 - Captures qualified solar surplus without a tariff veto, except for safety/fault handling, manual control, selected or active discharge, and a grid reservation.
 - Records measured energy, scheduled-charge source attribution, cash flow, solar opportunity cost, and a separate opportunity-cost-adjusted metric in local JSON.
 - Sends optional Telegram notifications and accepts authorized private-chat status/manual-discharge commands.
-- Detects a frozen ESPHome-to-battery RS485 link during active sessions and can restart the bridge when a restart button is configured.
+- Detects a frozen ESPHome-to-battery RS485 link during active sessions, then keeps the bus quiet: it stops writing except for one throttled stop retry every five minutes, and restarts the bridge only after five minutes down and at most once per hour, when a restart button is configured.
 
 The preserved `clients/marstek` UDP package is not wired into the executable. See [Legacy UDP Client](docs/legacy-udp.md).
 
@@ -46,7 +46,7 @@ Qualified solar capture has no tariff veto: missing, negative, or expensive tari
 
 ### Accounting and restart behavior
 
-Energy accounting uses measured AC power. With P1 observations, scheduled charging distinguishes grid input from solar input; energy before the first usable source observation is explicitly unattributed. Cash-flow P&L is priced discharge value minus priced grid cost. The separate opportunity-adjusted figure subtracts signed forgone solar-export value. Neither is inventory-matched profit or a bill: discharge may offset household load rather than reach the meter, and missing prices or source attribution leave estimates incomplete.
+Energy accounting uses measured AC power. While the RS485 link is detected down during a scheduled charge or discharge, that time books zero energy rather than integrating the bridge's last cached reading, and the affected seconds are recorded on the trade as `telemetry_gap_s`. With P1 observations, scheduled charging distinguishes grid input from solar input; energy before the first usable source observation is explicitly unattributed. Cash-flow P&L is priced discharge value minus priced grid cost. The separate opportunity-adjusted figure subtracts signed forgone solar-export value. Neither is inventory-matched profit or a bill: discharge may offset household load rather than reach the meter, and missing prices or source attribution leave estimates incomplete.
 
 Grid-cycle intent is persisted before charging; completed discharge windows are persisted to prevent their reuse after restart. Uncommitted inventory plans are rebuilt from fresh SOC and known tariffs. Persistence errors can block automatic control, and partial active-session energy is not crash-durable. Back up `DATA_DIR` and follow [recovery guidance](docs/operations.md#commitment-recovery) rather than deleting state to unblock trading.
 

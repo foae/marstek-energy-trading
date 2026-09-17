@@ -269,7 +269,7 @@ func TestInventoryPlanDominatesDenseExecutableEndpoints(t *testing.T) {
 		best, selected := p.bestWithInventory(dc, 1)
 		oracle := p.best(p.planningStart, dc, 1).value
 		ed := p.roundTrip / p.chargeEfficiency
-		for _, sale := range inventorySaleCandidates(slots, cfg, dc*ed, p.dischargePowerKW) {
+		for _, sale := range inventorySaleCandidates(slots, cfg, dc*ed, p.minimumSaleKWh, p.dischargePowerKW) {
 			idx := sort.Search(len(slots), func(i int) bool { return !slots[i].Time.Before(sale.window.End) }) - 1
 			a := slots[idx].Time
 			if a.Before(sale.window.Start) {
@@ -280,6 +280,9 @@ func TestInventoryPlanDominatesDenseExecutableEndpoints(t *testing.T) {
 					continue
 				}
 				energy := p.dischargePowerKW * at.Sub(sale.window.Start).Hours()
+				if energy < p.minimumSaleKWh {
+					continue // the planner refuses sliver endpoints by design
+				}
 				revenue := sale.revenue.Sub(slots[idx].Export.Mul(decimal.NewFromFloat(p.dischargePowerKW * sale.window.End.Sub(at).Hours())))
 				v := revenue.Add(p.best(at, math.Max(0, dc-energy/ed), 1).value)
 				if v.GreaterThan(oracle) {

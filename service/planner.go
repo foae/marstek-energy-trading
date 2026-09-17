@@ -187,11 +187,14 @@ type gridPlanner struct {
 	usableDCKWh         float64
 	fullDeliveryKWh     float64
 	initialTrustedDCKWh float64
-	chargePowerKW       float64
-	dischargePowerKW    float64
-	planningStart       time.Time
-	memo                map[gridMemoKey]valuePlan
-	allocationMemo      map[chargeAllocationMemoKey]chargeAllocation
+	// Minimum AC energy an inventory sale must deliver, a share of a physically
+	// full delivery so quarantined energy cannot shrink it.
+	minimumSaleKWh   float64
+	chargePowerKW    float64
+	dischargePowerKW float64
+	planningStart    time.Time
+	memo             map[gridMemoKey]valuePlan
+	allocationMemo   map[chargeAllocationMemoKey]chargeAllocation
 }
 
 func newGridPlanner(slots []priceSlot, cfg AnalyzerConfig) *gridPlanner {
@@ -233,6 +236,7 @@ func newGridPlanner(slots []priceSlot, cfg AnalyzerConfig) *gridPlanner {
 		usableDCKWh:         usableDCKWh,
 		fullDeliveryKWh:     usableDCKWh * roundTrip / chargeEfficiency,
 		initialTrustedDCKWh: initialTrustedDCKWh,
+		minimumSaleKWh:      physicalUsable * roundTrip / chargeEfficiency * minimumInventorySaleShare,
 		chargePowerKW:       chargePowerKW,
 		dischargePowerKW:    dischargePowerKW,
 		planningStart:       planningStart,
@@ -410,7 +414,14 @@ func (p *gridPlanner) fullDischargeCandidate(start int) (TimeWindow, decimal.Dec
 	return TimeWindow{}, decimal.Zero, false
 }
 
-func inventorySaleCandidates(slots []priceSlot, cfg AnalyzerConfig, deliveryKWh, dischargePowerKW float64) []inventorySaleCandidate {
+// A sale below this share of a full delivery is a sliver: integer SOC one
+// point above the floor reads as a one-minute sale worth about a cent, and
+// every such start/stop costs Modbus writes and verification on a link that
+// fails under load. Scaling with the battery keeps small configurations
+// trading; for a 5 kWh battery this is roughly five minutes at full power.
+const minimumInventorySaleShare = 0.05
+
+func inventorySaleCandidates(slots []priceSlot, cfg AnalyzerConfig, deliveryKWh, minimumEnergy, dischargePowerKW float64) []inventorySaleCandidate {
 	if cfg.Now.IsZero() || deliveryKWh <= plannerEnergyEpsilon || dischargePowerKW <= 0 {
 		return nil
 	}
@@ -441,7 +452,7 @@ func inventorySaleCandidates(slots []priceSlot, cfg AnalyzerConfig, deliveryKWh,
 			}
 			energy := dischargePowerKW * end.Sub(at).Hours()
 			revenue = revenue.Add(slot.Export.Mul(decimal.NewFromFloat(energy)))
-			if end.Sub(start) > minimumAutomaticControlWindow {
+			if end.Sub(start) > minimumAutomaticControlWindow && dischargePowerKW*end.Sub(start).Hours() >= minimumEnergy {
 				candidates = append(candidates, inventorySaleCandidate{
 					window:  TimeWindow{Start: start, End: end, Price: weightedPrice(revenue, dischargePowerKW*end.Sub(start).Hours())},
 					revenue: revenue,
@@ -587,7 +598,7 @@ func (p *gridPlanner) bestWithInventory(initialDC float64, cycles int) (valuePla
 	}
 	scratch := make([]TimeWindow, 0, len(p.slots))
 	ed := p.roundTrip / p.chargeEfficiency
-	candidates := inventorySaleCandidates(p.slots, p.cfg, initialDC*ed, p.dischargePowerKW)
+	candidates := inventorySaleCandidates(p.slots, p.cfg, initialDC*ed, p.minimumSaleKWh, p.dischargePowerKW)
 	type dualKey struct {
 		time       int64
 		index      int
@@ -617,7 +628,17 @@ func (p *gridPlanner) bestWithInventory(initialDC float64, cycles int) (valuePla
 				bounds = append(bounds, cutoff)
 			}
 		}
+		// The minimum-energy cutoff is itself a candidate endpoint: the value
+		// function is piecewise linear, so the optimum can sit exactly there.
+		// Regions are walked in order, so keep the bounds sorted.
+		if p.dischargePowerKW > 0 {
+			cutoff := sale.window.Start.Add(time.Duration(math.Ceil(p.minimumSaleKWh / p.dischargePowerKW * float64(time.Hour))))
+			if cutoff.After(a) && cutoff.Before(sale.window.End) {
+				bounds = append(bounds, cutoff)
+			}
+		}
 		bounds = append(bounds, sale.window.End)
+		sort.Slice(bounds, func(i, j int) bool { return bounds[i].Before(bounds[j]) })
 		for index, c := range p.dischargeCandidates {
 			if !c.feasible || !c.window.Start.After(a) {
 				continue
@@ -629,6 +650,9 @@ func (p *gridPlanner) bestWithInventory(initialDC float64, cycles int) (valuePla
 				}
 				seen[at.UnixNano()] = true
 				energy := p.dischargePowerKW * at.Sub(sale.window.Start).Hours()
+				if energy < p.minimumSaleKWh {
+					return // a truncated endpoint is still a sliver
+				}
 				remainingDC := math.Max(0, initialDC-energy/ed)
 				requiredDC := p.usableDCKWh - remainingDC
 				if requiredDC <= plannerEnergyEpsilon {

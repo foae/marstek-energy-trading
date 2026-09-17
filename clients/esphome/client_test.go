@@ -1326,7 +1326,7 @@ func TestCheckLink_SamplesFastMovingSensors(t *testing.T) {
 	}
 }
 
-func TestRestartDevice_ReseedsLinkBaseline(t *testing.T) {
+func TestRestartDevice_KeepsLinkBaselineUntilTelemetryMoves(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex
 	posts := 0
@@ -1350,12 +1350,18 @@ func TestRestartDevice_ReseedsLinkBaseline(t *testing.T) {
 		t.Fatalf("RestartDevice() error = %v", err)
 	}
 
-	// Post-reboot telemetry is a fresh baseline and the verdict is dropped.
-	if err := client.CheckLink(context.Background()); err != nil {
-		t.Fatalf("CheckLink() after restart error = %v, want nil", err)
+	// A reboot proves nothing about the battery side of the bus: reads that
+	// repeat the frozen values keep the verdict, and control stays refused.
+	if err := client.CheckLink(context.Background()); !errors.Is(err, marstek.ErrLinkDown) {
+		t.Fatalf("CheckLink() after restart error = %v, want ErrLinkDown", err)
 	}
-	if err := client.ensureRS485ControlMode(context.Background()); err != nil {
-		t.Fatalf("ensureRS485ControlMode() after restart error = %v, want nil", err)
+	if err := client.ensureRS485ControlMode(context.Background()); !errors.Is(err, marstek.ErrLinkDown) {
+		t.Fatalf("ensureRS485ControlMode() after restart error = %v, want ErrLinkDown", err)
+	}
+	// A battery-sourced value that actually changes is the proof of life.
+	client.recordTelemetry(sensorBatteryPower, 1234.5)
+	if err := client.CheckLink(context.Background()); err != nil {
+		t.Fatalf("CheckLink() after telemetry moved error = %v, want nil", err)
 	}
 }
 

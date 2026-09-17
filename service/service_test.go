@@ -3297,50 +3297,81 @@ func TestTick_LinkDownDuringDischargeNotifiesOnce(t *testing.T) {
 	}
 }
 
-func TestTick_LinkDownRestartsBridgeAndRetriesPendingStop(t *testing.T) {
+func TestTick_LinkDownKeepsBusQuietThenRestartsBridgeOnce(t *testing.T) {
 	battery := NewMockBattery(64)
 	battery.checkLinkErr = linkDownErr()
 	battery.restartAvailable = true
 	notifier := &MockNotifier{}
 	var now time.Time
 	svc := newLinkDownDischargeService(t, battery, notifier, &now)
-	// A stop already failed with a dead link one minute ago: without a bridge
-	// restart the retry would wait the 5 minute link-down interval.
+	// A stop already failed with a dead link: the pending safety command must
+	// not be re-sent onto the dead bus every tick, and the bridge must not be
+	// rebooted before the quiet period has had its chance.
 	svc.state = StateDischarging
+	svc.stopPending = true
 	svc.lastStopLinkDown = true
-	svc.lastStopAttempt = now.Add(-time.Minute)
-	battery.SOC = 5 // below min SOC, so this tick tries to stop again
+	svc.lastStopAttempt = now
+	battery.IdleErr = linkDownErr()
+	battery.SOC = 5
 
 	ctx := context.Background()
-	// The first link-down tick only confirms and notifies; hardware is not rebooted
-	// until a second consecutive tick still reports the link down.
-	svc.tick(ctx)
+	for i := 0; i < 4; i++ {
+		now = now.Add(time.Minute)
+		svc.tick(ctx)
+	}
+	if battery.IdleAttempts != 0 {
+		t.Fatalf("stop was re-sent onto a dead bus %d times within the quiet period", battery.IdleAttempts)
+	}
 	if battery.restartCalls != 0 {
-		t.Fatalf("expected no bridge restart on the first link-down tick, got %d", battery.restartCalls)
+		t.Fatalf("bridge restarted before %s of link down, got %d", bridgeRestartAfterLinkDown, battery.restartCalls)
 	}
 
-	now = now.Add(time.Minute)
+	now = now.Add(time.Minute) // quiet interval elapsed: exactly one stop attempt
 	svc.tick(ctx)
+	if battery.IdleAttempts != 1 || svc.state != StateDischarging {
+		t.Fatalf("expected a single stop attempt after %s: attempts=%d state=%s", batteryLinkDownStopRetryInterval, battery.IdleAttempts, svc.state)
+	}
+	if battery.restartCalls != 0 {
+		t.Fatalf("the failed stop rebooted the bridge before %s of link down", bridgeRestartAfterLinkDown)
+	}
 
+	now = now.Add(time.Minute) // link down long enough: one reboot, no write burst
+	svc.tick(ctx)
 	if battery.restartCalls != 1 {
-		t.Fatalf("expected one bridge restart, got %d", battery.restartCalls)
+		t.Fatalf("expected one bridge restart after %s, got %d", bridgeRestartAfterLinkDown, battery.restartCalls)
 	}
-	if svc.state != StateIdle {
-		t.Fatalf("expected pending stop to be retried immediately after restart, got state %s", svc.state)
-	}
-	if battery.IdleCalls != 1 {
-		t.Errorf("expected one idle command, got %d", battery.IdleCalls)
+	if battery.IdleAttempts != 1 || svc.state != StateDischarging {
+		t.Fatalf("reboot must not retry the stop into a still-dead bus: attempts=%d state=%s", battery.IdleAttempts, svc.state)
 	}
 
-	// A second link down within 10 minutes must not restart the bridge again.
+	// Live telemetry clears the backoff and the pending stop goes out promptly.
+	battery.checkLinkErr = nil
+	battery.IdleErr = nil
+	now = now.Add(10 * time.Second)
+	svc.tick(ctx)
+	if battery.IdleAttempts != 2 || battery.IdleCalls != 1 || svc.state != StateIdle {
+		t.Fatalf("expected the stop to retry once the link is live: attempts=%d idle=%d state=%s", battery.IdleAttempts, battery.IdleCalls, svc.state)
+	}
+
+	// A second freeze within the hour must not reboot the bridge again, even
+	// well past the old ten-minute limiter.
+	battery.checkLinkErr = linkDownErr()
 	svc.state = StateDischarging
 	svc.currentTradeStart = now.Add(-time.Hour)
 	svc.currentTradeSOC = 80
+	svc.activeInventorySale = &TimeWindow{Start: now, End: now.Add(3 * time.Hour), Price: decimal.NewFromFloat(.22)}
 	battery.SOC = 64
-	now = now.Add(time.Minute)
-	svc.tick(ctx)
+	for i := 0; i < 25; i++ {
+		now = now.Add(time.Minute)
+		svc.tick(ctx)
+	}
 	if battery.restartCalls != 1 {
-		t.Fatalf("expected bridge restart to be rate limited, got %d calls", battery.restartCalls)
+		t.Fatalf("expected bridge restart to be rate limited to one per hour, got %d calls", battery.restartCalls)
+	}
+	now = now.Add(time.Hour)
+	svc.tick(ctx)
+	if battery.restartCalls != 2 {
+		t.Fatalf("expected a second restart once the hour elapsed, got %d calls", battery.restartCalls)
 	}
 }
 
@@ -3393,7 +3424,7 @@ func TestRefreshPassiveModeUsesRefresher(t *testing.T) {
 	}
 }
 
-func TestCheckLinkDuringSession_RestartsOnSecondTick(t *testing.T) {
+func TestCheckLinkDuringSession_RestartsAfterQuietPeriod(t *testing.T) {
 	battery := NewMockBattery(64)
 	battery.checkLinkErr = linkDownErr()
 	battery.restartAvailable = true
@@ -3410,10 +3441,16 @@ func TestCheckLinkDuringSession_RestartsOnSecondTick(t *testing.T) {
 		t.Fatalf("expected the first tick to notify, got %v", notifier.ErrorCalls)
 	}
 
-	now = now.Add(time.Minute)
+	now = now.Add(4 * time.Minute)
+	svc.checkLinkDuringSession(ctx)
+	if battery.restartCalls != 0 {
+		t.Fatalf("expected no restart before the quiet period elapsed, got %d", battery.restartCalls)
+	}
+
+	now = now.Add(time.Minute) // five minutes down
 	svc.checkLinkDuringSession(ctx)
 	if battery.restartCalls != 1 {
-		t.Fatalf("expected one restart on the second link-down tick, got %d", battery.restartCalls)
+		t.Fatalf("expected one restart once the link has been down for %s, got %d", bridgeRestartAfterLinkDown, battery.restartCalls)
 	}
 }
 
@@ -3428,7 +3465,7 @@ func TestTryRestartBridge_FailedRestartDoesNotConsumeLimiter(t *testing.T) {
 
 	ctx := context.Background()
 	svc.checkLinkDuringSession(ctx) // first tick: confirm only
-	now = now.Add(time.Minute)
+	now = now.Add(bridgeRestartAfterLinkDown)
 	svc.checkLinkDuringSession(ctx)
 
 	if battery.restartCalls != 1 {
@@ -3438,7 +3475,7 @@ func TestTryRestartBridge_FailedRestartDoesNotConsumeLimiter(t *testing.T) {
 		t.Fatalf("failed restart consumed the limiter: lastBridgeRestart = %v", svc.lastBridgeRestart)
 	}
 
-	// The next tick must try again instead of waiting out the 10 minute interval.
+	// The next tick must try again instead of waiting out the hourly interval.
 	now = now.Add(time.Minute)
 	svc.checkLinkDuringSession(ctx)
 	if battery.restartCalls != 2 {
@@ -3446,13 +3483,14 @@ func TestTryRestartBridge_FailedRestartDoesNotConsumeLimiter(t *testing.T) {
 	}
 }
 
-func TestStopRetryDelay_NormalCadenceRightAfterBridgeRestart(t *testing.T) {
+func TestStopRetryDelay_StaysQuietAfterBridgeRestartUntilLinkIsLive(t *testing.T) {
 	battery := NewMockBattery(64)
 	battery.restartAvailable = true
 	notifier := &MockNotifier{}
 	var now time.Time
 	svc := newLinkDownDischargeService(t, battery, notifier, &now)
 	svc.lastStopLinkDown = true
+	svc.linkDownSince = now.Add(-bridgeRestartAfterLinkDown)
 
 	if got := svc.stopRetryDelay(); got != batteryLinkDownStopRetryInterval {
 		t.Fatalf("stopRetryDelay() before restart = %s, want %s", got, batteryLinkDownStopRetryInterval)
@@ -3462,16 +3500,19 @@ func TestStopRetryDelay_NormalCadenceRightAfterBridgeRestart(t *testing.T) {
 	if battery.restartCalls != 1 {
 		t.Fatalf("expected one bridge restart, got %d", battery.restartCalls)
 	}
-
-	// tryRestartBridge clears lastStopLinkDown; a stop failing again on the same
-	// tick must still retry at the normal cadence, not re-arm the long backoff.
-	svc.lastStopLinkDown = true
+	// A reboot proves nothing about the battery side of the bus: the backoff
+	// holds until the link check sees live telemetry.
+	if got := svc.stopRetryDelay(); got != batteryLinkDownStopRetryInterval {
+		t.Fatalf("stopRetryDelay() after restart = %s, want %s", got, batteryLinkDownStopRetryInterval)
+	}
+	battery.checkLinkErr = nil
+	svc.checkLinkDuringSession(context.Background())
 	if got := svc.stopRetryDelay(); got != batteryStopRetryInterval {
-		t.Fatalf("stopRetryDelay() after restart = %s, want %s", got, batteryStopRetryInterval)
+		t.Fatalf("stopRetryDelay() with a live link = %s, want %s", got, batteryStopRetryInterval)
 	}
 }
 
-func TestTryRestartBridge_ClearsLinkDownStartCooldown(t *testing.T) {
+func TestTryRestartBridge_KeepsLinkDownStartCooldownAndWaitsForQuietPeriod(t *testing.T) {
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
 	prices := makePrices(baseTime, 0.05, 0.06, 0.20, 0.22) // slot 0 is a charge window
 	battery := NewMockBattery(50)
@@ -3491,12 +3532,21 @@ func TestTryRestartBridge_ClearsLinkDownStartCooldown(t *testing.T) {
 	}
 
 	battery.restartAvailable = true
+	// The failed start reached this path straight away: the bus gets its quiet
+	// period before any reboot, on this path as on the in-session check.
+	svc.tryRestartBridge(ctx)
+	if battery.restartCalls != 0 {
+		t.Fatalf("expected no bridge restart before %s of link down, got %d", bridgeRestartAfterLinkDown, battery.restartCalls)
+	}
+	now = now.Add(bridgeRestartAfterLinkDown)
 	svc.tryRestartBridge(ctx)
 	if battery.restartCalls != 1 {
-		t.Fatalf("expected one bridge restart, got %d", battery.restartCalls)
+		t.Fatalf("expected one bridge restart after the quiet period, got %d", battery.restartCalls)
 	}
-	if want := now.Add(bridgeRebootGrace); !svc.batteryCooldownUntil.Equal(want) {
-		t.Fatalf("expected the restart to shrink the cooldown to the reboot grace %v, got %v", want, svc.batteryCooldownUntil)
+	// A reboot proves nothing about the battery side of the bus, so the
+	// link-down start cooldown armed by the failed command stays in force.
+	if want := baseTime.Add(batteryLinkDownCooldown); !svc.batteryCooldownUntil.Equal(want) {
+		t.Fatalf("expected the restart to keep the link-down cooldown %v, got %v", want, svc.batteryCooldownUntil)
 	}
 }
 

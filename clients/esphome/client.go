@@ -396,6 +396,9 @@ func (c *Client) getSensorFloatContext(ctx context.Context, path string) (float6
 // recordTelemetry notes a battery-sourced reading. Any change proves the RS485
 // link is alive, which clears a previous link-down verdict.
 func (c *Client) recordTelemetry(path string, value float64) {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return // an unknown reading is not evidence that the bus is alive
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	prev, seen := c.lastValues[path]
@@ -560,14 +563,10 @@ func (c *Client) RestartDevice(ctx context.Context) error {
 		return fmt.Errorf("restart button %q not found on the device: %w", c.restartButton, lastErr)
 	}
 
-	// The bridge is rebooting: every value collected before it is meaningless as a
-	// staleness baseline, and the link-down verdict it produced must not survive
-	// the recovery it triggered. Post-reboot telemetry becomes a fresh baseline.
-	c.mu.Lock()
-	c.lastValues = make(map[string]float64)
-	c.lastChangeAt = time.Time{}
-	c.linkDownAt = time.Time{}
-	c.mu.Unlock()
+	// The bridge is rebooting, but that proves nothing about the battery side
+	// of the RS485 bus: keep the pre-reboot values as the staleness baseline so
+	// the link counts as live only once a battery-sourced value actually
+	// changes. Post-reboot reads that repeat the frozen values stay frozen.
 	return nil
 }
 

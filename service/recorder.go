@@ -50,7 +50,11 @@ type Trade struct {
 	// EnergyBasis records how EnergyKWh was estimated: "measured_ac_power" for
 	// current records, "measured_battery_power" for historical DC-based records,
 	// blank for historic trades written before the field existed.
-	EnergyBasis    string               `json:"energy_basis"`
+	EnergyBasis string `json:"energy_basis"`
+	// TelemetryGapS counts session seconds whose energy is unknown because the
+	// RS485 link was frozen; those seconds are booked as zero energy, never as
+	// the last reading the bridge kept serving.
+	TelemetryGapS  int                  `json:"telemetry_gap_s,omitempty"`
 	DayAllocations []TradeDayAllocation `json:"day_allocations,omitempty"`
 }
 

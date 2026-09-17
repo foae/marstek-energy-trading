@@ -61,22 +61,34 @@ const (
 )
 
 const (
-	batteryStartVerificationTimeout   = 10 * time.Second
-	batteryStartVerificationInterval  = time.Second
-	batteryActivePowerThresholdW      = 50.0
-	batteryControlFailureCooldown     = 5 * time.Minute
-	batteryLinkDownCooldown           = 30 * time.Minute
-	batteryShutdownTimeout            = 60 * time.Second
-	batteryShutdownAttemptTimeout     = 30 * time.Second
-	batteryStopRetryInterval          = 5 * time.Second
+	batteryStartVerificationTimeout  = 10 * time.Second
+	batteryStartVerificationInterval = time.Second
+	batteryActivePowerThresholdW     = 50.0
+	batteryControlFailureCooldown    = 5 * time.Minute
+	batteryLinkDownCooldown          = 30 * time.Minute
+	batteryShutdownTimeout           = 60 * time.Second
+	batteryShutdownAttemptTimeout    = 30 * time.Second
+	batteryStopRetryInterval         = 5 * time.Second
+	// Shutdown has a 60 s budget: keep a few stop attempts inside it even on a
+	// dead link, without the old 5 s hammering.
+	batteryShutdownStopRetryInterval = 15 * time.Second
+	// While a dead-link stop is throttled, the link is probed over HTTP only;
+	// space those probes so the 1 Hz tickers do not turn into a request flood.
+	linkProbeInterval                 = 5 * time.Second
 	minimumAutomaticControlWindow     = time.Minute
 	dailySummaryRetryCooldown         = 15 * time.Minute
 	automaticCycleCommitmentMaxFuture = 72 * time.Hour
-	// A dead RS485 link fails the stop command instantly, so the normal 5s retry
-	// would spin while the bridge restart path attempts recovery.
+	// A dead RS485 link fails the stop command instantly. The Venus E's Modbus
+	// side recovers on its own after a few minutes of bus silence and stays dead
+	// for hours while a controller keeps re-sending; a failed link-down stop is
+	// therefore retried only after this interval, or as soon as the link check
+	// sees live telemetry again.
 	batteryLinkDownStopRetryInterval = 5 * time.Minute
-	// A wedged RS485 link only recovers with an ESP32 reboot; don't reboot in a loop.
-	bridgeRestartMinInterval       = 10 * time.Minute
+	// An ESP32 reboot rarely revives a battery-side stall and costs another
+	// enable/stop burst on reconnect. Reboot only after the quiet period has had
+	// its chance, and never more than once per hour.
+	bridgeRestartAfterLinkDown     = 5 * time.Minute
+	bridgeRestartMinInterval       = time.Hour
 	bridgeRebootGrace              = time.Minute // ESP32 is unreachable for ~30 s after a restart
 	linkDownNotifyInterval         = 15 * time.Minute
 	solarTelemetryFailureThreshold = 10 * time.Second
@@ -147,6 +159,10 @@ type Service struct {
 	stopPending                  bool          // irreversible intent until a confirmed stop
 	pendingSolarStopReason       solarStopReason
 	linkDownSince                time.Time // first detection of a frozen RS485 link during an active session
+	currentTradeTelemetryGapS    int       // session seconds booked as zero energy because the link was frozen
+	telemetryGapMarkedAt         time.Time // gap has been booked up to this instant while the link is down
+	lastBridgeRestartAttempt     time.Time // spaces repeated restart POSTs when the press itself fails
+	lastLinkProbe                time.Time // rate limits link probes on the throttled stop path
 	lastLinkDownNotify           time.Time // rate limit link-down notifications (own limiter)
 	lastBridgeRestart            time.Time // rate limit ESPHome bridge restarts
 	retiredDischargeWindows      []TimeWindow
@@ -345,6 +361,11 @@ func (s *Service) cacheBatteryTelemetryLocked(soc int, powerW float64) {
 }
 
 func (s *Service) beginMeasuredTradeLocked(measuredPowerW float64) {
+	// A confirmed command with measured response proves the link is alive; a
+	// stale verdict from a previous outage must not gate this session's energy.
+	s.linkDownSince = time.Time{}
+	s.telemetryGapMarkedAt = time.Time{}
+	s.currentTradeTelemetryGapS = 0
 	s.currentTradeLastPowerW = measuredPowerW
 	s.currentTradeLastUpdate = s.now()
 	s.currentTradeEnergyWs = 0
@@ -354,6 +375,39 @@ func (s *Service) beginMeasuredTradeLocked(measuredPowerW float64) {
 	s.currentTradePrices = nil
 	s.currentTradeDayAllocations = nil
 	s.snapshotSessionPricesLocked()
+}
+
+// accountableACPowerLocked returns the AC power to book for this sample. A
+// frozen RS485 link serves the last Modbus reading indefinitely: while the
+// link check reports it down, the sample books zero energy and the elapsed
+// session time is recorded as a telemetry gap instead. Caller must hold s.mu.
+func (s *Service) accountableACPowerLocked(measuredACPowerW float64) float64 {
+	if s.linkDownSince.IsZero() {
+		return measuredACPowerW
+	}
+	s.bookTelemetryGapLocked(s.now())
+	return 0
+}
+
+// bookTelemetryGapLocked advances the recorded gap through now for an active
+// charge or discharge session while the link is down. Caller must hold s.mu.
+func (s *Service) bookTelemetryGapLocked(now time.Time) {
+	if s.linkDownSince.IsZero() {
+		return
+	}
+	switch s.state {
+	case StateCharging, StateDischarging, StateManualDischarging, StateSolarCharging:
+	default:
+		return
+	}
+	mark := s.telemetryGapMarkedAt
+	if mark.IsZero() || mark.Before(s.linkDownSince) {
+		mark = s.linkDownSince
+	}
+	if now.After(mark) {
+		s.currentTradeTelemetryGapS += int(now.Sub(mark).Seconds())
+		s.telemetryGapMarkedAt = now
+	}
 }
 
 func (s *Service) tradeDayAllocationLocked(allocations *[]TradeDayAllocation, at time.Time) *TradeDayAllocation {
@@ -697,6 +751,17 @@ func (s *Service) tick(ctx context.Context) {
 	// must include inverter losses and the nameplate charge power is AC-side.
 	measuredACPowerW, acPowerErr := s.battery.GetACPower(ctx)
 
+	// Telemetry can look healthy while the RS485 link is frozen: check staleness
+	// during active sessions, unlocked (network I/O), before the samples above
+	// are booked so a freeze or a recovery applies to this tick's accounting.
+	s.mu.RLock()
+	activeSession := s.state == StateCharging || s.state == StateDischarging ||
+		s.state == StateManualDischarging || s.state == StateSolarCharging
+	s.mu.RUnlock()
+	if activeSession {
+		s.checkLinkDuringSession(ctx)
+	}
+
 	s.mu.Lock()
 	s.currentTradeLastSOC = batStatus.SOC
 	// DC telemetry stands on its own: cache it whenever it was read, even if the
@@ -705,14 +770,15 @@ func (s *Service) tick(ctx context.Context) {
 		s.cacheBatteryTelemetryLocked(batStatus.SOC, measuredPowerW)
 	}
 	if powerErr == nil && acPowerErr == nil {
+		accountedACPowerW := s.accountableACPowerLocked(measuredACPowerW)
 		switch s.state {
 		case StateCharging:
 			s.observedChargePowerW = max(measuredACPowerW, 0)
 			now := s.now()
-			s.accumulateMeasuredTradeEnergyAtLocked(measuredACPowerW, now, true)
-			s.scheduledChargeAccounting.Sample(now, measuredACPowerW, 0, false, s.loc, s.sessionPriceAtLocked)
+			s.accumulateMeasuredTradeEnergyAtLocked(accountedACPowerW, now, true)
+			s.scheduledChargeAccounting.Sample(now, accountedACPowerW, 0, false, s.loc, s.sessionPriceAtLocked)
 		case StateDischarging, StateManualDischarging:
-			s.accumulateMeasuredTradeEnergyLocked(measuredACPowerW)
+			s.accumulateMeasuredTradeEnergyLocked(accountedACPowerW)
 		}
 	} else {
 		s.batteryTelemetryAvailable = false
@@ -738,15 +804,6 @@ func (s *Service) tick(ctx context.Context) {
 		return
 	}
 
-	// Telemetry can look healthy while the RS485 link is frozen: check staleness
-	// during active sessions, unlocked (network I/O).
-	s.mu.RLock()
-	activeSession := s.state == StateCharging || s.state == StateDischarging ||
-		s.state == StateManualDischarging || s.state == StateSolarCharging
-	s.mu.RUnlock()
-	if activeSession {
-		s.checkLinkDuringSession(ctx)
-	}
 	// Network reads can cross a tariff boundary. Take the decision timestamp only
 	// after they finish so an expired price cannot start or refresh a command.
 	now := s.now()
@@ -1051,8 +1108,9 @@ func (s *Service) sampleScheduledCharge(ctx context.Context) {
 	}
 	now := s.now()
 	s.observedChargePowerW = max(measuredACPowerW, 0)
-	s.accumulateMeasuredTradeEnergyAtLocked(measuredACPowerW, now, true)
-	s.scheduledChargeAccounting.Sample(now, measuredACPowerW, importPowerW, meterErr == nil, s.loc, s.sessionPriceAtLocked)
+	accountedACPowerW := s.accountableACPowerLocked(measuredACPowerW)
+	s.accumulateMeasuredTradeEnergyAtLocked(accountedACPowerW, now, true)
+	s.scheduledChargeAccounting.Sample(now, accountedACPowerW, importPowerW, meterErr == nil, s.loc, s.sessionPriceAtLocked)
 }
 
 // solarTick is called every 1 second to manage solar self-consumption charging.
@@ -1191,7 +1249,7 @@ func (s *Service) solarTick(ctx context.Context) {
 		}
 
 	case StateSolarCharging:
-		s.accumulateSolarEnergyLocked(measuredACChargePowerW)
+		s.accumulateSolarEnergyLocked(s.accountableACPowerLocked(measuredACChargePowerW))
 		// Attribute only the part of battery draw covered by net grid import.
 		s.solarGridPowerW = min(max(activePowerW, 0), measuredACChargePowerW)
 
@@ -1384,6 +1442,7 @@ func (s *Service) startSolarChargingLocked(ctx context.Context, powerW int, soc 
 		if idleErr != nil {
 			s.state = StateStopping
 			s.lastStopAttempt = s.now()
+			s.lastStopLinkDown = errors.Is(idleErr, marstek.ErrLinkDown)
 		}
 		l.Error("failed to start solar charging", "error", err, "link_down", errors.Is(err, marstek.ErrLinkDown))
 		s.solarSurplusSince = time.Time{}
@@ -1826,6 +1885,7 @@ func (s *Service) startChargingLocked(ctx context.Context, price decimal.Decimal
 		if idleErr != nil {
 			s.state = StateStopping
 			s.lastStopAttempt = s.now()
+			s.lastStopLinkDown = errors.Is(idleErr, marstek.ErrLinkDown)
 		}
 		l.Error("failed to start charging", "error", err, "link_down", errors.Is(err, marstek.ErrLinkDown))
 		s.batteryCooldownUntil = s.now().Add(batteryFailureCooldown(err))
@@ -1875,6 +1935,7 @@ func (s *Service) startChargingLocked(ctx context.Context, price decimal.Decimal
 
 // stopChargingLocked ends a charge session and records the trade. Caller must hold s.mu.
 func (s *Service) stopChargingLocked(ctx context.Context, endSOC int) {
+	s.bookTelemetryGapLocked(s.now())
 	if !s.transitionToIdleLocked(ctx, endSOC) {
 		return
 	}
@@ -1903,6 +1964,7 @@ func (s *Service) stopChargingLocked(ctx context.Context, endSOC int) {
 		EnergyKWh:      energyKWh,
 		UnpricedKWh:    decimal.NewFromFloat(s.currentTradeUnpricedWs / 3_600_000),
 		EnergyBasis:    measuredACPowerEnergyBasis,
+		TelemetryGapS:  s.currentTradeTelemetryGapS,
 		DayAllocations: completeTradeDayAllocations(s.currentTradeDayAllocations, tradeStart, tradeDurationS, s.loc),
 		StartSOC:       s.currentTradeSOC,
 		EndSOC:         endSOC,
@@ -2039,6 +2101,7 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 			s.state = StateStopping
 			s.stopPending = true
 			s.lastStopAttempt = s.now()
+			s.lastStopLinkDown = errors.Is(idleErr, marstek.ErrLinkDown)
 		} else if !s.settleDischargeInventoryLocked() {
 			s.state = StateStopping
 			s.stopPending = true
@@ -2115,6 +2178,7 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 	previousState := s.state
 	tradePowerW := s.currentTradePowerW
+	s.bookTelemetryGapLocked(s.now())
 	inventoryDeadlineReached := !s.inventory.deadline.IsZero() && !s.now().Before(s.inventory.deadline)
 	var uncommittedSessionWindow TimeWindow
 	hasUncommittedSessionWindow := false
@@ -2154,6 +2218,7 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 		EnergyKWh:      energyKWh,
 		UnpricedKWh:    decimal.NewFromFloat(s.currentTradeUnpricedWs / 3_600_000),
 		EnergyBasis:    measuredACPowerEnergyBasis,
+		TelemetryGapS:  s.currentTradeTelemetryGapS,
 		DayAllocations: completeTradeDayAllocations(s.currentTradeDayAllocations, tradeStart, tradeDurationS, s.loc),
 		StartSOC:       s.currentTradeSOC,
 		EndSOC:         endSOC,
@@ -2307,6 +2372,10 @@ func (s *Service) transitionToIdleLocked(ctx context.Context, soc int) bool {
 	s.stopPending = false
 	s.lastStopAttempt = time.Time{}
 	s.lastStopLinkDown = false
+	// A confirmed stop is a battery-side acknowledgement: the link-down
+	// verdict must not outlive the session it was raised in.
+	s.linkDownSince = time.Time{}
+	s.telemetryGapMarkedAt = time.Time{}
 	if s.pendingPlan != nil && s.automaticCycleCommit == nil && s.activeInventorySale == nil {
 		s.currentPlan = s.pendingPlan
 		s.pendingPlan = nil
@@ -2320,11 +2389,8 @@ func (s *Service) stopRetryDelay() time.Duration {
 		return s.batteryStopRetryDelay
 	}
 	if s.lastStopLinkDown {
-		// Right after a bridge reboot the link is expected back within a minute,
-		// and the same tick's failed stop must not re-arm the long backoff.
-		if !s.lastBridgeRestart.IsZero() && s.now().Sub(s.lastBridgeRestart) < bridgeRestartMinInterval {
-			return batteryStopRetryInterval
-		}
+		// Keep the bus quiet: the link check clears lastStopLinkDown as soon as
+		// telemetry moves again, which returns the retry to the normal cadence.
 		return batteryLinkDownStopRetryInterval
 	}
 	return batteryStopRetryInterval
@@ -2340,14 +2406,24 @@ func (s *Service) retryStopping(ctx context.Context) bool {
 	s.mu.Unlock()
 
 	if throttled {
-		// Even while a dead-link stop retry is throttled, sample the link once.
-		// A second consecutive failure can restart the bridge, which clears
-		// lastStopAttempt and makes this pending safety command retry immediately.
-		s.checkLinkDuringSession(ctx)
+		// Even while a dead-link stop retry is throttled, sample the link:
+		// live telemetry clears the link-down backoff so the pending safety
+		// command retries at the normal cadence, while a still-dead bus stays
+		// quiet. Only cached HTTP reads, spaced so the 1 Hz tickers do not
+		// flood the bridge; no Modbus write happens on this path.
+		s.mu.Lock()
+		probe := s.lastLinkProbe.IsZero() || s.now().Sub(s.lastLinkProbe) >= linkProbeInterval
+		if probe {
+			s.lastLinkProbe = s.now()
+		}
+		s.mu.Unlock()
+		if probe {
+			s.checkLinkDuringSession(ctx)
+		}
 		s.mu.RLock()
-		recovered := s.lastStopAttempt.IsZero()
+		throttled = !s.lastStopAttempt.IsZero() && s.now().Sub(s.lastStopAttempt) < s.stopRetryDelay()
 		s.mu.RUnlock()
-		if !recovered {
+		if throttled {
 			return true
 		}
 	}
@@ -2418,7 +2494,10 @@ func (s *Service) stopBatteryOnShutdown() error {
 			}
 		}
 
-		timer := time.NewTimer(s.stopRetryDelay())
+		s.mu.RLock()
+		delay := min(s.stopRetryDelay(), batteryShutdownStopRetryInterval)
+		s.mu.RUnlock()
+		timer := time.NewTimer(delay)
 		select {
 		case <-shutdownCtx.Done():
 			timer.Stop()
@@ -3153,7 +3232,9 @@ func (s *Service) checkLinkDuringSession(ctx context.Context) {
 		// Live telemetry proves the link is back (bridge rebooted, by us or by
 		// hand), so a pending stop may retry at the normal cadence again.
 		s.mu.Lock()
+		s.bookTelemetryGapLocked(s.now())
 		s.linkDownSince = time.Time{}
+		s.telemetryGapMarkedAt = time.Time{}
 		s.lastStopLinkDown = false
 		s.mu.Unlock()
 		return
@@ -3165,6 +3246,19 @@ func (s *Service) checkLinkDuringSession(ctx context.Context) {
 	s.mu.Lock()
 	if s.linkDownSince.IsZero() {
 		s.linkDownSince = s.now()
+		// Frozen telemetry must not keep integrating the last reading for the
+		// rest of the outage: settle the trade through detection and book the
+		// outage as a telemetry gap instead.
+		switch s.state {
+		case StateCharging, StateDischarging, StateManualDischarging:
+			s.accumulateMeasuredTradeEnergyAtLocked(0, s.now(), s.state == StateCharging)
+			s.currentTradeLastPowerW = 0 // explicit: the next interval books nothing
+			if s.state == StateCharging {
+				// The P1 source split keeps its own last sample; settle it too.
+				s.scheduledChargeAccounting.Sample(s.now(), 0, 0, false, s.loc, s.sessionPriceAtLocked)
+			}
+		}
+		s.telemetryGapMarkedAt = s.linkDownSince
 	}
 	s.invalidateDischargeInventoryLocked()
 	downSince := s.linkDownSince
@@ -3201,11 +3295,7 @@ func (s *Service) checkLinkDuringSession(ctx context.Context) {
 	)
 	s.notifyLinkDown(ctx, msg)
 
-	// Rebooting hardware needs one extra minute of confirmation: only restart from
-	// the second consecutive tick that still reports the link down.
-	if s.now().Sub(downSince) >= time.Minute {
-		s.tryRestartBridge(ctx)
-	}
+	s.tryRestartBridge(ctx)
 }
 
 // notifyLinkDown sends a link-down alert with its own rate limiter, so it is never
@@ -3238,30 +3328,46 @@ func (s *Service) tryRestartBridge(ctx context.Context) {
 	}
 
 	s.mu.Lock()
-	if !s.lastBridgeRestart.IsZero() && s.now().Sub(s.lastBridgeRestart) < bridgeRestartMinInterval {
+	now := s.now()
+	// Give the quiet period its chance first, on every path that reaches this
+	// function: the battery side usually comes back on its own once nothing is
+	// written, and a reboot re-sends the enable/stop burst on reconnect.
+	if s.linkDownSince.IsZero() {
+		s.linkDownSince = now
+	}
+	if now.Sub(s.linkDownSince) < bridgeRestartAfterLinkDown {
+		s.mu.Unlock()
+		slog.Debug("bridge restart deferred until the link has been down long enough", "down_since", s.linkDownSince)
+		return
+	}
+	if !s.lastBridgeRestart.IsZero() && now.Sub(s.lastBridgeRestart) < bridgeRestartMinInterval {
 		s.mu.Unlock()
 		slog.Debug("bridge restart rate limited", "last_restart", s.lastBridgeRestart)
 		return
 	}
+	if !s.lastBridgeRestartAttempt.IsZero() && now.Sub(s.lastBridgeRestartAttempt) < bridgeRebootGrace {
+		s.mu.Unlock()
+		return
+	}
+	s.lastBridgeRestartAttempt = now
 	s.mu.Unlock()
 
 	if err := r.RestartDevice(ctx); err != nil {
-		// A failed POST rebooted nothing, so it must not consume the 10 minute
-		// limiter: the next tick should be free to try again.
+		// A failed POST rebooted nothing, so it must not consume the hourly
+		// limiter; the press may still have landed on a device that dropped the
+		// connection while rebooting, so space the next attempt by the reboot
+		// grace rather than retrying on the next 1 Hz sample.
 		slog.Error("failed to restart ESPHome bridge", "error", err)
 		return
 	}
 	slog.Warn("restarted ESPHome bridge to recover RS485 link")
 
-	// A pending stop should retry at the normal cadence once the bridge is back,
-	// and the 30 minute link-down cooldown a failed start armed must not outlive
-	// the recovery that just fixed its cause. The bridge needs ~30 s to reboot,
-	// so hold starts for one tick instead of retrying into the outage.
+	// The reboot proves nothing about the battery side of the bus: a pending
+	// stop retries only once the link check sees live telemetry (which clears
+	// the link-down backoff) or the quiet interval elapses, and a start
+	// cooldown armed by a failed command stays in force.
 	s.mu.Lock()
 	s.lastBridgeRestart = s.now()
-	s.lastStopLinkDown = false
-	s.lastStopAttempt = time.Time{}
-	s.batteryCooldownUntil = s.now().Add(bridgeRebootGrace)
 	s.mu.Unlock()
 
 	if s.telegramEnabled() {

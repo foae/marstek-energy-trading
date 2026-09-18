@@ -156,6 +156,32 @@ func TestInventorySaleRequiresMinimumGain(t *testing.T) {
 	if plan.InventorySale == nil {
 		t.Fatalf("plan = %+v, want a sale that clears the minimum gain", plan)
 	}
+
+	// The minimum is inclusive: a sale worth exactly the configured gain is taken.
+	// Grid charging never pays here, so the no-sale plan is worth nothing and the
+	// gain is the sale revenue itself.
+	if len(plan.Cycles) != 0 {
+		t.Fatalf("fixture sanity: plan has grid cycles, the gain is not the sale revenue: %+v", plan.Cycles)
+	}
+	revenue := plan.InventorySale.Price.Mul(decimal.NewFromFloat(windowEnergyKWh(*plan.InventorySale, 1)))
+	exact, _ := revenue.Float64()
+	plan = AnalyzePrices(minimumGainPrices(base, .45), minimumGainConfig(base, exact))
+	if plan.InventorySale == nil {
+		t.Fatalf("plan = %+v, want the sale whose gain (%s EUR) equals the minimum exactly", plan, revenue)
+	}
+}
+
+func TestBetterInventoryAlternativeAcceptsExactMinimumGain(t *testing.T) {
+	current := valuePlan{value: decimal.NewFromFloat(.10)}
+	candidate := valuePlan{value: decimal.NewFromFloat(.12)}
+	sale := TimeWindow{Start: time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)}
+
+	if !betterInventoryAlternative(candidate, sale, current, nil, decimal.NewFromFloat(.02)) {
+		t.Fatal("a gain equal to the minimum was rejected")
+	}
+	if betterInventoryAlternative(candidate, sale, current, nil, decimal.NewFromFloat(.021)) {
+		t.Fatal("a gain below the minimum was accepted")
+	}
 }
 
 // observedDayHalfHourPrices is the all-in import series observed on

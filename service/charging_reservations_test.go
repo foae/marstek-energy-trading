@@ -454,17 +454,18 @@ func TestReservationDefersToLatestAffordableSlices(t *testing.T) {
 
 func TestReservationTruncatesEarliestDeferredSliceAtItsStart(t *testing.T) {
 	// 1.4 kWh is five whole quarters plus nine minutes: the earliest reserved
-	// piece keeps its slot's end and starts late.
+	// piece keeps its slot's end and starts late, one deferredStartLead early.
 	s, base := deferralFixture(cheapAndExpensive(), 2.8)
 
 	reservation := s.chargeReservationLocked(base, 50)
 
-	if !reservation.Feasible || math.Abs(reservation.ReservedKWh-1.4) > 1e-9 {
-		t.Fatalf("reservation = %+v, want a feasible 1.4 kWh reservation", reservation)
+	wantKWh := 1.4 + deferredStartLead.Hours()
+	if !reservation.Feasible || math.Abs(reservation.ReservedKWh-wantKWh) > 1e-9 {
+		t.Fatalf("reservation = %+v, want a feasible %f kWh reservation", reservation, wantKWh)
 	}
 	start, end := reservationSpan(reservation)
-	if !start.Equal(base.Add(96*time.Minute)) || !end.Equal(base.Add(3*time.Hour)) {
-		t.Fatalf("reserved span = %s-%s, want 01:36-03:00", start, end)
+	if !start.Equal(base.Add(95*time.Minute)) || !end.Equal(base.Add(3*time.Hour)) {
+		t.Fatalf("reserved span = %s-%s, want 01:35-03:00", start, end)
 	}
 	if got := reservation.Windows[0].End; !got.Equal(base.Add(105 * time.Minute)) {
 		t.Fatalf("truncated piece end = %s, want its slot end 01:45", got)
@@ -530,21 +531,108 @@ func TestReservationRunsForwardWhileCharging(t *testing.T) {
 	}
 }
 
-func TestReservationKeepsRunningSliceAbovePriceCap(t *testing.T) {
-	prices := make([]float64, 16)
-	for i := range prices {
-		prices[i] = .13
-	}
-	prices[1] = .30
-	s, base := deferralFixture(prices, 2)
+func TestReservationKeepsRunningSliceDriftingAboveCapUnderOneCent(t *testing.T) {
+	// The running 0.13 slice has ten minutes (0.167 kWh) left and the cheaper
+	// 0.10 slices cover the whole requirement, so the cap ejects it; finishing it
+	// costs 0.03 EUR/kWh on 0.167 kWh, about half a cent, so it is kept.
+	prices := []float64{.13, .10, .10, .10, .10}
+	s, base := deferralFixture(prices, 1)
 	s.state = StateCharging
-	now := base.Add(20 * time.Minute)
+	now := base.Add(5 * time.Minute)
 	s.nowFunc = func() time.Time { return now }
 
 	reservation := s.chargeReservationLocked(now, 50)
 
-	if !reservation.Windows[0].Start.Equal(now) || !reservation.Windows[0].Price.Equal(decimal.NewFromFloat(.30)) {
-		t.Fatalf("expensive running slice was dropped: %+v", reservation.Windows)
+	if !reservation.contains(now) {
+		t.Fatalf("running slice was stopped mid-slot to save under a cent: %+v", reservation.Windows)
+	}
+	if !reservation.Windows[0].Start.Equal(now) || !reservation.Windows[0].End.Equal(base.Add(15*time.Minute)) {
+		t.Fatalf("running window = %+v, want %s to its slot end", reservation.Windows[0], now)
+	}
+}
+
+// boundaryPrices places a dear slot between two cheap ones, so a charge that
+// crosses into it at a tariff boundary must justify continuing.
+func boundaryPrices() []float64 {
+	return []float64{.10, .30, .10}
+}
+
+func TestReservationStopsAtBoundaryIntoDearUnselectedSlot(t *testing.T) {
+	// 0.25 kWh at 1 kW fits in the cheap slot after the boundary, so entering the
+	// dear slot buys nothing: the reservation must not cover it.
+	s, base := deferralFixture(boundaryPrices(), .5)
+	s.state = StateCharging
+	now := base.Add(15 * time.Minute)
+	s.nowFunc = func() time.Time { return now }
+
+	reservation := s.chargeReservationLocked(now, 50)
+
+	if reservation.contains(now) {
+		t.Fatalf("dear slot entered at the boundary was charged through: %+v", reservation.Windows)
+	}
+	if len(reservation.Windows) != 1 || !reservation.Windows[0].Start.Equal(base.Add(30*time.Minute)) {
+		t.Fatalf("reservation = %+v, want the cheap slot after the boundary", reservation.Windows)
+	}
+}
+
+func TestReservationChargesThroughDearSlotWhenNeeded(t *testing.T) {
+	// 0.5 kWh is still required but only 0.25 kWh of cheap slot remains, so the
+	// dear running slot covers the shortfall and the charge continues.
+	s, base := deferralFixture(boundaryPrices(), 1)
+	s.state = StateCharging
+	now := base.Add(15 * time.Minute)
+	s.nowFunc = func() time.Time { return now }
+
+	reservation := s.chargeReservationLocked(now, 50)
+
+	if !reservation.contains(now) {
+		t.Fatalf("needed dear slot was dropped: %+v", reservation.Windows)
+	}
+}
+
+func TestReservationMeterlessChargingKeepsCheapestOrdering(t *testing.T) {
+	// Without a meter the forward selection still pays the least: the 0.10 slot
+	// is taken before the nearer 0.12 one.
+	s, base := deferralFixture([]float64{.11, .12, .10}, .6)
+	s.meter = nil
+	s.state = StateCharging
+	now := base.Add(5 * time.Minute)
+	s.nowFunc = func() time.Time { return now }
+
+	reservation := s.chargeReservationLocked(now, 50)
+
+	if !reservation.contains(now) {
+		t.Fatalf("running slice was dropped: %+v", reservation.Windows)
+	}
+	for _, window := range reservation.Windows {
+		if window.Price.Equal(decimal.NewFromFloat(.12)) {
+			t.Fatalf("dearer nearer slot was preferred: %+v", reservation.Windows)
+		}
+	}
+	if len(reservation.Windows) != 2 || !reservation.Windows[1].Start.Equal(base.Add(30*time.Minute)) {
+		t.Fatalf("reservation = %+v, want the running slice and the cheapest later slot", reservation.Windows)
+	}
+}
+
+func TestReservationDeferredStartLeadsControlTick(t *testing.T) {
+	// The front-truncated piece starts a lead early, and the lead is clamped to
+	// the slot when the piece already reaches back to its start.
+	s, base := deferralFixture(cheapAndExpensive(), 2.8)
+
+	reservation := s.chargeReservationLocked(base, 50)
+
+	piece := reservation.Windows[0]
+	energyDuration := time.Duration(math.Round((1.4 - 1.25) * float64(time.Hour)))
+	if want := piece.End.Add(-energyDuration - deferredStartLead); !piece.Start.Equal(want) {
+		t.Fatalf("truncated piece start = %s, want %s (one lead before the energy start)", piece.Start, want)
+	}
+
+	// A 14.5-minute piece in a 15-minute slot cannot take the whole lead, so the
+	// start is clamped to the slot.
+	s.cfg.BatteryCapacityKWh = 2.9833333333333334
+	clamped := s.chargeReservationLocked(base, 50).Windows[0]
+	if !clamped.Start.Equal(base.Add(90 * time.Minute)) {
+		t.Fatalf("clamped piece start = %s, want the slot start 01:30", clamped.Start)
 	}
 }
 

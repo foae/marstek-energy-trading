@@ -1163,7 +1163,7 @@ func (s *Service) solarTick(ctx context.Context) {
 		if s.solarBlockedLocked(now, batterySOC) {
 			s.accumulateSolarEnergyLocked(measuredACChargePowerW)
 			s.solarGridPowerW = min(s.solarGridPowerW, measuredACChargePowerW)
-			slog.Info("decision: stop solar charging - yielding to plan window", "soc", batterySOC)
+			slog.Info("decision: stop solar charging - blocked", "soc", batterySOC, "reason", s.solarBlockReasonLocked())
 			s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonYieldWindow)
 			s.mu.Unlock()
 			s.tick(ctx)
@@ -1192,7 +1192,7 @@ func (s *Service) solarTick(ctx context.Context) {
 	if s.state == StateSolarCharging && s.solarBlockedLocked(now, batterySOC) {
 		s.accumulateSolarEnergyLocked(measuredACChargePowerW)
 		s.solarGridPowerW = min(max(activePowerW, 0), measuredACChargePowerW)
-		slog.Info("decision: stop solar charging - yielding to plan window", "soc", batterySOC)
+		slog.Info("decision: stop solar charging - blocked", "soc", batterySOC, "reason", s.solarBlockReasonLocked())
 		s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonYieldWindow)
 		s.mu.Unlock()
 		s.tick(ctx)

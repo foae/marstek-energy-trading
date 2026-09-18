@@ -102,6 +102,20 @@ func (s *Service) chargeReservationLocked(now time.Time, soc int) chargingReserv
 	return result
 }
 
+// chargeContinuationToleranceEUR bounds what is paid to finish a running slice.
+// Finishing a running slice that has drifted above the price cap is cheaper than
+// a stop/start pair when the price penalty on its remaining energy is under one
+// cent; a whole dear slot entered at a boundary costs far more and is not kept.
+const chargeContinuationToleranceEUR = 0.01
+
+// deferredStartLead widens a front-truncated deferred piece backwards. The
+// control loop ticks about once a minute and is not aligned to the piece, so a
+// piece that begins exactly when its energy is due can be seen up to a minute
+// late, and a piece only slightly longer than the minimum control window would
+// never be startable at all. The lead costs at most a minute of early charging
+// and is corrected by the next SOC recalculation.
+const deferredStartLead = time.Minute
+
 // allocateDeferredChargeSlices reserves the required AC energy as late as
 // possible without paying materially more than the cheapest selection, so
 // solar captured in the meantime shrinks the grid purchase. Slices priced at
@@ -109,18 +123,23 @@ func (s *Service) chargeReservationLocked(now time.Time, soc int) chargingReserv
 // "affordable"; any shortfall left after them comes from the cheapest of the
 // remaining slices. Before charging starts, affordable slices are taken from
 // the latest backwards and the earliest one is truncated at its start. Once
-// charging, the selection runs contiguously forward from now (the slice that
-// contains now is always kept, whatever its price or remaining length, so a
-// running charge is never interrupted mid-slot) and rising SOC shrinks its
-// tail, never its head. A truncated piece is never shorter than
+// charging, the selection runs contiguously forward from now (the slice
+// containing now is kept whatever its remaining length when it is affordable or
+// when finishing its remaining energy costs under chargeContinuationToleranceEUR
+// above the cheapest average, so a running charge is never interrupted mid-slot
+// to save a fraction of a cent; a dearer slot entered at a boundary costs far
+// more than that and is only used if the shortfall needs it) and rising SOC
+// shrinks its tail, never its head. A truncated piece is never shorter than
 // minimumAutomaticControlWindow plus one second; it is widened within its slot
 // instead, which over-reserves by under a minute and is corrected by the next
-// SOC recalculation.
+// SOC recalculation. A front-truncated piece additionally starts
+// deferredStartLead earlier, bounded by its slot.
 //
 // deferral is false without a P1 meter: SOC cannot rise while waiting, so
-// waiting can only cost money and the cheapest slices are reserved as before.
-// A running charge still runs contiguously forward, which is what keeps a
-// meterless install from stopping and restarting at every tariff boundary.
+// waiting can only cost money and the cheapest slices are reserved, keeping the
+// running slice when it is affordable. That still runs contiguously from the
+// running slice, which is what keeps a meterless install from stopping and
+// restarting at every tariff boundary.
 //
 // An infeasible cheapest allocation has no meaningful average price, so the
 // price cap is dropped and every slice counts as affordable: the same total
@@ -134,17 +153,25 @@ func allocateDeferredChargeSlices(windows []TimeWindow, requiredKWh, powerKW, to
 	if !deferral && !charging {
 		return cheapest
 	}
-	priceCap := cheapest.Cost.Div(decimal.NewFromFloat(cheapest.ReservedKWh)).
-		Add(decimal.NewFromFloat(max(toleranceEURPerKWh, 0)))
+	cheapestAverage := cheapest.Cost.Div(decimal.NewFromFloat(cheapest.ReservedKWh))
+	priceCap := cheapestAverage.Add(decimal.NewFromFloat(max(toleranceEURPerKWh, 0)))
 
 	owned := append([]TimeWindow(nil), windows...)
 	var running *TimeWindow
 	var affordable, rest []TimeWindow
 	for i := range owned {
 		window := owned[i]
-		// The running slice is kept whatever its price or remaining length: it is
-		// already being charged, so dropping it stops the inverter mid-slot.
-		if charging && running == nil && !now.Before(window.Start) && now.Before(window.End) {
+		// A running slice is kept whatever its remaining length when it is
+		// affordable, or when its remaining energy costs under a cent more than
+		// the cheapest average: it is already being charged, so dropping it stops
+		// the inverter mid-slot. A whole dear slot merely entered at a tariff
+		// boundary costs far more than that and is classified like any other
+		// window.
+		if charging && running == nil && !now.Before(window.Start) && now.Before(window.End) &&
+			(!cheapest.Feasible || window.Price.LessThanOrEqual(priceCap) ||
+				window.Price.Sub(cheapestAverage).
+					Mul(decimal.NewFromFloat(powerKW*window.End.Sub(window.Start).Hours())).
+					LessThan(decimal.NewFromFloat(chargeContinuationToleranceEUR))) {
 			candidate := window
 			running = &candidate
 			continue
@@ -159,10 +186,18 @@ func allocateDeferredChargeSlices(windows []TimeWindow, requiredKWh, powerKW, to
 		rest = append(rest, window)
 	}
 	sort.SliceStable(affordable, func(i, j int) bool {
-		if charging {
+		switch {
+		case !deferral:
+			// Meterless: nothing can arrive while waiting, so pay the least.
+			if affordable[i].Price.Equal(affordable[j].Price) {
+				return affordable[i].Start.Before(affordable[j].Start)
+			}
+			return affordable[i].Price.LessThan(affordable[j].Price)
+		case charging:
 			return affordable[i].Start.Before(affordable[j].Start)
+		default:
+			return affordable[j].Start.Before(affordable[i].Start)
 		}
-		return affordable[j].Start.Before(affordable[i].Start)
 	})
 	sort.SliceStable(rest, func(i, j int) bool {
 		if rest[i].Price.Equal(rest[j].Price) {
@@ -205,7 +240,11 @@ func allocateDeferredChargeSlices(windows []TimeWindow, requiredKWh, powerKW, to
 		// forward selections (a running charge, or any fallback slice) keep their
 		// start instead.
 		if !charging && i < affordableCount {
-			window.Start = window.End.Add(-duration)
+			slotStart := window.Start
+			window.Start = window.End.Add(-duration - deferredStartLead)
+			if window.Start.Before(slotStart) {
+				window.Start = slotStart
+			}
 		} else {
 			window.End = window.Start.Add(duration)
 		}
@@ -235,6 +274,14 @@ func (r chargingReservation) windowAt(now time.Time) (TimeWindow, bool) {
 		}
 	}
 	return TimeWindow{}, false
+}
+
+// solarBlockReasonLocked labels why solar charging yields, for the decision log.
+func (s *Service) solarBlockReasonLocked() string {
+	if s.retiredDischargeWindowsDirty {
+		return "retired windows pending persistence"
+	}
+	return "plan window"
 }
 
 func (s *Service) solarBlockedLocked(now time.Time, soc int) bool {

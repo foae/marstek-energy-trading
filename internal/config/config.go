@@ -181,8 +181,13 @@ func isFinite(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
-// PlanningChargePowerW is the charge power assumed when sizing reservations and plans.
+// PlanningChargePowerW is the charge power assumed when sizing reservations and
+// plans. validate rejects a derate outside (0, 1], so the clamp only guards
+// callers that build a Config without going through it, such as tests.
 func (c *Config) PlanningChargePowerW() float64 {
+	if !(c.ChargePlanningDerate > 0 && c.ChargePlanningDerate <= 1) {
+		return float64(c.ChargePowerW)
+	}
 	return float64(c.ChargePowerW) * c.ChargePlanningDerate
 }
 

@@ -174,7 +174,7 @@ func TestInventorySaleRejectsSliverAboveMinimumSOC(t *testing.T) {
 		cfg := AnalyzerConfig{
 			Efficiency: 0.79, ChargeEfficiency: 0.95, MinPriceSpread: .05,
 			BatteryCapacityKWh: 5.12, BatteryMinSOC: 0.11,
-			ChargePowerW: 2200, DischargePowerW: 2200, MaxCyclesPerDay: 2,
+			ChargePowerW: 2200, ChargePlanningDerate: 1, DischargePowerW: 2200, MaxCyclesPerDay: 2,
 			Now: base, InitialSOC: soc, InitialSOCKnown: true,
 		}
 		available := cfg.BatteryCapacityKWh * float64(soc-11) / 100
@@ -233,7 +233,7 @@ func TestInventorySaleFloorIgnoresQuarantinedEnergy(t *testing.T) {
 	cfg := AnalyzerConfig{
 		Efficiency: 0.79, ChargeEfficiency: 0.95, MinPriceSpread: .05,
 		BatteryCapacityKWh: 5.12, BatteryMinSOC: 0.11,
-		ChargePowerW: 2200, DischargePowerW: 2200, MaxCyclesPerDay: 2,
+		ChargePowerW: 2200, ChargePlanningDerate: 1, DischargePowerW: 2200, MaxCyclesPerDay: 2,
 		Now: base, InitialSOC: 100, InitialSOCKnown: true,
 	}
 	trusted := 0.05

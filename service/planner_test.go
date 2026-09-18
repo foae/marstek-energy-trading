@@ -26,14 +26,15 @@ func plannerPrices(start time.Time, imports, exports []float64) []nordpool.Price
 
 func plannerConfig(now time.Time) AnalyzerConfig {
 	return AnalyzerConfig{
-		Efficiency:         1,
-		ChargeEfficiency:   1,
-		MinPriceSpread:     .01,
-		BatteryCapacityKWh: 1,
-		ChargePowerW:       4000,
-		DischargePowerW:    4000,
-		MaxCyclesPerDay:    1,
-		Now:                now,
+		Efficiency:           1,
+		ChargeEfficiency:     1,
+		MinPriceSpread:       .01,
+		BatteryCapacityKWh:   1,
+		ChargePowerW:         4000,
+		ChargePlanningDerate: 1,
+		DischargePowerW:      4000,
+		MaxCyclesPerDay:      1,
+		Now:                  now,
 	}
 }
 
@@ -293,5 +294,36 @@ func TestInventoryPlanDominatesDenseExecutableEndpoints(t *testing.T) {
 		if oracle.Sub(best.value).GreaterThan(decimal.NewFromFloat(1e-9)) {
 			t.Fatalf("trial=%d got=%s oracle=%s sale=%+v cfg=%+v imports=%v exports=%v", trial, best.value, oracle, selected, cfg, imports, exports)
 		}
+	}
+}
+
+// TestChargePlanningDerateLengthensPlannedChargeWindow: at half the assumed
+// power the same energy needs twice the time, so the plan starts charging in
+// earlier, dearer slices.
+func TestChargePlanningDerateLengthensPlannedChargeWindow(t *testing.T) {
+	base := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+	values := []float64{.14, .13, .12, .11, .50, .50, .50, .50}
+	prices := plannerPrices(base, values, values)
+	cfg := plannerConfig(base)
+	cfg.ChargePowerW, cfg.DischargePowerW = 1000, 1000
+	cfg.BatteryCapacityKWh = .5
+
+	nameplate := AnalyzePrices(prices, cfg)
+	cfg.ChargePlanningDerate = .5
+	derated := AnalyzePrices(prices, cfg)
+
+	if len(nameplate.Cycles) != 1 || len(derated.Cycles) != 1 {
+		t.Fatalf("expected one cycle each: nameplate=%+v derated=%+v", nameplate.Cycles, derated.Cycles)
+	}
+	full := nameplate.Cycles[0].ChargeWindow
+	half := derated.Cycles[0].ChargeWindow
+	if !full.Start.Equal(base.Add(30 * time.Minute)) {
+		t.Fatalf("nameplate charge start = %s, want 00:30 (30 minutes at 1 kW)", full.Start)
+	}
+	if !half.Start.Equal(base) {
+		t.Fatalf("derated charge start = %s, want 00:00 (one hour at 0.5 kW)", half.Start)
+	}
+	if !half.Price.GreaterThan(full.Price) {
+		t.Fatalf("derated weighted price = %s, want above the nameplate %s", half.Price, full.Price)
 	}
 }

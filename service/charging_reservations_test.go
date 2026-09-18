@@ -14,7 +14,7 @@ func reservationFixture() (*Service, time.Time) {
 	now := time.Date(2026, 9, 5, 23, 30, 0, 0, time.UTC)
 	s := &Service{
 		loc:     time.UTC,
-		cfg:     &config.Config{BatteryCapacityKWh: 1, BatteryEfficiency: 1, MinPriceSpread: .05, ChargePowerW: 1000},
+		cfg:     &config.Config{BatteryCapacityKWh: 1, BatteryEfficiency: 1, MinPriceSpread: .05, ChargePowerW: 1000, ChargePlanningDerate: 1},
 		nowFunc: func() time.Time { return now },
 		currentPlan: &TradingPlan{Cycles: []TradeCycle{{
 			ChargeWindow:    TimeWindow{Start: now, End: now.Add(time.Hour)},
@@ -41,6 +41,7 @@ func TestReservationOnlyUsesSlicesMeetingExpectedProfitThreshold(t *testing.T) {
 			BatteryChargeEfficiency: .90,
 			MinPriceSpread:          .05,
 			ChargePowerW:            2500,
+			ChargePlanningDerate:    1,
 		},
 		nowFunc: func() time.Time { return now },
 		currentPlan: &TradingPlan{Cycles: []TradeCycle{{
@@ -84,10 +85,11 @@ func TestEconomicShortfallDoesNotBlockSolarWithoutActiveReservation(t *testing.T
 	s := &Service{
 		loc: time.UTC,
 		cfg: &config.Config{
-			BatteryCapacityKWh: 1,
-			BatteryEfficiency:  .90,
-			MinPriceSpread:     .05,
-			ChargePowerW:       1000,
+			BatteryCapacityKWh:   1,
+			BatteryEfficiency:    .90,
+			MinPriceSpread:       .05,
+			ChargePowerW:         1000,
+			ChargePlanningDerate: 1,
 		},
 		nowFunc: func() time.Time { return now },
 		currentPlan: &TradingPlan{Cycles: []TradeCycle{{
@@ -142,7 +144,7 @@ func TestReservationRejectsZeroProfitSliceAtZeroThreshold(t *testing.T) {
 	now := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
 	s := &Service{
 		loc:     time.UTC,
-		cfg:     &config.Config{BatteryCapacityKWh: 1, BatteryEfficiency: .5, MinPriceSpread: 0, ChargePowerW: 1000},
+		cfg:     &config.Config{BatteryCapacityKWh: 1, BatteryEfficiency: .5, MinPriceSpread: 0, ChargePowerW: 1000, ChargePlanningDerate: 1},
 		nowFunc: func() time.Time { return now },
 		currentPlan: &TradingPlan{Cycles: []TradeCycle{{
 			ChargeWindow:    TimeWindow{Start: now, End: now.Add(15 * time.Minute)},
@@ -161,7 +163,7 @@ func TestStatusWaitsForFeasibleReservationWhenCurrentSliceIsExcluded(t *testing.
 	now := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
 	s := &Service{
 		loc:     time.UTC,
-		cfg:     &config.Config{BatteryCapacityKWh: 1, BatteryEfficiency: 1, MinPriceSpread: .05, ChargePowerW: 1000},
+		cfg:     &config.Config{BatteryCapacityKWh: 1, BatteryEfficiency: 1, MinPriceSpread: .05, ChargePowerW: 1000, ChargePlanningDerate: 1},
 		nowFunc: func() time.Time { return now },
 		currentPlan: &TradingPlan{IsProfitable: true, Cycles: []TradeCycle{{
 			ChargeWindow:    TimeWindow{Start: now, End: now.Add(45 * time.Minute)},
@@ -190,10 +192,11 @@ func TestFeasibleReservationIsNotMarkedEconomicsLimited(t *testing.T) {
 	s := &Service{
 		loc: time.UTC,
 		cfg: &config.Config{
-			BatteryCapacityKWh: 1,
-			BatteryEfficiency:  1,
-			MinPriceSpread:     .05,
-			ChargePowerW:       1000,
+			BatteryCapacityKWh:   1,
+			BatteryEfficiency:    1,
+			MinPriceSpread:       .05,
+			ChargePowerW:         1000,
+			ChargePlanningDerate: 1,
 		},
 		nowFunc: func() time.Time { return now },
 		currentPlan: &TradingPlan{Cycles: []TradeCycle{{
@@ -224,10 +227,11 @@ func TestReservationUsesDischargePriceFromMatchingCycle(t *testing.T) {
 	s := &Service{
 		loc: time.UTC,
 		cfg: &config.Config{
-			BatteryCapacityKWh: 1,
-			BatteryEfficiency:  .90,
-			MinPriceSpread:     .05,
-			ChargePowerW:       1000,
+			BatteryCapacityKWh:   1,
+			BatteryEfficiency:    .90,
+			MinPriceSpread:       .05,
+			ChargePowerW:         1000,
+			ChargePlanningDerate: 1,
 		},
 		nowFunc: func() time.Time { return now },
 		currentPlan: &TradingPlan{Cycles: []TradeCycle{
@@ -260,6 +264,7 @@ func TestReservationProfitFloorHoldsAcrossControlTicks(t *testing.T) {
 			BatteryChargeEfficiency: .90,
 			MinPriceSpread:          .05,
 			ChargePowerW:            1000,
+			ChargePlanningDerate:    1,
 		},
 		nowFunc: func() time.Time { return clock },
 		currentPlan: &TradingPlan{Cycles: []TradeCycle{{
@@ -332,7 +337,7 @@ func TestReservationDeduplicatesOverlappingPriceCalendars(t *testing.T) {
 	price := nordpool.Price{Time: now, Value: .10}
 	s := &Service{
 		loc:     time.UTC,
-		cfg:     &config.Config{BatteryCapacityKWh: 1, BatteryEfficiency: 1, MinPriceSpread: .05, ChargePowerW: 1000},
+		cfg:     &config.Config{BatteryCapacityKWh: 1, BatteryEfficiency: 1, MinPriceSpread: .05, ChargePowerW: 1000, ChargePlanningDerate: 1},
 		nowFunc: func() time.Time { return now },
 		currentPlan: &TradingPlan{Cycles: []TradeCycle{{
 			ChargeWindow:    TimeWindow{Start: now, End: now.Add(15 * time.Minute)},
@@ -367,6 +372,7 @@ func continuationFixture(state State, prices []float64) (*Service, time.Time) {
 			BatteryChargeEfficiency: 1,
 			MinPriceSpread:          .05,
 			ChargePowerW:            1000,
+			ChargePlanningDerate:    1,
 		},
 		nowFunc: func() time.Time { return now },
 		currentPlan: &TradingPlan{Cycles: []TradeCycle{{
@@ -378,159 +384,222 @@ func continuationFixture(state State, prices []float64) (*Service, time.Time) {
 	return s, now
 }
 
-func TestReservationExtendsRunningSliceToTariffBoundary(t *testing.T) {
-	s, now := continuationFixture(StateCharging, []float64{.13, .12, .11})
-	slotEnd := now.Add(10 * time.Minute)
+// deferralFixture builds an idle service whose whole price series is a single
+// charge window, so the allocator alone decides which slices are reserved.
+func deferralFixture(prices []float64, capacityKWh float64) (*Service, time.Time) {
+	base := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+	today := make([]nordpool.Price, len(prices))
+	for i, value := range prices {
+		today[i] = nordpool.Price{Time: base.Add(time.Duration(i) * 15 * time.Minute), Value: value}
+	}
+	s := &Service{
+		loc: time.UTC,
+		cfg: &config.Config{
+			BatteryCapacityKWh:            capacityKWh,
+			BatteryEfficiency:             1,
+			BatteryChargeEfficiency:       1,
+			MinPriceSpread:                .05,
+			ChargePowerW:                  1000,
+			ChargePlanningDerate:          1,
+			ChargeDeferToleranceEURPerKWh: .01,
+		},
+		nowFunc: func() time.Time { return base },
+		currentPlan: &TradingPlan{Cycles: []TradeCycle{{
+			ChargeWindow:    TimeWindow{Start: base, End: base.Add(time.Duration(len(prices)) * 15 * time.Minute)},
+			DischargeWindow: TimeWindow{Price: decimal.NewFromFloat(.50)},
+		}}},
+		todayPrices: today,
+		meter:       NewMockMeter(true, 0),
+	}
+	return s, base
+}
 
-	reservation := s.chargeReservationLocked(now, 50)
+// cheapAndExpensive returns four hours of quarter-hour prices: cheap until the
+// final hour, which is priced beyond the deferral tolerance.
+func cheapAndExpensive() []float64 {
+	prices := make([]float64, 16)
+	for i := range prices {
+		prices[i] = .13
+		if i >= 12 {
+			prices[i] = .18
+		}
+	}
+	return prices
+}
 
-	if math.Abs(reservation.RequiredKWh-0.55) > 0.000001 {
-		t.Fatalf("fixture sanity: RequiredKWh = %f, want 0.55", reservation.RequiredKWh)
+func reservationSpan(reservation chargingReservation) (time.Time, time.Time) {
+	return reservation.Windows[0].Start, reservation.Windows[len(reservation.Windows)-1].End
+}
+
+func TestReservationDefersToLatestAffordableSlices(t *testing.T) {
+	// 2 kWh at 1 kW is two hours; the cheap slices end at 03:00, so the latest
+	// affordable selection is 01:00-03:00, not the earliest 00:00-02:00.
+	s, base := deferralFixture(cheapAndExpensive(), 4)
+
+	reservation := s.chargeReservationLocked(base, 50)
+
+	if !reservation.Feasible || math.Abs(reservation.ReservedKWh-2) > 1e-9 {
+		t.Fatalf("reservation = %+v, want a feasible 2 kWh reservation", reservation)
 	}
-	if len(reservation.Windows) != 3 {
-		t.Fatalf("expected three reserved windows, got %+v", reservation.Windows)
+	start, end := reservationSpan(reservation)
+	if !start.Equal(base.Add(time.Hour)) || !end.Equal(base.Add(3*time.Hour)) {
+		t.Fatalf("reserved span = %s-%s, want 01:00-03:00", start, end)
 	}
-	running := reservation.Windows[0]
-	if !running.Start.Equal(now) || !running.End.Equal(slotEnd) {
-		t.Errorf("running window = %s-%s, want %s-%s", running.Start, running.End, now, slotEnd)
-	}
-	// The 7 minutes of energy added to the running slice come out of the next
-	// most expensive reserved slice.
-	displaced := reservation.Windows[1]
-	if got := displaced.End.Sub(displaced.Start); got != 8*time.Minute {
-		t.Errorf("displaced window length = %s, want 8m", got)
-	}
-	if math.Abs(reservation.ReservedKWh-0.55) > 0.000001 {
-		t.Errorf("ReservedKWh = %f, want 0.55", reservation.ReservedKWh)
-	}
-	if !reservation.Feasible {
-		t.Errorf("reservation should stay feasible: %+v", reservation)
+	for _, window := range reservation.Windows {
+		if !window.Price.Equal(decimal.NewFromFloat(.13)) {
+			t.Fatalf("reserved a slice above the deferral price cap: %+v", window)
+		}
 	}
 }
 
-func TestReservationKeepsTruncationWhenContinuationCostsMoreThanOneCent(t *testing.T) {
-	s, now := continuationFixture(StateCharging, []float64{.30, .10, .10})
+func TestReservationTruncatesEarliestDeferredSliceAtItsStart(t *testing.T) {
+	// 1.4 kWh is five whole quarters plus nine minutes: the earliest reserved
+	// piece keeps its slot's end and starts late.
+	s, base := deferralFixture(cheapAndExpensive(), 2.8)
 
-	reservation := s.chargeReservationLocked(now, 50)
+	reservation := s.chargeReservationLocked(base, 50)
 
-	running := reservation.Windows[0]
-	if !running.End.Equal(now.Add(3 * time.Minute)) {
-		t.Errorf("running window end = %s, want the truncated %s", running.End, now.Add(3*time.Minute))
+	if !reservation.Feasible || math.Abs(reservation.ReservedKWh-1.4) > 1e-9 {
+		t.Fatalf("reservation = %+v, want a feasible 1.4 kWh reservation", reservation)
 	}
-	if math.Abs(reservation.ReservedKWh-0.55) > 0.000001 {
-		t.Errorf("ReservedKWh = %f, want 0.55", reservation.ReservedKWh)
+	start, end := reservationSpan(reservation)
+	if !start.Equal(base.Add(96*time.Minute)) || !end.Equal(base.Add(3*time.Hour)) {
+		t.Fatalf("reserved span = %s-%s, want 01:36-03:00", start, end)
 	}
-}
-
-func TestReservationDoesNotExtendWhenNotCharging(t *testing.T) {
-	s, now := continuationFixture(StateIdle, []float64{.13, .12, .11})
-
-	reservation := s.chargeReservationLocked(now, 50)
-
-	running := reservation.Windows[0]
-	if !running.End.Equal(now.Add(3 * time.Minute)) {
-		t.Errorf("running window end = %s, want the truncated %s", running.End, now.Add(3*time.Minute))
+	if got := reservation.Windows[0].End; !got.Equal(base.Add(105 * time.Minute)) {
+		t.Fatalf("truncated piece end = %s, want its slot end 01:45", got)
 	}
 }
 
-func TestReservationDoesNotExtendSingleReservedSlice(t *testing.T) {
-	// Only the running slice clears the expected-profit floor, so there is no
-	// cheaper reserved energy to displace.
-	s, now := continuationFixture(StateCharging, []float64{.13, .50, .50})
-	s.cfg.BatteryCapacityKWh = 0.1 // 0.05 kWh required at 50% SOC
+func TestReservationFillsShortfallFromCheapestRemainingSlices(t *testing.T) {
+	// One cheap hour, then an expensive hour, then a middling one. The affordable
+	// slices hold 1 kWh of the 1.5 kWh requirement; the rest comes from the
+	// cheapest remaining slices, not from the chronologically nearer expensive ones.
+	prices := []float64{.13, .13, .13, .13, .30, .30, .30, .30, .20, .20, .20, .20}
+	s, base := deferralFixture(prices, 3)
 
-	reservation := s.chargeReservationLocked(now, 50)
+	reservation := s.chargeReservationLocked(base, 50)
 
-	if len(reservation.Windows) != 1 {
-		t.Fatalf("expected a single reserved window, got %+v", reservation.Windows)
+	if !reservation.Feasible || math.Abs(reservation.ReservedKWh-1.5) > 1e-9 {
+		t.Fatalf("reservation = %+v, want a feasible 1.5 kWh reservation", reservation)
 	}
-	if !reservation.Windows[0].End.Equal(now.Add(3 * time.Minute)) {
-		t.Errorf("window end = %s, want the truncated %s", reservation.Windows[0].End, now.Add(3*time.Minute))
+	for _, window := range reservation.Windows {
+		if window.Price.Equal(decimal.NewFromFloat(.30)) {
+			t.Fatalf("shortfall was taken from the expensive slices: %+v", reservation.Windows)
+		}
+	}
+	last := reservation.Windows[len(reservation.Windows)-1]
+	if !last.End.Equal(base.Add(150 * time.Minute)) {
+		t.Fatalf("shortfall span ends at %s, want 02:30 of the cheapest remaining slices", last.End)
 	}
 }
 
-// continuationFixtureAt mirrors continuationFixture but places "now" at an
-// arbitrary offset inside the first slot, so the energy left in the running
-// slice can be chosen exactly.
-func continuationFixtureAt(state State, prices []float64, offset time.Duration) (*Service, time.Time) {
-	s, _ := continuationFixture(state, prices)
-	slotStart := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
-	now := slotStart.Add(offset)
+func TestReservationRunsForwardWhileCharging(t *testing.T) {
+	prices := make([]float64, 16)
+	for i := range prices {
+		prices[i] = .13
+	}
+	s, base := deferralFixture(prices, 2)
+	s.state = StateCharging
+	now := base.Add(20 * time.Minute)
 	s.nowFunc = func() time.Time { return now }
-	return s, now
-}
-
-func TestReservationReAddsRunningSliceEjectedByRisingSOC(t *testing.T) {
-	// The two cheaper slices alone cover the 0.5 kWh requirement, so the running
-	// slice is no longer selected at all. Re-adding it costs 0.09 EUR/kWh on
-	// 0.1 kWh = 0.009 EUR, under the one-cent tolerance.
-	s, now := continuationFixtureAt(StateCharging, []float64{.19, .10, .10}, 9*time.Minute)
-	s.cfg.BatteryCapacityKWh = 1
-	slotEnd := now.Add(6 * time.Minute)
 
 	reservation := s.chargeReservationLocked(now, 50)
 
-	if math.Abs(reservation.RequiredKWh-0.5) > 0.000001 {
-		t.Fatalf("fixture sanity: RequiredKWh = %f, want 0.5", reservation.RequiredKWh)
-	}
 	if !reservation.contains(now) {
-		t.Fatalf("running slice was not re-added to the reservation: %+v", reservation.Windows)
+		t.Fatalf("running slice not reserved: %+v", reservation.Windows)
 	}
-	running := reservation.Windows[0]
-	if !running.Start.Equal(now) || !running.End.Equal(slotEnd) {
-		t.Errorf("running window = %s-%s, want %s-%s", running.Start, running.End, now, slotEnd)
+	if !reservation.Windows[0].Start.Equal(now) {
+		t.Fatalf("selection starts at %s, want the running slice at %s", reservation.Windows[0].Start, now)
 	}
-	if math.Abs(reservation.ReservedKWh-0.5) > 0.000001 {
-		t.Errorf("ReservedKWh = %f, want 0.5", reservation.ReservedKWh)
+	for i := 1; i < len(reservation.Windows); i++ {
+		if !reservation.Windows[i].Start.Equal(reservation.Windows[i-1].End) {
+			t.Fatalf("selection is not contiguous: %+v", reservation.Windows)
+		}
 	}
-}
+	_, end := reservationSpan(reservation)
 
-func TestReservationDoesNotReAddEjectedRunningSliceAboveTolerance(t *testing.T) {
-	// Same ejection, but the price gap makes continuation cost 0.015 EUR.
-	s, now := continuationFixtureAt(StateCharging, []float64{.25, .10, .10}, 9*time.Minute)
-	s.cfg.BatteryCapacityKWh = 1
-
-	reservation := s.chargeReservationLocked(now, 50)
-
-	if reservation.contains(now) {
-		t.Fatalf("expensive running slice was re-added anyway: %+v", reservation.Windows)
+	// Rising SOC shrinks the tail, never the head.
+	shrunk := s.chargeReservationLocked(now, 75)
+	if !shrunk.contains(now) || !shrunk.Windows[0].Start.Equal(now) {
+		t.Fatalf("rising SOC moved the running head: %+v", shrunk.Windows)
 	}
-	if math.Abs(reservation.ReservedKWh-0.5) > 0.000001 {
-		t.Errorf("ReservedKWh = %f, want 0.5", reservation.ReservedKWh)
+	_, shrunkEnd := reservationSpan(shrunk)
+	if !shrunkEnd.Before(end) {
+		t.Fatalf("reserved tail = %s, want it shorter than %s", shrunkEnd, end)
 	}
 }
 
-func TestReservationRejectsContinuationCostingExactlyOneCent(t *testing.T) {
-	// 0.10 EUR/kWh on 0.1 kWh is exactly one cent: the tolerance is "under a
-	// cent", so the running slice stays out.
-	s, now := continuationFixtureAt(StateCharging, []float64{.20, .10, .10}, 9*time.Minute)
-	s.cfg.BatteryCapacityKWh = 1
+func TestReservationKeepsRunningSliceAbovePriceCap(t *testing.T) {
+	prices := make([]float64, 16)
+	for i := range prices {
+		prices[i] = .13
+	}
+	prices[1] = .30
+	s, base := deferralFixture(prices, 2)
+	s.state = StateCharging
+	now := base.Add(20 * time.Minute)
+	s.nowFunc = func() time.Time { return now }
 
 	reservation := s.chargeReservationLocked(now, 50)
 
-	if reservation.contains(now) {
-		t.Fatalf("continuation costing exactly one cent was accepted: %+v", reservation.Windows)
+	if !reservation.Windows[0].Start.Equal(now) || !reservation.Windows[0].Price.Equal(decimal.NewFromFloat(.30)) {
+		t.Fatalf("expensive running slice was dropped: %+v", reservation.Windows)
 	}
 }
 
-func TestReservationKeepsTruncationWhenCheaperSlicesCannotAbsorbExtension(t *testing.T) {
-	// The only cheaper reserved slice holds 0.1 kWh but the extension needs
-	// 0.2333 kWh. Extending anyway would reserve more than the requirement.
-	s, now := continuationFixture(StateCharging, []float64{.13, .12})
-	slotStart := now.Add(-5 * time.Minute)
-	s.currentPlan.Cycles[0].ChargeWindow.End = slotStart.Add(21 * time.Minute)
-	s.cfg.BatteryCapacityKWh = 0.3
-
-	reservation := s.chargeReservationLocked(now, 50)
-
-	if math.Abs(reservation.RequiredKWh-0.15) > 0.000001 {
-		t.Fatalf("fixture sanity: RequiredKWh = %f, want 0.15", reservation.RequiredKWh)
+func TestReservationSizesAtDeratedPower(t *testing.T) {
+	prices := make([]float64, 16)
+	for i := range prices {
+		prices[i] = .13
 	}
-	running := reservation.Windows[0]
-	if delta := running.End.Sub(now.Add(3 * time.Minute)); delta > time.Second || delta < -time.Second {
-		t.Errorf("running window end = %s, want the truncated %s", running.End, now.Add(3*time.Minute))
+	s, base := deferralFixture(prices, 1)
+
+	full := s.chargeReservationLocked(base, 50)
+	s.cfg.ChargePlanningDerate = .5
+	derated := s.chargeReservationLocked(base, 50)
+
+	fullStart, fullEnd := reservationSpan(full)
+	deratedStart, deratedEnd := reservationSpan(derated)
+	if fullEnd.Sub(fullStart) != 30*time.Minute {
+		t.Fatalf("nameplate reservation = %s, want 30m", fullEnd.Sub(fullStart))
 	}
-	if reservation.ReservedKWh > reservation.RequiredKWh+1e-9 {
-		t.Errorf("over-reserved: ReservedKWh = %f, RequiredKWh = %f", reservation.ReservedKWh, reservation.RequiredKWh)
+	if deratedEnd.Sub(deratedStart) != time.Hour {
+		t.Fatalf("derated reservation = %s, want 1h", deratedEnd.Sub(deratedStart))
+	}
+}
+
+func TestReservationInfeasibleUnchangedByDeferral(t *testing.T) {
+	// Only the first two slices clear the expected-profit floor, so the 2 kWh
+	// requirement cannot be met and the shortfall is economic.
+	s, base := deferralFixture([]float64{.13, .13, .50, .50}, 4)
+
+	reservation := s.chargeReservationLocked(base, 50)
+
+	if reservation.Feasible {
+		t.Fatalf("reservation = %+v, want infeasible", reservation)
+	}
+	if !reservation.LimitedByEconomics {
+		t.Fatalf("reservation = %+v, want the shortfall attributed to economics", reservation)
+	}
+	if math.Abs(reservation.ReservedKWh-.5) > 1e-9 {
+		t.Fatalf("ReservedKWh = %f, want the eligible 0.5 kWh", reservation.ReservedKWh)
+	}
+}
+
+func TestReservationUsesCheapestSlicesWithoutMeter(t *testing.T) {
+	// Without a P1 meter, SOC cannot rise while waiting, so deferral can only
+	// cost money: the earliest cheap slices are reserved as before.
+	s, base := deferralFixture(cheapAndExpensive(), 4)
+	s.meter = nil
+
+	reservation := s.chargeReservationLocked(base, 50)
+
+	if !reservation.Feasible || math.Abs(reservation.ReservedKWh-2) > 1e-9 {
+		t.Fatalf("reservation = %+v, want a feasible 2 kWh reservation", reservation)
+	}
+	start, end := reservationSpan(reservation)
+	if !start.Equal(base) || !end.Equal(base.Add(2*time.Hour)) {
+		t.Fatalf("reserved span = %s-%s, want the cheapest 00:00-02:00", start, end)
 	}
 }

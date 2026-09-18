@@ -452,6 +452,7 @@ func testConfig() *config.Config {
 		BatteryMinSOC:           0.11,
 		MaxCyclesPerDay:         2,
 		ChargePowerW:            2500,
+		ChargePlanningDerate:    1,
 		DischargePowerW:         2500,
 		PassiveModeTimeoutS:     300,
 		SolarMinSurplusW:        100,
@@ -471,6 +472,7 @@ func testConfigSmallBattery() *config.Config {
 		BatteryMinSOC:           0.11,
 		MaxCyclesPerDay:         2,
 		ChargePowerW:            2000,
+		ChargePlanningDerate:    1,
 		DischargePowerW:         2000,
 		PassiveModeTimeoutS:     300,
 		SolarMinSurplusW:        100,
@@ -1909,6 +1911,9 @@ func TestSolarTick_YieldToChargeWindow(t *testing.T) {
 	)
 
 	cfg := testConfigSmallBattery()
+	// Half the charge power makes the 0.25 kWh requirement fill the whole cheap
+	// slot, so the deferred reservation starts at the top of the window.
+	cfg.ChargePowerW = 1000
 	mockBattery := NewMockBattery(50)
 	meter := NewMockMeter(true, -500)
 
@@ -1935,8 +1940,12 @@ func TestSolarHandoffRechecksReservationAfterStop(t *testing.T) {
 	battery := NewMockBattery(50)
 	battery.CurrentPower = 500
 	battery.IdleHook = func() { now = baseTime.Add(15*time.Minute + time.Second) }
+	// Half the charge power makes the 0.25 kWh requirement fill the whole cheap
+	// slot, so the deferred reservation starts at the top of the window.
+	handoffConfig := testConfigSmallBattery()
+	handoffConfig.ChargePowerW = 1000
 	svc := newTestServiceWithMeter(
-		testConfigSmallBattery(),
+		handoffConfig,
 		battery,
 		NewMockMeter(true, -500),
 		makePrices(baseTime, .05, .40, .40, .40),
@@ -2051,6 +2060,9 @@ func TestSolarTick_YieldsScheduledWindowBeforeReadingP1(t *testing.T) {
 	meter := NewMockMeter(true, -500)
 	meter.ActivePowerErr = errors.New("P1 unavailable")
 	cfg := testConfigSmallBattery()
+	// Half the charge power makes the 0.25 kWh requirement fill the whole cheap
+	// slot, so the deferred reservation starts at the top of the window.
+	cfg.ChargePowerW = 1000
 	svc := newTestServiceWithMeter(cfg, battery, meter, prices, baseTime)
 	svc.state = StateSolarCharging
 	svc.currentTradeStart = baseTime.Add(-5 * time.Minute)

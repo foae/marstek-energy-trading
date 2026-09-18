@@ -68,6 +68,8 @@ type AnalyzerConfig struct {
 	BatteryCapacityKWh      float64      // Battery capacity in kWh
 	BatteryMinSOC           float64      // Minimum SOC (0.0-1.0), e.g., 0.11 for 11%
 	ChargePowerW            int          // Charge power in watts
+	ChargePlanningDerate    float64      // Charge power derate for sizing; values outside (0, 1] are treated as 1
+	InventorySaleMinGainEUR float64      // Minimum EUR an inventory sale must add over the no-sale plan
 	DischargePowerW         int          // Discharge power in watts
 	MaxCyclesPerDay         int          // Maximum grid charge/discharge cycles per day
 	Now                     time.Time    // Current time; zero retains static-horizon analysis
@@ -177,7 +179,12 @@ func observedUsableDCKWh(cfg AnalyzerConfig, capacity float64) float64 {
 	return math.Min(capacity, math.Max(0, value))
 }
 
-func betterInventoryAlternative(candidate valuePlan, sale TimeWindow, current valuePlan, currentSale *TimeWindow) bool {
+func betterInventoryAlternative(candidate valuePlan, sale TimeWindow, current valuePlan, currentSale *TimeWindow, minGain decimal.Decimal) bool {
+	// The first sale must clear a minimum gain over the no-sale plan; refinements
+	// of an already selected sale are compared on value alone.
+	if currentSale == nil && minGain.IsPositive() {
+		return candidate.value.GreaterThan(current.value.Add(minGain))
+	}
 	if candidate.value.GreaterThan(current.value) {
 		return true
 	}

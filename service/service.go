@@ -293,14 +293,16 @@ func (s *Service) meterEnabled() bool {
 // analyzerConfig returns the AnalyzerConfig derived from service config.
 func (s *Service) analyzerConfig() AnalyzerConfig {
 	return AnalyzerConfig{
-		Efficiency:         s.cfg.BatteryEfficiency,
-		ChargeEfficiency:   s.cfg.BatteryChargeEfficiency,
-		MinPriceSpread:     s.cfg.MinPriceSpread,
-		BatteryCapacityKWh: s.cfg.BatteryCapacityKWh,
-		BatteryMinSOC:      s.cfg.BatteryMinSOC,
-		ChargePowerW:       s.cfg.ChargePowerW,
-		DischargePowerW:    s.cfg.DischargePowerW,
-		MaxCyclesPerDay:    s.cfg.MaxCyclesPerDay,
+		Efficiency:              s.cfg.BatteryEfficiency,
+		ChargeEfficiency:        s.cfg.BatteryChargeEfficiency,
+		MinPriceSpread:          s.cfg.MinPriceSpread,
+		BatteryCapacityKWh:      s.cfg.BatteryCapacityKWh,
+		BatteryMinSOC:           s.cfg.BatteryMinSOC,
+		ChargePowerW:            s.cfg.ChargePowerW,
+		ChargePlanningDerate:    s.cfg.ChargePlanningDerate,
+		InventorySaleMinGainEUR: s.cfg.InventorySaleMinGainEUR,
+		DischargePowerW:         s.cfg.DischargePowerW,
+		MaxCyclesPerDay:         s.cfg.MaxCyclesPerDay,
 	}
 }
 
@@ -1161,6 +1163,7 @@ func (s *Service) solarTick(ctx context.Context) {
 		if s.solarBlockedLocked(now, batterySOC) {
 			s.accumulateSolarEnergyLocked(measuredACChargePowerW)
 			s.solarGridPowerW = min(s.solarGridPowerW, measuredACChargePowerW)
+			slog.Info("decision: stop solar charging - yielding to plan window", "soc", batterySOC)
 			s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonYieldWindow)
 			s.mu.Unlock()
 			s.tick(ctx)
@@ -1189,6 +1192,7 @@ func (s *Service) solarTick(ctx context.Context) {
 	if s.state == StateSolarCharging && s.solarBlockedLocked(now, batterySOC) {
 		s.accumulateSolarEnergyLocked(measuredACChargePowerW)
 		s.solarGridPowerW = min(max(activePowerW, 0), measuredACChargePowerW)
+		slog.Info("decision: stop solar charging - yielding to plan window", "soc", batterySOC)
 		s.stopSolarChargingLocked(ctx, batterySOC, solarStopReasonYieldWindow)
 		s.mu.Unlock()
 		s.tick(ctx)

@@ -44,26 +44,28 @@ func makePrices(baseTime time.Time, values ...float64) []nordpool.Price {
 // Default test config: 5.12 kWh battery, 2500W charge/discharge, 90% efficiency, 11% min SOC
 func defaultTestConfig() AnalyzerConfig {
 	return AnalyzerConfig{
-		Efficiency:         0.90,
-		MinPriceSpread:     0.05,
-		BatteryCapacityKWh: 5.12,
-		BatteryMinSOC:      0.11,
-		ChargePowerW:       2500,
-		DischargePowerW:    2500,
-		MaxCyclesPerDay:    2,
+		Efficiency:           0.90,
+		MinPriceSpread:       0.05,
+		BatteryCapacityKWh:   5.12,
+		BatteryMinSOC:        0.11,
+		ChargePowerW:         2500,
+		ChargePlanningDerate: 1,
+		DischargePowerW:      2500,
+		MaxCyclesPerDay:      2,
 	}
 }
 
 // Small window config for testing with less data: small battery for 1-slot windows
 func smallWindowConfig() AnalyzerConfig {
 	return AnalyzerConfig{
-		Efficiency:         0.90,
-		MinPriceSpread:     0.01,
-		BatteryCapacityKWh: 0.5,
-		BatteryMinSOC:      0.0, // No min SOC for simpler test calculations
-		ChargePowerW:       2000,
-		DischargePowerW:    2000,
-		MaxCyclesPerDay:    2,
+		Efficiency:           0.90,
+		MinPriceSpread:       0.01,
+		BatteryCapacityKWh:   0.5,
+		BatteryMinSOC:        0.0, // No min SOC for simpler test calculations
+		ChargePowerW:         2000,
+		ChargePlanningDerate: 1,
+		DischargePowerW:      2000,
+		MaxCyclesPerDay:      2,
 	}
 }
 
@@ -323,13 +325,14 @@ func TestAnalyzePrices_EfficiencyCheck(t *testing.T) {
 
 			prices := makePrices(baseTime, values...)
 			cfg := AnalyzerConfig{
-				Efficiency:         tt.efficiency,
-				MinPriceSpread:     tt.minProfit,
-				BatteryCapacityKWh: 5.12,
-				BatteryMinSOC:      0.11,
-				ChargePowerW:       2500,
-				DischargePowerW:    2500,
-				MaxCyclesPerDay:    2,
+				Efficiency:           tt.efficiency,
+				MinPriceSpread:       tt.minProfit,
+				BatteryCapacityKWh:   5.12,
+				BatteryMinSOC:        0.11,
+				ChargePowerW:         2500,
+				ChargePlanningDerate: 1,
+				DischargePowerW:      2500,
+				MaxCyclesPerDay:      2,
 			}
 			plan := AnalyzePrices(prices, cfg)
 
@@ -430,12 +433,13 @@ func makeAsymmetricPrices(baseTime time.Time, imports, exports []float64) []nord
 func TestAnalyzePrices_DischargeWindowsUseExportPrices(t *testing.T) {
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
 	cfg := AnalyzerConfig{
-		Efficiency:         1,
-		MinPriceSpread:     0.01,
-		BatteryCapacityKWh: 0.5,
-		ChargePowerW:       2000,
-		DischargePowerW:    2000,
-		MaxCyclesPerDay:    1,
+		Efficiency:           1,
+		MinPriceSpread:       0.01,
+		BatteryCapacityKWh:   0.5,
+		ChargePowerW:         2000,
+		ChargePlanningDerate: 1,
+		DischargePowerW:      2000,
+		MaxCyclesPerDay:      1,
 	}
 
 	imports := []float64{0.10, 0.30}
@@ -495,12 +499,13 @@ func TestGetCurrentExportPrice(t *testing.T) {
 func TestAnalyzePrices_MaximizesTotalProfitAcrossCycles(t *testing.T) {
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
 	cfg := AnalyzerConfig{
-		Efficiency:         1,
-		MinPriceSpread:     0.01,
-		BatteryCapacityKWh: 0.5,
-		ChargePowerW:       2000,
-		DischargePowerW:    2000,
-		MaxCyclesPerDay:    2,
+		Efficiency:           1,
+		MinPriceSpread:       0.01,
+		BatteryCapacityKWh:   0.5,
+		ChargePowerW:         2000,
+		ChargePlanningDerate: 1,
+		DischargePowerW:      2000,
+		MaxCyclesPerDay:      2,
 	}
 
 	plan := AnalyzePrices(makePrices(baseTime, 0.10, 0.30, 0.15, 0.40), cfg)
@@ -647,12 +652,13 @@ func TestAnalyzePrices_SkipsCycleWithoutControlLeadTime(t *testing.T) {
 func TestAnalyzePrices_RejectsWindowsAcrossPriceGaps(t *testing.T) {
 	baseTime := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
 	cfg := AnalyzerConfig{
-		Efficiency:         1,
-		MinPriceSpread:     0.01,
-		BatteryCapacityKWh: 1,
-		ChargePowerW:       2000,
-		DischargePowerW:    2000,
-		MaxCyclesPerDay:    2,
+		Efficiency:           1,
+		MinPriceSpread:       0.01,
+		BatteryCapacityKWh:   1,
+		ChargePowerW:         2000,
+		ChargePlanningDerate: 1,
+		DischargePowerW:      2000,
+		MaxCyclesPerDay:      2,
 	}
 	prices := makePrices(baseTime, 0.10, 0.10, 0.40, 0.40)
 	prices[3].Time = baseTime.Add(75 * time.Minute)
@@ -850,14 +856,15 @@ func TestAnalyzePrices_WindowSizesUseACSideEnergy(t *testing.T) {
 	}
 
 	cfg := AnalyzerConfig{
-		Efficiency:         0.79,
-		ChargeEfficiency:   0.95,
-		MinPriceSpread:     0.05,
-		BatteryCapacityKWh: 5.12,
-		BatteryMinSOC:      0.11,
-		ChargePowerW:       2200,
-		DischargePowerW:    2200,
-		MaxCyclesPerDay:    1,
+		Efficiency:           0.79,
+		ChargeEfficiency:     0.95,
+		MinPriceSpread:       0.05,
+		BatteryCapacityKWh:   5.12,
+		BatteryMinSOC:        0.11,
+		ChargePowerW:         2200,
+		ChargePlanningDerate: 1,
+		DischargePowerW:      2200,
+		MaxCyclesPerDay:      1,
 	}
 
 	plan := AnalyzePrices(makePrices(baseTime, values...), cfg)
@@ -890,13 +897,14 @@ func TestAnalyzePrices_UnsetChargeEfficiencyUsesExactDischargeDuration(t *testin
 	}
 
 	cfg := AnalyzerConfig{
-		Efficiency:         1,
-		MinPriceSpread:     0.05,
-		BatteryCapacityKWh: 5.12,
-		BatteryMinSOC:      0.11,
-		ChargePowerW:       2200,
-		DischargePowerW:    2200,
-		MaxCyclesPerDay:    1,
+		Efficiency:           1,
+		MinPriceSpread:       0.05,
+		BatteryCapacityKWh:   5.12,
+		BatteryMinSOC:        0.11,
+		ChargePowerW:         2200,
+		ChargePlanningDerate: 1,
+		DischargePowerW:      2200,
+		MaxCyclesPerDay:      1,
 	}
 
 	plan := AnalyzePrices(makePrices(baseTime, values...), cfg)

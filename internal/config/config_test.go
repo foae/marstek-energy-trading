@@ -71,15 +71,18 @@ func validConfig() Config {
 		MinPriceSpread:    0.05,
 		BatteryEfficiency: 0.90,
 		// 1.0 keeps every BatteryEfficiency case in range for the >= constraint.
-		BatteryChargeEfficiency: 1.0,
-		BatteryCapacityKWh:      5.12,
-		BatteryMinSOC:           0.11,
-		MaxCyclesPerDay:         2,
-		ChargePowerW:            2500,
-		DischargePowerW:         2500,
-		PassiveModeTimeoutS:     300,
-		SolarMinSurplusW:        100,
-		ExportPriceMode:         "symmetric",
+		BatteryChargeEfficiency:       1.0,
+		BatteryCapacityKWh:            5.12,
+		BatteryMinSOC:                 0.11,
+		MaxCyclesPerDay:               2,
+		ChargePowerW:                  2500,
+		ChargeDeferToleranceEURPerKWh: 0.01,
+		ChargePlanningDerate:          0.90,
+		InventorySaleMinGainEUR:       0.02,
+		DischargePowerW:               2500,
+		PassiveModeTimeoutS:           300,
+		SolarMinSurplusW:              100,
+		ExportPriceMode:               "symmetric",
 	}
 }
 
@@ -132,6 +135,12 @@ func TestValidate_RejectsNonFiniteFloatValues(t *testing.T) {
 		{"infinite price spread", func(cfg *Config) { cfg.MinPriceSpread = math.Inf(1) }},
 		{"NaN battery capacity", func(cfg *Config) { cfg.BatteryCapacityKWh = math.NaN() }},
 		{"infinite battery capacity", func(cfg *Config) { cfg.BatteryCapacityKWh = math.Inf(1) }},
+		{"NaN charge defer tolerance", func(cfg *Config) { cfg.ChargeDeferToleranceEURPerKWh = math.NaN() }},
+		{"infinite charge defer tolerance", func(cfg *Config) { cfg.ChargeDeferToleranceEURPerKWh = math.Inf(1) }},
+		{"NaN charge planning derate", func(cfg *Config) { cfg.ChargePlanningDerate = math.NaN() }},
+		{"infinite charge planning derate", func(cfg *Config) { cfg.ChargePlanningDerate = math.Inf(1) }},
+		{"NaN inventory sale minimum gain", func(cfg *Config) { cfg.InventorySaleMinGainEUR = math.NaN() }},
+		{"infinite inventory sale minimum gain", func(cfg *Config) { cfg.InventorySaleMinGainEUR = math.Inf(1) }},
 	}
 
 	for _, tt := range tests {
@@ -265,6 +274,48 @@ func TestValidate_MinPriceSpread(t *testing.T) {
 	cfg.MinPriceSpread = 0
 	if err := cfg.validate(); err != nil {
 		t.Errorf("unexpected error for zero MinPriceSpread: %v", err)
+	}
+}
+
+func TestValidate_ChargeDeferTolerance(t *testing.T) {
+	cfg := validConfig()
+	cfg.ChargeDeferToleranceEURPerKWh = -0.001
+	if err := cfg.validate(); err == nil {
+		t.Error("expected error for negative CHARGE_DEFER_TOLERANCE_EUR_PER_KWH")
+	}
+
+	cfg.ChargeDeferToleranceEURPerKWh = 0
+	if err := cfg.validate(); err != nil {
+		t.Errorf("unexpected error for zero CHARGE_DEFER_TOLERANCE_EUR_PER_KWH: %v", err)
+	}
+}
+
+func TestValidate_ChargePlanningDerate(t *testing.T) {
+	for _, value := range []float64{0, -0.5, 1.01} {
+		cfg := validConfig()
+		cfg.ChargePlanningDerate = value
+		if err := cfg.validate(); err == nil {
+			t.Errorf("expected error for CHARGE_PLANNING_DERATE = %f", value)
+		}
+	}
+
+	cfg := validConfig()
+	cfg.ChargePlanningDerate = 1
+	if err := cfg.validate(); err != nil {
+		t.Errorf("unexpected error for CHARGE_PLANNING_DERATE = 1: %v", err)
+	}
+}
+
+func TestValidate_InventorySaleMinGain(t *testing.T) {
+	cfg := validConfig()
+	cfg.InventorySaleMinGainEUR = -0.01
+	if err := cfg.validate(); err == nil {
+		t.Error("expected error for negative INVENTORY_SALE_MIN_GAIN_EUR")
+	}
+
+	cfg.InventorySaleMinGainEUR = 0
+	if err := cfg.validate(); err != nil {
+		t.Errorf("unexpected error for zero INVENTORY_SALE_MIN_GAIN_EUR: %v", err)
 	}
 }
 

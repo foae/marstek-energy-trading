@@ -25,6 +25,9 @@ All settings are environment variables, typically provided through a `.env` file
 | `ESPHOME_URL` | required | Absolute URL of the ESPHome bridge |
 | `ESPHOME_RESTART_BUTTON` | empty | Optional restart-button name exposed by ESPHome |
 | `CHARGE_POWER_W` | `2500` | Charge target, 75-2500 W |
+| `CHARGE_DEFER_TOLERANCE_EUR_PER_KWH` | `0.01` | Latest slices priced at most this much above the cheapest allocation's average are preferred, so solar can fill the battery first. Only active when a P1 meter is configured; without one the cheapest slices are reserved as before |
+| `CHARGE_PLANNING_DERATE` | `0.90` | Reservation and plan sizing assume `CHARGE_POWER_W` times this factor, absorbing charge taper |
+| `INVENTORY_SALE_MIN_GAIN_EUR` | `0.02` | An inventory sale must beat the no-sale plan by at least this much |
 | `DISCHARGE_POWER_W` | `2500` | Discharge target, 800-2500 W |
 | `PASSIVE_MODE_TIMEOUT_S` | `300` | Refresh interval basis; not a hardware safety timeout |
 | `HOMEWIZARD_P1_URL` | empty | Empty disables P1; URL selects a meter; `auto` opts into discovery and LAN scanning |

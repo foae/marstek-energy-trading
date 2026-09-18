@@ -9,7 +9,7 @@ This project is for technically experienced owners of a compatible battery and E
 - Fetches 15-minute NordPool day-ahead prices for a configured bidding area.
 - Compares holding observed stored energy, selling it, or using it to reduce a grid purchase in a joint total-EUR plan.
 - Can sell part or all of uncommitted inventory in one contiguous positive-export-price window, including a partial tariff slot, followed by profitable grid cycles.
-- Recalculates grid charging from measured state of charge and reserves the cheapest eligible slices before the next charge deadline; these slices need not be contiguous.
+- Recalculates grid charging from measured state of charge and reserves eligible slices as late as the price tolerance allows before the next charge deadline, so solar can fill the battery first; these slices need not be contiguous. Deferral requires a configured P1 meter; without one the cheapest slices are reserved as before.
 - Controls one Marstek Venus E through an ESPHome HTTP bridge, with read-back confirmation and measured-power start verification.
 - Captures qualified solar surplus without a tariff veto, except for safety/fault handling, manual control, selected or active discharge, and a grid reservation.
 - Records measured energy, scheduled-charge source attribution, cash flow, solar opportunity cost, and a separate opportunity-cost-adjusted metric in local JSON.

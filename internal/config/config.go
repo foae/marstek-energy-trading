@@ -51,12 +51,21 @@ type Config struct {
 	MaxCyclesPerDay         int     `env:"MAX_CYCLES_PER_DAY" envDefault:"2"`
 
 	// Battery
-	BatteryUDPAddr       string `env:"BATTERY_UDP_ADDR"` // No default (optional, for UDP client)
-	ESPHomeURL           string `env:"ESPHOME_URL"`      // Required ESPHome REST API URL
-	ChargePowerW         int    `env:"CHARGE_POWER_W" envDefault:"2500"`
-	DischargePowerW      int    `env:"DISCHARGE_POWER_W" envDefault:"2500"`
-	PassiveModeTimeoutS  int    `env:"PASSIVE_MODE_TIMEOUT_S" envDefault:"300"`
-	ESPHomeRestartButton string `env:"ESPHOME_RESTART_BUTTON"` // ESPHome restart button name as exposed in its web URLs, e.g. "Restart"; empty = manual power-cycle only
+	BatteryUDPAddr string `env:"BATTERY_UDP_ADDR"` // No default (optional, for UDP client)
+	ESPHomeURL     string `env:"ESPHOME_URL"`      // Required ESPHome REST API URL
+	ChargePowerW   int    `env:"CHARGE_POWER_W" envDefault:"2500"`
+	// ChargeDeferToleranceEURPerKWh: latest slices at most this much above the
+	// cheapest allocation's average price are preferred, so solar can fill the
+	// battery first.
+	ChargeDeferToleranceEURPerKWh float64 `env:"CHARGE_DEFER_TOLERANCE_EUR_PER_KWH" envDefault:"0.01"`
+	// ChargePlanningDerate: reservation sizing uses CHARGE_POWER_W times this
+	// factor to absorb taper.
+	ChargePlanningDerate float64 `env:"CHARGE_PLANNING_DERATE" envDefault:"0.90"`
+	// InventorySaleMinGainEUR: an inventory sale must beat holding by this much.
+	InventorySaleMinGainEUR float64 `env:"INVENTORY_SALE_MIN_GAIN_EUR" envDefault:"0.02"`
+	DischargePowerW         int     `env:"DISCHARGE_POWER_W" envDefault:"2500"`
+	PassiveModeTimeoutS     int     `env:"PASSIVE_MODE_TIMEOUT_S" envDefault:"300"`
+	ESPHomeRestartButton    string  `env:"ESPHOME_RESTART_BUTTON"` // ESPHome restart button name as exposed in its web URLs, e.g. "Restart"; empty = manual power-cycle only
 
 	// HomeWizard P1 meter (optional)
 	HomeWizardP1URL  string `env:"HOMEWIZARD_P1_URL"`                    // Empty = disabled; "auto" = explicit discovery
@@ -105,6 +114,15 @@ func (c *Config) validate() error {
 	}
 	if c.ChargePowerW < 75 || c.ChargePowerW > 2500 {
 		return fmt.Errorf("CHARGE_POWER_W must be between 75 and 2500, got %d", c.ChargePowerW)
+	}
+	if !isFinite(c.ChargeDeferToleranceEURPerKWh) || c.ChargeDeferToleranceEURPerKWh < 0 {
+		return fmt.Errorf("CHARGE_DEFER_TOLERANCE_EUR_PER_KWH must be finite and >= 0, got %f", c.ChargeDeferToleranceEURPerKWh)
+	}
+	if !isFinite(c.ChargePlanningDerate) || c.ChargePlanningDerate <= 0 || c.ChargePlanningDerate > 1.0 {
+		return fmt.Errorf("CHARGE_PLANNING_DERATE must be finite and in (0.0, 1.0], got %f", c.ChargePlanningDerate)
+	}
+	if !isFinite(c.InventorySaleMinGainEUR) || c.InventorySaleMinGainEUR < 0 {
+		return fmt.Errorf("INVENTORY_SALE_MIN_GAIN_EUR must be finite and >= 0, got %f", c.InventorySaleMinGainEUR)
 	}
 	if c.PassiveModeTimeoutS <= 0 || c.PassiveModeTimeoutS > 86400 {
 		return fmt.Errorf("PASSIVE_MODE_TIMEOUT_S must be between 1 and 86400, got %d", c.PassiveModeTimeoutS)
@@ -161,6 +179,11 @@ func (c *Config) validate() error {
 
 func isFinite(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+// PlanningChargePowerW is the charge power assumed when sizing reservations and plans.
+func (c *Config) PlanningChargePowerW() float64 {
+	return float64(c.ChargePowerW) * c.ChargePlanningDerate
 }
 
 // MinSOCPercent rounds protection upward to the battery's integer SOC resolution.

@@ -207,6 +207,9 @@ func newGridPlanner(slots []priceSlot, cfg AnalyzerConfig) *gridPlanner {
 		roundTrip = 1
 	}
 	chargePowerKW := float64(cfg.ChargePowerW) / 1000
+	if cfg.ChargePlanningDerate > 0 && cfg.ChargePlanningDerate <= 1 {
+		chargePowerKW *= cfg.ChargePlanningDerate
+	}
 	dischargePowerKW := float64(cfg.DischargePowerW) / 1000
 	if chargePowerKW <= 0 {
 		chargePowerKW = 2.5
@@ -605,9 +608,10 @@ func (p *gridPlanner) bestWithInventory(initialDC float64, cycles int) (valuePla
 		priceIndex int
 	}
 	duals := make(map[dualKey]inventoryValueBound)
+	minGain := decimal.NewFromFloat(p.cfg.InventorySaleMinGainEUR)
 	consider := func(sale inventorySaleCandidate, suffix valuePlan) {
 		option := valuePlan{cycles: suffix.cycles, value: sale.revenue.Add(suffix.value), sessions: 1 + suffix.sessions}
-		if betterInventoryAlternative(option, sale.window, best, selected) {
+		if betterInventoryAlternative(option, sale.window, best, selected, minGain) {
 			best = option
 			w := sale.window
 			selected = &w

@@ -734,7 +734,7 @@ func (s *Service) tick(ctx context.Context) {
 	if err != nil {
 		s.mu.Lock()
 		s.batteryTelemetryAvailable = false
-		s.invalidateDischargeInventoryLocked()
+		s.noteInventoryTelemetryFailureLocked()
 		switch s.state {
 		case StateCharging:
 			s.stopChargingLocked(ctx, s.currentTradeLastSOC)
@@ -784,7 +784,7 @@ func (s *Service) tick(ctx context.Context) {
 		}
 	} else {
 		s.batteryTelemetryAvailable = false
-		s.invalidateDischargeInventoryLocked()
+		s.noteInventoryTelemetryFailureLocked()
 		switch s.state {
 		case StateCharging:
 			s.stopChargingLocked(ctx, batStatus.SOC)
@@ -1136,7 +1136,7 @@ func (s *Service) solarTick(ctx context.Context) {
 	if err != nil {
 		s.mu.Lock()
 		s.batteryTelemetryAvailable = false
-		s.invalidateDischargeInventoryLocked()
+		s.noteInventoryTelemetryFailureLocked()
 		s.mu.Unlock()
 		s.handleSolarStatusFailure(ctx, err)
 		return
@@ -2442,7 +2442,7 @@ func (s *Service) retryStopping(ctx context.Context) bool {
 		endSOC = status.SOC
 	} else {
 		s.batteryTelemetryAvailable = false
-		s.invalidateDischargeInventoryLocked()
+		s.noteInventoryTelemetryFailureLocked()
 	}
 
 	if s.state != StateStopping && !s.stopPending {
@@ -3264,7 +3264,10 @@ func (s *Service) checkLinkDuringSession(ctx context.Context) {
 		}
 		s.telemetryGapMarkedAt = s.linkDownSince
 	}
-	s.invalidateDischargeInventoryLocked()
+	// A confirmed frozen link makes this discard final: the readings that
+	// earned the most recent credit may already have been cached values, so
+	// SOC must not be allowed to hand any of it back later.
+	s.invalidateDischargeInventoryLocked(false)
 	downSince := s.linkDownSince
 	state := s.state
 	powerW := s.currentTradePowerW
@@ -3470,7 +3473,7 @@ func (s *Service) handleManualDischargeCommand(ctx context.Context, args []strin
 	batStatus, err := s.battery.GetBatteryStatusContext(ctx)
 	if err != nil {
 		s.mu.Lock()
-		s.invalidateDischargeInventoryLocked()
+		s.noteInventoryTelemetryFailureLocked()
 		s.batteryTelemetryAvailable = false
 		s.mu.Unlock()
 		s.sendTelegramCommandResponse(ctx, "Manual discharge not started: battery status is unavailable.")
@@ -3516,7 +3519,7 @@ func (s *Service) handleManualDischargeCommand(ctx context.Context, args []strin
 		batStatus, err = s.battery.GetBatteryStatusContext(ctx)
 		s.mu.Lock()
 		if err != nil {
-			s.invalidateDischargeInventoryLocked()
+			s.noteInventoryTelemetryFailureLocked()
 			s.batteryTelemetryAvailable = false
 			s.mu.Unlock()
 			s.sendTelegramCommandResponse(ctx, "Manual discharge not started: fresh battery status is unavailable after stopping the previous operation.")
@@ -3590,7 +3593,7 @@ func (s *Service) handleAutoCommand(ctx context.Context) {
 		endSOC = batStatus.SOC
 	} else {
 		s.mu.Lock()
-		s.invalidateDischargeInventoryLocked()
+		s.noteInventoryTelemetryFailureLocked()
 		s.batteryTelemetryAvailable = false
 		s.mu.Unlock()
 	}

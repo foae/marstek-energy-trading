@@ -327,3 +327,57 @@ func TestChargePlanningDerateLengthensPlannedChargeWindow(t *testing.T) {
 		t.Fatalf("derated weighted price = %s, want above the nameplate %s", half.Price, full.Price)
 	}
 }
+
+// A nearly full battery leaves a few points of headroom. Sizing a cycle from
+// that headroom alone produced a two-minute discharge worth cents, which still
+// costs a charge reservation, a discharge start and a confirmed stop.
+func TestAnalyzePricesRejectsSliverGridCycle(t *testing.T) {
+	base := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
+	stuck := 0.0232
+	full := 4.4544
+	cfg := AnalyzerConfig{
+		Efficiency:           .79,
+		ChargeEfficiency:     .95,
+		MinPriceSpread:       .01,
+		BatteryCapacityKWh:   5.12,
+		BatteryMinSOC:        .11,
+		ChargePowerW:         2200,
+		ChargePlanningDerate: 1,
+		DischargePowerW:      2200,
+		MaxCyclesPerDay:      2,
+		Now:                  base,
+		InitialSOC:           98,
+		InitialSOCKnown:      true,
+	}
+	imports := make([]float64, 32)
+	exports := make([]float64, 32)
+	for i := range imports {
+		imports[i], exports[i] = .18, .18
+		if i >= 24 {
+			imports[i], exports[i] = .47, .47
+		}
+	}
+
+	cfg.AvailableInventoryDCKWh = &stuck
+	plan := AnalyzePrices(plannerPrices(base, imports, exports), cfg)
+	if len(plan.Cycles) != 0 {
+		t.Fatalf("sliver of headroom planned %d grid cycle(s): %+v", len(plan.Cycles), plan.Cycles)
+	}
+	if plan.InventorySale != nil {
+		t.Fatalf("untrusted sliver planned a sale: %+v", plan.InventorySale)
+	}
+
+	// The floor must not silence a healthy ledger: the same prices and the same
+	// nearly full battery deliver the energy actually measured into them. The
+	// planner is free to do that as one topped-up cycle or as a separate sale,
+	// so assert the delivery rather than its shape.
+	cfg.AvailableInventoryDCKWh = &full
+	plan = AnalyzePrices(plannerPrices(base, imports, exports), cfg)
+	delivered := time.Duration(0)
+	for _, window := range plan.DischargeWindows {
+		delivered += window.End.Sub(window.Start)
+	}
+	if delivered < time.Hour {
+		t.Fatalf("trusted inventory delivered only %s: %+v", delivered, plan)
+	}
+}

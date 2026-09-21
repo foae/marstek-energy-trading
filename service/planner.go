@@ -189,7 +189,9 @@ type gridPlanner struct {
 	initialTrustedDCKWh float64
 	// Minimum AC energy an inventory sale must deliver, a share of a physically
 	// full delivery so quarantined energy cannot shrink it.
-	minimumSaleKWh   float64
+	minimumSaleKWh float64
+	// Minimum AC energy a grid cycle must deliver, on the same physical basis.
+	minimumCycleKWh  float64
 	chargePowerKW    float64
 	dischargePowerKW float64
 	planningStart    time.Time
@@ -240,6 +242,7 @@ func newGridPlanner(slots []priceSlot, cfg AnalyzerConfig) *gridPlanner {
 		fullDeliveryKWh:     usableDCKWh * roundTrip / chargeEfficiency,
 		initialTrustedDCKWh: initialTrustedDCKWh,
 		minimumSaleKWh:      physicalUsable * roundTrip / chargeEfficiency * minimumInventorySaleShare,
+		minimumCycleKWh:     physicalUsable * roundTrip / chargeEfficiency * minimumGridCycleShare,
 		chargePowerKW:       chargePowerKW,
 		dischargePowerKW:    dischargePowerKW,
 		planningStart:       planningStart,
@@ -273,6 +276,11 @@ func newGridPlanner(slots []priceSlot, cfg AnalyzerConfig) *gridPlanner {
 
 func (p *gridPlanner) best(earliest time.Time, initialDCKWh float64, cyclesLeft int) valuePlan {
 	if cyclesLeft <= 0 || p.usableDCKWh <= plannerEnergyEpsilon || p.fullDeliveryKWh <= plannerEnergyEpsilon {
+		return valuePlan{}
+	}
+	// Every candidate discharge is sized to a full delivery, so a sliver of
+	// free capacity yields a sliver cycle for the whole horizon.
+	if p.fullDeliveryKWh < p.minimumCycleKWh {
 		return valuePlan{}
 	}
 	if earliest.Before(p.planningStart) {
@@ -423,6 +431,15 @@ func (p *gridPlanner) fullDischargeCandidate(start int) (TimeWindow, decimal.Dec
 // fails under load. Scaling with the battery keeps small configurations
 // trading; for a 5 kWh battery this is roughly five minutes at full power.
 const minimumInventorySaleShare = 0.05
+
+// A grid cycle below this share of a full delivery is not worth a round trip.
+// A nearly full battery leaves a few points of headroom, which reads as buying
+// a sliver to sell it minutes later for cents, while the charge reservation,
+// the discharge start and the confirmed stop each cost Modbus writes on a link
+// that fails under load. It is deliberately separate from
+// minimumInventorySaleShare: a sale only has to beat holding energy already
+// paid for, while a cycle also has to pay to buy it.
+const minimumGridCycleShare = 0.05
 
 func inventorySaleCandidates(slots []priceSlot, cfg AnalyzerConfig, deliveryKWh, minimumEnergy, dischargePowerKW float64) []inventorySaleCandidate {
 	if cfg.Now.IsZero() || deliveryKWh <= plannerEnergyEpsilon || dischargePowerKW <= 0 {

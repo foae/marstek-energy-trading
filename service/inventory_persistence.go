@@ -23,6 +23,13 @@ type InventorySnapshot struct {
 	CapacityKWh    float64 `json:"capacity_kwh"`
 	MinSOCPercent  int     `json:"min_soc_percent"`
 	InFlight       bool    `json:"in_flight"`
+	// LostDCKWh is a measured allowance discarded outside a sale, pending
+	// repair against live SOC. Optional: an older ledger simply has none.
+	// LostSOCFloor is the lowest SOC seen since that discard and bounds the
+	// repair, so it has to survive the restart with it.
+	LostDCKWh         float64 `json:"lost_dc_kwh,omitempty"`
+	LostSOCFloor      int     `json:"lost_soc_floor_percent,omitempty"`
+	LostSOCFloorKnown bool    `json:"lost_soc_floor_known,omitempty"`
 }
 
 // SaveInventorySnapshot atomically persists the trusted inventory and its
@@ -78,11 +85,14 @@ func (r *Recorder) LoadInventorySnapshot() (*InventorySnapshot, error) {
 }
 
 type inventorySnapshotJSON struct {
-	Version        *int     `json:"version"`
-	RemainingDCKWh *float64 `json:"remaining_dc_kwh"`
-	CapacityKWh    *float64 `json:"capacity_kwh"`
-	MinSOCPercent  *int     `json:"min_soc_percent"`
-	InFlight       *bool    `json:"in_flight"`
+	Version           *int     `json:"version"`
+	RemainingDCKWh    *float64 `json:"remaining_dc_kwh"`
+	CapacityKWh       *float64 `json:"capacity_kwh"`
+	MinSOCPercent     *int     `json:"min_soc_percent"`
+	InFlight          *bool    `json:"in_flight"`
+	LostDCKWh         *float64 `json:"lost_dc_kwh"`
+	LostSOCFloor      *int     `json:"lost_soc_floor_percent"`
+	LostSOCFloorKnown *bool    `json:"lost_soc_floor_known"`
 }
 
 func decodeInventorySnapshot(data []byte) (*InventorySnapshot, error) {
@@ -111,6 +121,15 @@ func decodeInventorySnapshot(data []byte) (*InventorySnapshot, error) {
 		MinSOCPercent:  *persisted.MinSOCPercent,
 		InFlight:       *persisted.InFlight,
 	}
+	if persisted.LostDCKWh != nil {
+		snapshot.LostDCKWh = *persisted.LostDCKWh
+	}
+	if persisted.LostSOCFloor != nil {
+		snapshot.LostSOCFloor = *persisted.LostSOCFloor
+	}
+	if persisted.LostSOCFloorKnown != nil {
+		snapshot.LostSOCFloorKnown = *persisted.LostSOCFloorKnown
+	}
 	if err := validateInventorySnapshot(snapshot); err != nil {
 		return nil, err
 	}
@@ -131,10 +150,20 @@ func validateInventorySnapshot(snapshot InventorySnapshot) error {
 		return fmt.Errorf("invalid remaining inventory")
 	}
 
+	if !isFinite(snapshot.LostDCKWh) || snapshot.LostDCKWh < 0 {
+		return fmt.Errorf("invalid discarded inventory")
+	}
+	if snapshot.LostSOCFloor < 0 || snapshot.LostSOCFloor > 100 {
+		return fmt.Errorf("invalid discarded inventory SOC floor")
+	}
+
 	maximum := snapshot.CapacityKWh * float64(100-snapshot.MinSOCPercent) / 100
 	tolerance := inventoryRemainingRelativeTolerance * math.Max(1, maximum)
 	if snapshot.RemainingDCKWh > maximum+tolerance {
 		return fmt.Errorf("remaining inventory exceeds usable capacity")
+	}
+	if snapshot.LostDCKWh > maximum+tolerance {
+		return fmt.Errorf("discarded inventory exceeds usable capacity")
 	}
 	return nil
 }

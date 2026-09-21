@@ -148,6 +148,21 @@ If saving or pruning retirement markers fails at runtime, `/status` reports `com
 
 Malformed or unreadable inventory blocks startup. A publication failure blocks discharge; failed stop settlement retains the session and retries without authorizing another command. Restore filesystem access rather than inserting an SOC-derived balance. `/status` exposes `inventory_available_dc_kwh`, `inventory_persistence_blocked`, and `inventory_discharge_in_flight`. Manual discharge remains an explicit override but is debited and protected by the same durable marker.
 
+A failed telemetry read does not discard the allowance. Failures are tolerated for two minutes before the balance is discarded, and any valid reading ends the outage; a link the checker confirms dead still invalidates immediately. Previously, one ESPHome HTTP timeout was enough to discard a full battery's allowance, which no amount of waiting could rebuild because only measured charging credits the ledger and a full battery cannot charge.
+
+An allowance discarded while the battery was **not** discharging is recorded as `lost_dc_kwh` and repaired automatically. Once per minute, while idle and only when the link check confirms the battery itself is answering, the service restores the smaller of the discarded amount and what SOC can hold, then persists it. The discard itself is persisted too: left only in memory, a restart would read the pre-discard balance straight back and skip every gate below.
+
+Four bounds keep the repair from inventing energy:
+
+- It never exceeds the allowance that was actually measured in and then discarded.
+- It is capped by `lost_soc_floor_percent`, the **lowest** SOC seen since the discard, not by present SOC. A pack that drained and was refilled from an unmeasured source reads back high; the floor keeps that energy unsellable.
+- It waits two minutes after the first telemetry sample. The bridge client's link check reports healthy until it has seen a value change, so on a fresh process it cannot fail, and a gate that cannot fail proves nothing.
+- Any discharge clears the marker at the moment the sale is committed, because afterwards only measurement knows what is left and SOC is exactly the witness a frozen link can forge. A rejected attempt commits nothing and keeps the marker.
+
+A discard during a sale, or one caused by a **confirmed** frozen link, is never repaired: in the second case the credits earned last may themselves have come from cached readings. A failed settlement during a repair keeps the marker so the accident stays repairable once filesystem access returns.
+
+Rollback note: `lost_dc_kwh`, `lost_soc_floor_percent` and `lost_soc_floor_known` are omitted when empty, so an older binary reads the ledger normally in the ordinary case. It will refuse to start on a ledger written while a repair was pending, because the decoder rejects unknown fields. Remove those three keys from `inventory-ledger.json` before downgrading.
+
 ### Automatic Control Deadlines
 
 Automatic control does not start or refresh in the final minute of its window. A separate control-loop timer requests idle at the selected discharge endpoint, including a partial tariff slot, without needing a successful battery or tariff read. Failed stops retain ownership and use the throttled retry path. This is software scheduling, not a hardware command expiry or a guarantee that network I/O cannot delay physical stopping.

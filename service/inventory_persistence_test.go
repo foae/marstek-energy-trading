@@ -107,3 +107,49 @@ func TestInventorySnapshotSaveReportsDataDirectoryWriteFailure(t *testing.T) {
 		t.Fatal("SaveInventorySnapshot() error = nil for blocked data directory")
 	}
 }
+
+func TestInventorySnapshotRoundTripPreservesPendingRepair(t *testing.T) {
+	dir := t.TempDir()
+	want := InventorySnapshot{
+		Version:        1,
+		RemainingDCKWh: 0,
+		CapacityKWh:    5.12,
+		MinSOCPercent:  11,
+		LostDCKWh:      4.45,
+	}
+	if err := NewRecorder(dir, .9, time.UTC).SaveInventorySnapshot(want); err != nil {
+		t.Fatalf("SaveInventorySnapshot() error = %v", err)
+	}
+	got, err := NewRecorder(dir, .9, time.UTC).LoadInventorySnapshot()
+	if err != nil {
+		t.Fatalf("LoadInventorySnapshot() error = %v", err)
+	}
+	if got == nil || got.LostDCKWh != want.LostDCKWh {
+		t.Fatalf("LoadInventorySnapshot() = %+v, want pending repair %g", got, want.LostDCKWh)
+	}
+}
+
+// A ledger written before repairs existed must still load, with no repair.
+func TestInventorySnapshotWithoutRepairFieldLoads(t *testing.T) {
+	dir := t.TempDir()
+	legacy := `{"version":1,"remaining_dc_kwh":1.5,"capacity_kwh":5.12,"min_soc_percent":11,"in_flight":false}`
+	if err := os.WriteFile(filepath.Join(dir, inventoryLedgerFile), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := NewRecorder(dir, .9, time.UTC).LoadInventorySnapshot()
+	if err != nil {
+		t.Fatalf("LoadInventorySnapshot() error = %v", err)
+	}
+	if got == nil || got.RemainingDCKWh != 1.5 || got.LostDCKWh != 0 {
+		t.Fatalf("LoadInventorySnapshot() = %+v, want the legacy balance and no repair", got)
+	}
+}
+
+func TestInventorySnapshotRejectsImpossibleRepair(t *testing.T) {
+	err := NewRecorder(t.TempDir(), .9, time.UTC).SaveInventorySnapshot(InventorySnapshot{
+		Version: 1, CapacityKWh: 5.12, MinSOCPercent: 11, LostDCKWh: 99,
+	})
+	if err == nil {
+		t.Fatal("SaveInventorySnapshot() accepted a repair larger than the battery")
+	}
+}

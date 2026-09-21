@@ -97,7 +97,7 @@ func TestInventoryLiveSOCReplenishesInFlightSaleOnly(t *testing.T) {
 	now = now.Add(30 * time.Second)
 	svc.mu.Lock()
 	svc.linkDownSince = now
-	svc.invalidateDischargeInventoryLocked()
+	svc.invalidateDischargeInventoryLocked(true)
 	svc.cacheBatteryTelemetryLocked(59, -2500)
 	svc.mu.Unlock()
 	if svc.inventory.remainingDCKWh != 0 {

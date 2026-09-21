@@ -50,7 +50,21 @@ Telegram plans, daily summaries and status messages report measured operational 
 
 An independent read-only worker samples ESPHome SOC and AC power every five seconds, including solar charging and standby. It integrates AC input and output between opposite crossings of the same integer-SOC boundary, approximating each crossing at the sample midpoint. A window must rise at least 20 SOC points and consume at least 0.5 kWh before returning to its starting boundary. The reported percentage is total accepted AC output divided by total accepted AC input, multiplied by 100; windows are energy-weighted, not averaged percentages.
 
-Failed reads, detected stale telemetry, gaps longer than 30 seconds, skipped SOC levels and backwards timestamps discard incomplete windows. Windows exceeding 72 hours or producing more output than input are rejected. Completed aggregates persist atomically in `measured-efficiency.json`; incomplete windows never bridge a restart. This remains a sampled operational estimate, not calibrated metering: integer SOC, sensor publication delay and undetected telemetry faults limit accuracy.
+A failed read is a missing sample, not a corrupt window: it is skipped, and the window survives if telemetry resumes inside the 30-second gap tolerance. Only confirmed frozen telemetry discards the window immediately, because cached readings would be integrated as if they were live. Gaps longer than 30 seconds, skipped SOC levels, backwards timestamps and windows exceeding 72 hours still discard whatever was in progress.
+
+Energy across a tolerated gap is a zero-order hold of the last reading rather than a measurement, and that held value is wrong in direction whenever the gap spans a session start or stop. Intervals longer than twice the sampler's cadence are therefore accounted separately, and a window whose held energy exceeds 2% of its input is discarded as interrupted: surviving a brief outage is worth having, surviving one by inventing the missing energy is not.
+
+The link probe that detects a freeze runs every 15 seconds rather than on every sample, because it costs four extra sensor reads on the bus whose overload causes the failures. The service's other one-second telemetry readers keep the client's staleness signal current between probes, and the client only reports a freeze after two minutes of unchanged telemetry, so this still detects one well inside that threshold. A probe failure that is not a confirmed freeze no longer suppresses the sample behind it. The sampler paces itself from the end of each read rather than from a free-running ticker, so a read that outlasts the interval cannot make the next one start immediately and hammer an already-failing bus.
+
+`rejected_windows` counts every window that did not become a measurement, split three ways so the total is not read as a fault count:
+
+| Reason | Meaning |
+|---|---|
+| `unqualified_windows` | The SOC swing was too small to measure. Expected churn, not a fault: a one-point solar top-up on a nearly full battery opens a window that would need a 20-point rise, so it can only ever be discarded. |
+| `interrupted_windows` | Telemetry stopped or jumped, leaving a hole in the energy integral. This is the count that says the measurement is unhealthy. |
+| `implausible_windows` | The window completed, but its energies cannot describe a round trip. |
+
+Aggregates recorded before the split carry an empty breakdown, so the parts can total less than the whole but never more. Completed aggregates persist atomically in `measured-efficiency.json`; incomplete windows never bridge a restart. This remains a sampled operational estimate, not calibrated metering: integer SOC, sensor publication delay and undetected telemetry faults limit accuracy.
 
 `BATTERY_EFFICIENCY` remains the separate configured planning assumption and is not automatically adjusted. Trade-energy accounting integrates ESPHome's AC-power measurement, so cash-flow energy estimates include AC conversion losses. Solar surplus compensation also uses measured AC charge power: the P1 meter sees the AC draw, not a DC battery estimate. Battery-power verification remains a separate measured-control check. Trade records are not used to calculate this AC efficiency, and records carrying the legacy `measured_battery_power` basis remain DC-based.
 

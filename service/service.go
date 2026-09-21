@@ -260,7 +260,7 @@ func New(
 		meter:      meterClient,
 		telegram:   telegramClient,
 		recorder:   recorder,
-		efficiency: newEfficiencyTracker(),
+		efficiency: newEfficiencyTracker(efficiencySampleInterval),
 		state:      StateIdle,
 		loc:        cfg.Location(),
 		nowFunc:    time.Now,

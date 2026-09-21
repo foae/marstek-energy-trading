@@ -120,7 +120,19 @@ var (
 	})
 	rejectedEfficiencyWindows = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "energy_trader_rejected_efficiency_windows",
-		Help: "Incomplete or invalid efficiency measurement windows discarded",
+		Help: "Incomplete or invalid efficiency measurement windows discarded; the sum of the three reason gauges below, except for aggregates recorded before they existed",
+	})
+	unqualifiedEfficiencyWindows = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "energy_trader_unqualified_efficiency_windows",
+		Help: "Efficiency windows discarded because the SOC swing was too small to measure; expected churn, not a fault",
+	})
+	interruptedEfficiencyWindows = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "energy_trader_interrupted_efficiency_windows",
+		Help: "Efficiency windows discarded because telemetry stopped or jumped, leaving a hole in the energy integral",
+	})
+	implausibleEfficiencyWindows = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "energy_trader_implausible_efficiency_windows",
+		Help: "Efficiency windows discarded because their measured energies cannot describe a round trip",
 	})
 )
 
@@ -130,6 +142,7 @@ func init() {
 	prometheus.MustRegister(traderPnL)
 	prometheus.MustRegister(unpricedCashFlowEnergy, opportunityAdjustedPnL, unattributedChargeEnergy, unpricedOpportunityEnergy)
 	prometheus.MustRegister(measuredEfficiency, measuredEfficiencyWindows, rejectedEfficiencyWindows)
+	prometheus.MustRegister(unqualifiedEfficiencyWindows, interruptedEfficiencyWindows, implausibleEfficiencyWindows)
 }
 
 // metricsHandler returns the Prometheus metrics handler.
@@ -171,6 +184,9 @@ func (h *Handler) updateMetrics(ctx context.Context) {
 	}
 	measuredEfficiencyWindows.Set(float64(status.MeasuredEfficiency.Cycles))
 	rejectedEfficiencyWindows.Set(float64(status.MeasuredEfficiency.RejectedWindows))
+	unqualifiedEfficiencyWindows.Set(float64(status.MeasuredEfficiency.UnqualifiedWindows))
+	interruptedEfficiencyWindows.Set(float64(status.MeasuredEfficiency.InterruptedWindows))
+	implausibleEfficiencyWindows.Set(float64(status.MeasuredEfficiency.ImplausibleWindows))
 	if status.BatteryAvailable {
 		batterySOC.Set(float64(status.BatterySOC))
 	} else {

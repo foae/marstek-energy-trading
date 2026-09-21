@@ -92,7 +92,7 @@ These are gauges derived from recorded history, not monotonic counters. Read fin
 
 With P1 disabled, scheduled charging retains the all-grid interpretation. With P1 enabled, energy before the first successful source observation is unattributed; after that, failed reads retain the last observed grid-import estimate. Source attribution is therefore an estimate across telemetry gaps, not continuous metering.
 
-Measured efficiency is independent of these financial totals: `energy_trader_measured_efficiency_percent` is `NaN` until a valid measurement window completes, while `energy_trader_measured_efficiency_windows` and `energy_trader_rejected_efficiency_windows` expose accepted and rejected counts. See [Methodology](methodology.md#measured-efficiency).
+Measured efficiency is independent of these financial totals: `energy_trader_measured_efficiency_percent` is `NaN` until a valid measurement window completes, while `energy_trader_measured_efficiency_windows` and `energy_trader_rejected_efficiency_windows` expose accepted and rejected counts. Read the rejected total together with its breakdown — `energy_trader_unqualified_efficiency_windows`, `energy_trader_interrupted_efficiency_windows` and `energy_trader_implausible_efficiency_windows` — because a high total is usually small SOC swings that could never qualify rather than a fault. Only the interrupted count means telemetry is costing you measurements. See [Methodology](methodology.md#measured-efficiency).
 
 ## Telegram Commands
 

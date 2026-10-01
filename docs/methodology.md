@@ -77,5 +77,5 @@ Solar charging is enabled only when `HOMEWIZARD_P1_URL` is an explicit meter URL
 - An elapsed-time EMA smooths the target, with a five-second settling period after power changes.
 - Surplus below `max(75 W, SOLAR_MIN_SURPLUS_W / 4)` enters a 60-second grace period at 75 W before stopping.
 - Adaptive cooldowns reduce short-session cycling.
-- Solar stops at 99% SOC and can qualify again at 97%; a grid reservation may charge to 100%.
+- Solar stops at 100% SOC and can qualify again at 97%; grid reservations also target 100%. At 99%, a matching durable grid commitment permits charging through known-price slices until its original charge deadline, without the usual profit-floor or estimated-energy cutoff. Safety stops and missing tariffs still take precedence; the discharge minimum and stopping reserve are unchanged.
 - Outside safety/fault handling, manual override, selected or active automatic discharge, and a current grid reservation, qualified solar capture has no tariff, forecast, reservation-economics, or grid-cycle-profit veto. A tariff change or missing tariff therefore does not stop an active solar session.

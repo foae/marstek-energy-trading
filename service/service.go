@@ -55,8 +55,8 @@ const (
 	solarStartQualification       = 30 * time.Second // sustained raw surplus required before starting
 	solarTelemetryGapTolerance    = 2 * time.Second  // more than two nominal samples breaks qualification
 	solarMinChargePowerW          = 75               // floor clamp for charge power
-	solarChargeUpperSOC           = 99               // stop solar charging when integer SOC reaches this limit
-	solarChargeResumeSOC          = 97               // re-arm only after SOC falls enough to reject 98/99 telemetry flicker
+	solarChargeUpperSOC           = 100              // stop solar charging when integer SOC reaches this limit
+	solarChargeResumeSOC          = 97               // re-arm below the full-SOC telemetry flicker band
 	solarEMAAlpha                 = 0.05             // EMA smoothing factor at a one-second sample interval
 )
 

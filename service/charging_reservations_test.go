@@ -691,3 +691,74 @@ func TestReservationUsesCheapestSlicesWithoutMeter(t *testing.T) {
 		t.Fatalf("reserved span = %s-%s, want the cheapest 00:00-02:00", start, end)
 	}
 }
+
+func TestCommittedFinalPercentCharging(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		soc          int
+		durable      bool
+		wantReserved bool
+	}{
+		{"finish committed charge", 99, true, true},
+		{"ordinary charge retains profit floor", 98, true, false},
+		{"full battery", 100, true, false},
+		{"unpublished commitment", 99, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, now := reservationFixture()
+			s.todayPrices = []nordpool.Price{{Time: now, Value: 1}}
+			s.tomorrowPrices = nil
+			cycle := s.currentPlan.Cycles[0]
+			s.automaticCycleCommit = &cycle
+			s.automaticCycleCommit.DischargeWindow.End = now.Add(2 * time.Hour)
+			s.currentPlan.Cycles[0] = *s.automaticCycleCommit
+			s.automaticCycleCommitDurable = tc.durable
+			r := s.chargeReservationLocked(now, tc.soc)
+			if r.contains(now) != tc.wantReserved {
+				t.Fatalf("reserved=%v, want %v: %+v", r.contains(now), tc.wantReserved, r)
+			}
+			if tc.wantReserved {
+				window, _ := r.windowAt(now)
+				if !window.End.Equal(now.Add(15 * time.Minute)) {
+					t.Fatalf("top-off truncated to estimated energy instead of known tariff boundary: %+v", window)
+				}
+				if s.chargeReservationLocked(now.Add(15*time.Minute), tc.soc).contains(now.Add(15 * time.Minute)) {
+					t.Fatal("missing tariff authorized top-off")
+				}
+			}
+		})
+	}
+}
+
+func TestFinalPercentDoesNotBypassCommitmentSafety(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*Service)
+	}{
+		{"missing commitment", func(s *Service) { s.automaticCycleCommit = nil }},
+		{"cleanup pending", func(s *Service) { s.automaticCycleCleanupPending = true }},
+		{"export mode changed", func(s *Service) { s.automaticCycleCommit.ExportPriceMode = "wholesale" }},
+		{"different pairing", func(s *Service) {
+			s.automaticCycleCommit.DischargeWindow.Start = s.automaticCycleCommit.DischargeWindow.Start.Add(time.Minute)
+		}},
+		{"restored discharge only", func(s *Service) { s.currentPlan.Cycles = nil; s.currentPlan.DischargeOnly = true }},
+		{"charge deadline passed", func(s *Service) {
+			s.currentPlan.Cycles[0].ChargeWindow.End = s.now()
+			s.automaticCycleCommit.ChargeWindow.End = s.now()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, now := reservationFixture()
+			s.todayPrices = []nordpool.Price{{Time: now, Value: 1}}
+			s.tomorrowPrices = nil
+			s.currentPlan.Cycles[0].DischargeWindow.End = now.Add(2 * time.Hour)
+			cycle := s.currentPlan.Cycles[0]
+			s.automaticCycleCommit = &cycle
+			s.automaticCycleCommitDurable = true
+			tc.change(s)
+			if s.chargeReservationLocked(now, 99).contains(now) {
+				t.Fatal("unsafe commitment authorized final-percent charging")
+			}
+		})
+	}
+}

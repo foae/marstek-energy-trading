@@ -1775,7 +1775,7 @@ func TestDischargeStartNotificationResamplesTariffAfterControl(t *testing.T) {
 
 func TestSolarUpperSOCSettlesPreviousGridPowerBeforeTaper(t *testing.T) {
 	now := time.Date(2024, 1, 15, 13, 0, 0, 0, time.UTC)
-	battery := NewMockBattery(99)
+	battery := NewMockBattery(100)
 	battery.CurrentPower = 100
 	svc := newTestServiceWithMeter(testConfigSmallBattery(), battery, NewMockMeter(true, 0), []nordpool.Price{{Time: now.Add(-time.Minute), Value: .20}}, now)
 	svc.state = StateSolarCharging
@@ -5283,7 +5283,7 @@ func TestSolarPriorityStopSettlesLatestBatteryPower(t *testing.T) {
 			now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
 			battery := NewMockBattery(50)
 			if batteryFull {
-				battery.SOC = 99
+				battery.SOC = 100
 			}
 			battery.CurrentPower = 0
 			battery.DischargFlag = false

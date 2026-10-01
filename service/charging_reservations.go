@@ -67,6 +67,13 @@ func (s *Service) chargeReservationLocked(now time.Time, soc int) chargingReserv
 	result.maxChargePrice = dischargePrice.
 		Mul(decimal.NewFromFloat(s.cfg.BatteryEfficiency)).
 		Sub(decimal.NewFromFloat(s.cfg.MinPriceSpread))
+	// A valid, durable purchase pairing may finish its last reported percent
+	// through known-price slices before the original charge deadline. Do not
+	// truncate this tail using nameplate energy: BMS balancing can take longer.
+	topOff := soc == 99 && s.automaticCycleCommitDurable &&
+		sameTradeCycle(s.automaticCycleCommit, result.pairedCycle) &&
+		s.automaticCycleCommit.ExportPriceMode == s.cfg.ExportPriceMode &&
+		!now.Before(result.pairedCycle.ChargeWindow.Start)
 	var eligibleCapacityKWh, totalCapacityKWh float64
 	for _, price := range s.futurePriceHorizonLocked(now) {
 		start, end := price.Time, price.Time.Add(15*time.Minute)
@@ -83,12 +90,17 @@ func (s *Service) chargeReservationLocked(now time.Time, soc int) chargingReserv
 		capacityKWh := powerKW * end.Sub(start).Hours()
 		totalCapacityKWh += capacityKWh
 		priceDecimal := decimal.NewFromFloat(price.Value)
-		if !s.chargePriceMeetsProfitFloorLocked(priceDecimal, result.maxChargePrice) {
+		if !topOff && !s.chargePriceMeetsProfitFloorLocked(priceDecimal, result.maxChargePrice) {
 			result.currentPriceTooHigh = result.currentPriceTooHigh || isCurrentSlice
 			continue
 		}
 		eligibleCapacityKWh += capacityKWh
 		result.Windows = append(result.Windows, TimeWindow{Start: start, End: end, Price: priceDecimal})
+	}
+	if topOff {
+		result.ReservedKWh = eligibleCapacityKWh
+		result.Feasible = eligibleCapacityKWh+0.000001 >= result.RequiredKWh
+		return result
 	}
 	allocation := allocateDeferredChargeSlices(result.Windows, result.RequiredKWh, powerKW,
 		s.cfg.ChargeDeferToleranceEURPerKWh, now, s.state == StateCharging, s.meterEnabled())

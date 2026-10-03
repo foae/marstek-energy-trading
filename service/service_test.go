@@ -69,6 +69,7 @@ type MockBattery struct {
 	// Error injection
 	ConnectErr    error
 	GetStatusErr  error
+	GetPowerErr   error
 	ChargeErr     error
 	DischargeErr  error
 	IdleErr       error
@@ -149,6 +150,9 @@ func (m *MockBattery) GetBatteryPower(_ context.Context) (float64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.PowerCalls++
+	if m.GetPowerErr != nil {
+		return 0, m.GetPowerErr
+	}
 	if m.GetStatusErr != nil {
 		return 0, m.GetStatusErr
 	}
@@ -3103,6 +3107,11 @@ func TestManualDischargeStopsWhenTelemetryFails(t *testing.T) {
 
 	battery.GetStatusErr = errors.New("telemetry unavailable")
 	currentTime = currentTime.Add(time.Minute)
+	svc.tick(context.Background())
+	if svc.state != StateManualDischarging || battery.IdleCalls != 0 {
+		t.Fatalf("brief telemetry failure interrupted manual discharge: state=%s stops=%d", svc.state, battery.IdleCalls)
+	}
+	currentTime = currentTime.Add(inventoryTelemetryFailureGrace)
 	svc.tick(context.Background())
 
 	if svc.state != StateIdle {

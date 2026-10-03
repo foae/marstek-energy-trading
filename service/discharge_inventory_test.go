@@ -93,6 +93,125 @@ func TestInventoryTransientTelemetryFailureKeepsAllowance(t *testing.T) {
 	}
 }
 
+func runningInventorySale(t *testing.T, now *time.Time) (*Service, *MockBattery) {
+	t.Helper()
+	battery := NewMockBattery(100)
+	prices := make([]nordpool.Price, 8)
+	for i := range prices {
+		prices[i] = nordpool.Price{Time: now.Add(time.Duration(i) * 15 * time.Minute), Value: 0.4}
+	}
+	svc := newTestService(testConfig(), battery, prices, *now)
+	svc.nowFunc = func() time.Time { return *now }
+	svc.recorder = NewRecorder(t.TempDir(), svc.cfg.BatteryEfficiency, time.UTC)
+	svc.tick(context.Background())
+	if svc.state != StateDischarging {
+		t.Fatalf("sale did not start: %s", svc.state)
+	}
+	return svc, battery
+}
+
+func TestDischargeSurvivesTransientTelemetryFailures(t *testing.T) {
+	for _, path := range []string{"inventory sampler", "inventory DC", "minute status", "minute DC", "minute AC"} {
+		t.Run(path, func(t *testing.T) {
+			now := time.Now().UTC().Truncate(15 * time.Minute).Add(15 * time.Minute)
+			svc, battery := runningInventorySale(t, &now)
+			start := svc.currentTradeStart
+			deadline := svc.inventory.deadline
+			initialInventory := svc.inventory.remainingDCKWh
+			// Repeated isolated failures must not split one sale into multiple
+			// trades. Keep SOC fixed so conservative debit, not SOC repair,
+			// determines the remaining balance.
+			for range 4 {
+				now = now.Add(30 * time.Second)
+				switch path {
+				case "minute AC":
+					battery.GetACPowerErr = context.DeadlineExceeded
+				case "inventory DC", "minute DC":
+					battery.GetPowerErr = context.DeadlineExceeded
+				default:
+					battery.GetStatusErr = context.DeadlineExceeded
+				}
+				if path == "inventory sampler" || path == "inventory DC" {
+					svc.sampleDischargeInventory(context.Background())
+				} else {
+					svc.tick(context.Background())
+				}
+				if svc.state != StateDischarging || battery.IdleCalls != 0 {
+					t.Fatalf("brief read failure stopped sale: state=%s stops=%d", svc.state, battery.IdleCalls)
+				}
+				battery.GetStatusErr, battery.GetPowerErr, battery.GetACPowerErr = nil, nil, nil
+				now = now.Add(30 * time.Second)
+				svc.sampleDischargeInventory(context.Background())
+				svc.tick(context.Background())
+			}
+			if len(battery.DischargeCalls) != 1 || !svc.currentTradeStart.Equal(start) {
+				t.Fatalf("sale restarted: commands=%d start=%s", len(battery.DischargeCalls), svc.currentTradeStart)
+			}
+			want := initialInventory - svc.inventory.debitPowerW*now.Sub(start).Hours()/1000
+			if math.Abs(svc.inventory.remainingDCKWh-want) > 1e-9 {
+				t.Fatalf("outage energy was not debited: got=%g want=%g", svc.inventory.remainingDCKWh, want)
+			}
+			if svc.inventory.deadline.After(deadline) {
+				t.Fatal("read failure extended the safety deadline")
+			}
+		})
+	}
+}
+
+func TestDischargeTelemetryGraceDoesNotBypassSafety(t *testing.T) {
+	for _, cause := range []string{"sustained status", "sustained AC", "window end", "inventory deadline", "minimum SOC", "frozen link", "nonpositive tariff", "manual expiry"} {
+		t.Run(cause, func(t *testing.T) {
+			now := time.Now().UTC().Truncate(15 * time.Minute).Add(15 * time.Minute)
+			svc, battery := runningInventorySale(t, &now)
+			now = now.Add(time.Second)
+			switch cause {
+			case "sustained AC", "minimum SOC":
+				battery.GetACPowerErr = context.DeadlineExceeded
+				svc.tick(context.Background())
+			default:
+				battery.GetStatusErr = context.DeadlineExceeded
+				svc.sampleDischargeInventory(context.Background())
+			}
+			if svc.state != StateDischarging {
+				t.Fatalf("first timeout prematurely stopped sale: %s", svc.state)
+			}
+			switch cause {
+			case "sustained status", "sustained AC":
+				now = now.Add(inventoryTelemetryFailureGrace - time.Second)
+				svc.sampleDischargeInventory(context.Background())
+				if svc.state != StateDischarging {
+					t.Fatal("stopped before telemetry grace expired")
+				}
+				now = now.Add(time.Second)
+			case "window end":
+				svc.activeInventorySale.End = now.Add(time.Second)
+				now = now.Add(time.Second)
+			case "inventory deadline":
+				svc.inventory.deadline = now.Add(time.Second)
+				now = now.Add(time.Second)
+			case "minimum SOC":
+				battery.SOC = svc.cfg.MinSOCPercent()
+			case "frozen link":
+				battery.checkLinkErr = marstek.ErrLinkDown
+			case "nonpositive tariff":
+				svc.todayPrices[0].Value = 0
+			case "manual expiry":
+				svc.state = StateManualDischarging
+				svc.manualOverrideUntil = now
+			}
+			svc.sampleDischargeInventory(context.Background())
+			if svc.state != StateIdle || battery.IdleCalls != 1 || svc.inventory.inFlight {
+				t.Fatalf("safety stop bypassed: state=%s stops=%d inFlight=%v", svc.state, battery.IdleCalls, svc.inventory.inFlight)
+			}
+			if cause == "sustained status" || cause == "frozen link" {
+				if svc.inventory.remainingDCKWh != 0 || svc.inventory.lostDCKWh != 0 {
+					t.Fatalf("untrusted in-flight balance can be resold: %+v", svc.inventory)
+				}
+			}
+		})
+	}
+}
+
 // discardedInventoryService returns a service whose telemetry history is old
 // enough for the link check to mean something, holding a repairable discard of
 // balanceDCKWh made at the battery's current SOC.

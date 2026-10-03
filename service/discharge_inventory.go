@@ -37,9 +37,9 @@ const (
 	// before treating a passing link check as proof of anything. It matches
 	// the client's own link-stale threshold.
 	inventoryRepairWarmup = 2 * time.Minute
-	// The repair probe runs at most once a minute while idle, so it can afford
-	// a budget that a slow-but-alive bridge can actually meet.
-	inventoryRepairProbeTimeout = 10 * time.Second
+	// A discharge sample reads six cached HTTP sensors serially. The solar
+	// qualification gap (2s) is not a viable deadline for that whole batch.
+	inventoryReadTimeout = 10 * time.Second
 )
 
 type dischargeInventory struct {
@@ -222,6 +222,9 @@ func (s *Service) noteInventoryTelemetryFailureLocked() {
 	if inv.telemetryFailureSince.IsZero() {
 		inv.telemetryFailureSince = now
 	}
+	// The last accepted command continues through a failed HTTP read. Debit
+	// its conservative DC draw now, not only if telemetry eventually recovers.
+	s.debitDischargeInventoryLocked(now, 0)
 	// Credit already requires consecutive samples inside the gap tolerance, so
 	// no energy is earned across the outage; only the balance is held.
 	inv.sampleCharging = false
@@ -448,6 +451,42 @@ func (s *Service) dischargeInventoryLinkLive(ctx context.Context) bool {
 	return true
 }
 
+// Brief read failures do not revoke an already-running discharge. These
+// independent safety limits still apply, including while no sample is available.
+// AC has its own outage clock: successful DC samples cannot prove AC recovered.
+func (s *Service) stopDischargeForSafetyLocked(ctx context.Context, soc int) {
+	if s.state != StateDischarging && s.state != StateManualDischarging {
+		return
+	}
+	now := s.now()
+	s.debitDischargeInventoryLocked(now, 0)
+	deadline := s.automaticDischargeDeadlineLocked()
+	reason := ""
+	switch {
+	case !s.linkDownSince.IsZero():
+		reason = "RS485 link down"
+	case soc <= s.cfg.MinSOCPercent():
+		reason = "minimum SOC"
+	case !deadline.IsZero() && !now.Before(deadline):
+		reason = "discharge deadline"
+	case s.state == StateManualDischarging && !now.Before(s.manualOverrideUntil):
+		reason = "manual override expired"
+	case s.inventory.telemetryInvalidated:
+		reason = "sustained battery telemetry failure"
+	case !s.dischargeACFailureSince.IsZero() && now.Sub(s.dischargeACFailureSince) >= inventoryTelemetryFailureGrace:
+		reason = "sustained AC telemetry failure"
+	}
+	if reason == "" && s.activeInventorySale != nil {
+		if price, known := s.currentExportPriceLocked(now); known && !price.IsPositive() {
+			reason = "nonpositive export tariff"
+		}
+	}
+	if reason != "" {
+		slog.Info("decision: stop discharging - safety limit", "reason", reason, "soc", soc, "deadline", deadline)
+		s.stopDischargingLocked(ctx, soc)
+	}
+}
+
 // Always runs on the serialized control loop, including without a P1 meter.
 // Do not run a second command goroutine: command/stop ordering must stay owned
 // by the existing service state machine.
@@ -466,6 +505,11 @@ func (s *Service) sampleDischargeInventory(ctx context.Context) {
 		s.settleDischargeInventoryLocked()
 	}
 	active := s.inventory.inFlight || s.state == StateCharging || s.state == StateSolarCharging
+	discharging := s.state == StateDischarging || s.state == StateManualDischarging
+	deadline := s.automaticDischargeDeadlineLocked()
+	if s.state == StateManualDischarging {
+		deadline = s.manualOverrideUntil
+	}
 	recovering := !active && s.recoverableDischargeInventoryLocked()
 	if recovering {
 		s.inventory.lastRecoveryAttempt = s.now()
@@ -475,10 +519,11 @@ func (s *Service) sampleDischargeInventory(ctx context.Context) {
 		return
 	}
 	timeout := solarTelemetryGapTolerance
-	if recovering {
-		// Re-basing reads four sensors through the link check; the sampling
-		// tolerance that paces an active session is too tight for that.
-		timeout = inventoryRepairProbeTimeout
+	if recovering || discharging {
+		timeout = inventoryReadTimeout
+	}
+	if !deadline.IsZero() {
+		timeout = min(timeout, max(0, deadline.Sub(s.now())))
 	}
 	sampleCtx, cancel := context.WithTimeout(ctx, timeout)
 	linkLive := false
@@ -497,6 +542,9 @@ func (s *Service) sampleDischargeInventory(ctx context.Context) {
 	}
 	cancel()
 	s.mu.Lock()
+	if status != nil {
+		s.currentTradeLastSOC = status.SOC
+	}
 	switch {
 	case err == nil:
 		s.cacheBatteryTelemetryLocked(status.SOC, powerW)
@@ -509,23 +557,22 @@ func (s *Service) sampleDischargeInventory(ctx context.Context) {
 		// unavailable for everyone else; the next attempt is a minute away.
 		slog.Debug("discharge inventory repair probe failed", "error", err)
 	default:
+		if s.inventory.telemetryFailureSince.IsZero() {
+			slog.Warn("discharge inventory sample unavailable", "state", s.state, "error", err)
+		}
 		s.noteInventoryTelemetryFailureLocked()
 		s.batteryTelemetryAvailable = false
 	}
-	deadline := s.inventory.deadline
-	// Only a failure on the session path owns stopping; the repair probe runs
-	// exclusively while idle and has nothing to stop.
+	// Charging retains its own fault policy. A discharge instead keeps the
+	// accepted command through brief read failures, subject to the limits below.
 	if err != nil && active {
 		switch s.state {
 		case StateCharging:
 			s.stopChargingLocked(ctx, s.currentTradeLastSOC)
-		case StateDischarging, StateManualDischarging:
-			s.stopDischargingLocked(ctx, s.currentTradeLastSOC)
 		case StateSolarCharging:
 			s.stopSolarChargingLocked(ctx, s.currentTradeLastSOC, solarStopReasonTelemetryFailure)
 		}
-	} else if s.state == StateDischarging && !deadline.IsZero() && !s.now().Before(deadline) {
-		s.stopDischargingLocked(ctx, status.SOC)
 	}
+	s.stopDischargeForSafetyLocked(ctx, s.currentTradeLastSOC)
 	s.mu.Unlock()
 }

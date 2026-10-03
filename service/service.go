@@ -131,6 +131,7 @@ type Service struct {
 	currentTradePowerW           int
 	currentTradeLastPowerW       float64
 	currentTradeLastUpdate       time.Time
+	dischargeACFailureSince      time.Time // AC outage is not cleared by successful DC inventory samples
 	currentTradeEnergyWs         float64
 	currentTradePricedEnergyWs   float64
 	currentTradeUnpricedWs       float64
@@ -368,6 +369,7 @@ func (s *Service) beginMeasuredTradeLocked(measuredPowerW float64) {
 	s.linkDownSince = time.Time{}
 	s.telemetryGapMarkedAt = time.Time{}
 	s.currentTradeTelemetryGapS = 0
+	s.dischargeACFailureSince = time.Time{}
 	s.currentTradeLastPowerW = measuredPowerW
 	s.currentTradeLastUpdate = s.now()
 	s.currentTradeEnergyWs = 0
@@ -739,7 +741,7 @@ func (s *Service) tick(ctx context.Context) {
 		case StateCharging:
 			s.stopChargingLocked(ctx, s.currentTradeLastSOC)
 		case StateDischarging, StateManualDischarging:
-			s.stopDischargingLocked(ctx, s.currentTradeLastSOC)
+			s.stopDischargeForSafetyLocked(ctx, s.currentTradeLastSOC)
 		case StateSolarCharging:
 			s.stopSolarChargingLocked(ctx, s.currentTradeLastSOC, solarStopReasonTelemetryFailure)
 		}
@@ -766,10 +768,15 @@ func (s *Service) tick(ctx context.Context) {
 
 	s.mu.Lock()
 	s.currentTradeLastSOC = batStatus.SOC
-	// DC telemetry stands on its own: cache it whenever it was read, even if the
-	// AC read failed and the session below has to stop.
+	// DC telemetry stands on its own: cache it whenever it was read. AC
+	// failures have a separate grace so DC samples cannot mask a lasting outage.
 	if powerErr == nil {
 		s.cacheBatteryTelemetryLocked(batStatus.SOC, measuredPowerW)
+	}
+	if acPowerErr == nil {
+		s.dischargeACFailureSince = time.Time{}
+	} else if (s.state == StateDischarging || s.state == StateManualDischarging) && s.dischargeACFailureSince.IsZero() {
+		s.dischargeACFailureSince = s.now()
 	}
 	if powerErr == nil && acPowerErr == nil {
 		accountedACPowerW := s.accountableACPowerLocked(measuredACPowerW)
@@ -784,12 +791,14 @@ func (s *Service) tick(ctx context.Context) {
 		}
 	} else {
 		s.batteryTelemetryAvailable = false
-		s.noteInventoryTelemetryFailureLocked()
+		if powerErr != nil {
+			s.noteInventoryTelemetryFailureLocked()
+		}
 		switch s.state {
 		case StateCharging:
 			s.stopChargingLocked(ctx, batStatus.SOC)
 		case StateDischarging, StateManualDischarging:
-			s.stopDischargingLocked(ctx, batStatus.SOC)
+			s.stopDischargeForSafetyLocked(ctx, batStatus.SOC)
 		case StateSolarCharging:
 			s.stopSolarChargingLocked(ctx, batStatus.SOC, solarStopReasonTelemetryFailure)
 		}

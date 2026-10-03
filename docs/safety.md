@@ -18,6 +18,10 @@ These measures do not create an independent fail-safe. The ESPHome backend has n
 
 An ESPHome control operation has a 45-second overall budget, while each changed select can consume up to 35 seconds of confirmation polling. If both selects need their full confirmation path, the operation can time out after writes were attempted. The service treats that outcome as unknown and retains any persisted discharge commitment.
 
+An already-running discharge (automatic or manual) survives brief HTTP telemetry failures instead of stopping and restarting on the next trading tick. The inventory sampler allows ten seconds for its sequential cached-sensor reads, independently of solar qualification timing. During a read outage, the service continues debiting trusted inventory at the conservative accepted draw; it does not extend the discharge deadline. Two minutes of continuous battery-telemetry failure stops discharge and quarantines its remaining allowance. AC telemetry has a separate two-minute failure clock, so successful DC samples cannot mask an AC outage.
+
+This grace never overrides a confirmed frozen RS485 link, minimum SOC, the automatic inventory/window deadline, manual-override expiry, or a confirmed nonpositive export tariff for an inventory sale. It does not authorize starting with unavailable telemetry or change charging's fault policy. The serialized-loop and hardware-expiry limitations above still apply.
+
 ## Security And Privacy
 
 - Keep ESPHome, HomeWizard, and this service on a trusted local network. Their local HTTP APIs are normally unauthenticated.

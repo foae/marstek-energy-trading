@@ -18,11 +18,12 @@ const (
 // InventorySnapshot records the energy that is trusted to have been measured
 // into the battery and is therefore eligible for discharge planning.
 type InventorySnapshot struct {
-	Version        int     `json:"version"`
-	RemainingDCKWh float64 `json:"remaining_dc_kwh"`
-	CapacityKWh    float64 `json:"capacity_kwh"`
-	MinSOCPercent  int     `json:"min_soc_percent"`
-	InFlight       bool    `json:"in_flight"`
+	Version            int     `json:"version"`
+	RemainingDCKWh     float64 `json:"remaining_dc_kwh"`
+	CapacityKWh        float64 `json:"capacity_kwh"`
+	MinSOCPercent      int     `json:"min_soc_percent"`
+	InFlight           bool    `json:"in_flight"`
+	DischargeFloorHeld bool    `json:"discharge_floor_held,omitempty"`
 	// LostDCKWh is a measured allowance discarded outside a sale, pending
 	// repair against live SOC. Optional: an older ledger simply has none.
 	// LostSOCFloor is the lowest SOC seen since that discard and bounds the
@@ -85,14 +86,15 @@ func (r *Recorder) LoadInventorySnapshot() (*InventorySnapshot, error) {
 }
 
 type inventorySnapshotJSON struct {
-	Version           *int     `json:"version"`
-	RemainingDCKWh    *float64 `json:"remaining_dc_kwh"`
-	CapacityKWh       *float64 `json:"capacity_kwh"`
-	MinSOCPercent     *int     `json:"min_soc_percent"`
-	InFlight          *bool    `json:"in_flight"`
-	LostDCKWh         *float64 `json:"lost_dc_kwh"`
-	LostSOCFloor      *int     `json:"lost_soc_floor_percent"`
-	LostSOCFloorKnown *bool    `json:"lost_soc_floor_known"`
+	Version            *int     `json:"version"`
+	RemainingDCKWh     *float64 `json:"remaining_dc_kwh"`
+	CapacityKWh        *float64 `json:"capacity_kwh"`
+	MinSOCPercent      *int     `json:"min_soc_percent"`
+	InFlight           *bool    `json:"in_flight"`
+	DischargeFloorHeld *bool    `json:"discharge_floor_held"`
+	LostDCKWh          *float64 `json:"lost_dc_kwh"`
+	LostSOCFloor       *int     `json:"lost_soc_floor_percent"`
+	LostSOCFloorKnown  *bool    `json:"lost_soc_floor_known"`
 }
 
 func decodeInventorySnapshot(data []byte) (*InventorySnapshot, error) {
@@ -120,6 +122,9 @@ func decodeInventorySnapshot(data []byte) (*InventorySnapshot, error) {
 		CapacityKWh:    *persisted.CapacityKWh,
 		MinSOCPercent:  *persisted.MinSOCPercent,
 		InFlight:       *persisted.InFlight,
+	}
+	if persisted.DischargeFloorHeld != nil {
+		snapshot.DischargeFloorHeld = *persisted.DischargeFloorHeld
 	}
 	if persisted.LostDCKWh != nil {
 		snapshot.LostDCKWh = *persisted.LostDCKWh

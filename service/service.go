@@ -823,6 +823,10 @@ func (s *Service) tick(ctx context.Context) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.currentTradeLastSOC = batStatus.SOC
+	if s.inventory.floorHeld && (s.state == StateDischarging || s.state == StateManualDischarging) {
+		s.stopDischargingLocked(ctx, batStatus.SOC)
+		return
+	}
 	if s.state != StateCharging && s.state != StateDischarging {
 		s.clearExpiredAutomaticCycleCommitmentLocked(ctx, now)
 	}
@@ -878,6 +882,7 @@ func (s *Service) tick(ctx context.Context) {
 	// Resolve the control window before the live price. A retained discharge is
 	// an obligation even when the corresponding tariff sample is unavailable.
 	dischargeWindow, inDischargeWindow := s.dischargeWindowAtLocked(now)
+	inDischargeWindow = inDischargeWindow && !s.inventory.floorHeld
 	currentPrice, ok := s.currentPriceLocked(now)
 	// Discharge sessions are valued at the export rate; the charge decision and
 	// everything else keep the import rate.
@@ -2100,6 +2105,13 @@ func (s *Service) startDischargingLocked(ctx context.Context, price decimal.Deci
 	}
 	cancelControl()
 	if err != nil {
+		if soc <= s.cfg.MinSOCPercent()+dischargeFloorBandPercent {
+			// Even an unconfirmed failure near protection must not be retried
+			// after a cooldown or process restart without measured recharge.
+			s.mu.Lock()
+			s.setDischargeFloorHoldLocked(true)
+			s.mu.Unlock()
+		}
 		if idleErr = s.idleBattery(ctx); idleErr != nil {
 			l.Warn("failed to return battery to idle after start failure", "error", idleErr)
 		}
@@ -2198,6 +2210,9 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 	if previousState == StateDischarging && s.automaticCycleCommit == nil {
 		uncommittedSessionWindow, hasUncommittedSessionWindow = s.dischargeWindowAtLocked(s.currentTradeStart)
 	}
+	if endSOC <= s.cfg.MinSOCPercent() {
+		s.setDischargeFloorHoldLocked(true)
+	}
 	if !s.transitionToIdleLocked(ctx, endSOC) {
 		return
 	}
@@ -2251,7 +2266,7 @@ func (s *Service) stopDischargingLocked(ctx context.Context, endSOC int) {
 	}
 	completedAutomaticCycle := hasAutomaticWindow &&
 		(!stopTime.Before(completedWindow.End) ||
-			endSOC <= s.cfg.MinSOCPercent() ||
+			endSOC <= s.cfg.MinSOCPercent() || s.inventory.floorHeld ||
 			(previousState == StateDischarging && (inventoryDeadlineReached || inventoryExhausted)))
 	retirements := retainedDischargeWindows(s.retiredDischargeWindows, stopTime)
 	if completedAutomaticCycle {
@@ -2594,6 +2609,10 @@ func (s *Service) idleBattery(ctx context.Context) error {
 // refreshPassiveModeLocked refreshes the passive mode command before timeout.
 // It returns false when a required refresh fails. Caller must hold s.mu.
 func (s *Service) refreshPassiveModeLocked(ctx context.Context, power int) bool {
+	if power > 0 && (s.inventory.floorHeld || !s.inventory.floorLowSince.IsZero()) {
+		// Do not overwrite a possible hardware cutoff while qualifying it.
+		return true
+	}
 	// Refresh if we're past 80% of the timeout period
 	refreshThreshold := time.Duration(float64(s.cfg.PassiveModeTimeoutS)*0.8) * time.Second
 	if s.now().Sub(s.lastPassiveRefresh) < refreshThreshold {
@@ -2794,7 +2813,7 @@ func (s *Service) refreshCurrentPlanLocked(now time.Time) *TradingPlan {
 	cfg.InitialSOC = s.batteryTelemetrySOC
 	cfg.InitialSOCKnown = s.batteryTelemetryAvailable
 	availableInventoryDCKWh := s.inventory.remainingDCKWh
-	if s.inventory.blocked {
+	if s.inventory.blocked || s.inventory.floorHeld {
 		availableInventoryDCKWh = 0
 	}
 	cfg.AvailableInventoryDCKWh = &availableInventoryDCKWh
@@ -3240,6 +3259,12 @@ func (s *Service) checkLinkDuringSession(ctx context.Context) {
 	}
 
 	err := lc.CheckLink(ctx)
+	s.mu.Lock()
+	s.inventory.linkLiveAt = time.Time{}
+	if err == nil {
+		s.inventory.linkLiveAt = s.now()
+	}
+	s.mu.Unlock()
 	switch {
 	case err == nil:
 		// Live telemetry proves the link is back (bridge rebooted, by us or by
@@ -3491,6 +3516,14 @@ func (s *Service) handleManualDischargeCommand(ctx context.Context, args []strin
 	minSOC := s.cfg.MinSOCPercent()
 
 	s.mu.Lock()
+	if batStatus.SOC <= minSOC {
+		s.setDischargeFloorHoldLocked(true)
+	}
+	if s.inventory.floorHeld {
+		s.mu.Unlock()
+		s.sendTelegramCommandResponse(ctx, "Manual discharge held after low-SOC cutoff; measured recharging is required before discharge can resume.")
+		return
+	}
 	stoppedPreviousOperation := false
 	switch s.state {
 	case StateManualDischarging:
@@ -3714,6 +3747,7 @@ type CurrentStatus struct {
 	InventoryAvailableDCKWh      float64                  `json:"inventory_available_dc_kwh"`
 	InventoryDischargeInFlight   bool                     `json:"inventory_discharge_in_flight"`
 	InventoryPersistenceBlocked  bool                     `json:"inventory_persistence_blocked"`
+	DischargeFloorHeld           bool                     `json:"discharge_floor_held"`
 }
 
 // GetCurrentStatus returns cached control-loop telemetry and current trading
@@ -3736,6 +3770,7 @@ func (s *Service) GetCurrentStatus(ctx context.Context) CurrentStatus {
 		InventoryAvailableDCKWh:     s.inventory.remainingDCKWh,
 		InventoryDischargeInFlight:  s.inventory.inFlight,
 		InventoryPersistenceBlocked: s.inventory.blocked,
+		DischargeFloorHeld:          s.inventory.floorHeld,
 	}
 	if s.currentPlan != nil {
 		status.PlanDischargeOnly = s.currentPlan.DischargeOnly
@@ -3814,6 +3849,9 @@ func (s *Service) GetCurrentStatus(ctx context.Context) CurrentStatus {
 		status.NextAction = "solar restart cooldown; waiting for a valuable sale"
 	} else {
 		status.NextAction = "holding inventory for valuable known prices; qualified solar capture remains enabled"
+	}
+	if s.inventory.floorHeld {
+		status.NextAction += "; low-SOC discharge hold until measured recharge"
 	}
 	return status
 }

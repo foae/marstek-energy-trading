@@ -163,6 +163,16 @@ A discard during a sale, or one caused by a **confirmed** frozen link, is never 
 
 Rollback note: `lost_dc_kwh`, `lost_soc_floor_percent` and `lost_soc_floor_known` are omitted when empty, so an older binary reads the ledger normally in the ordinary case. It will refuse to start on a ledger written while a repair was pending, because the decoder rejects unknown fields. Remove those three keys from `inventory-ledger.json` before downgrading.
 
+### Low-SOC Discharge Protection
+
+The configured minimum remains 11% (`BATTERY_MIN_SOC=0.11`), matching the battery's hard protection. Healthy discharge above that floor is allowed; trusted-inventory limits and tariff/deadline stopping reserves can still finish a sale earlier.
+
+At or below the minimum, or after 30 seconds of live measured discharge below 50 W within two percentage points of it (11–13% by default), the service holds discharge and requests a confirmed stop. A failed discharge start in that near-floor band also holds discharge after a fresh live reading confirms low output. Automatic starts, manual commands and positive-power refreshes stay blocked, including across restart. Existing failed-stop throttling and dead-link bus quiet periods remain in force.
+
+`/status` exposes `discharge_floor_held`. The hold does not block grid or solar charging, and a held discharge window does not reserve priority over solar. It clears only after live, service-controlled measured recharge of at least 3% of battery capacity and SOC at least five points above the configured floor (16% by default). Rebound, elapsed cooldown, and inventory recovery alone cannot clear it. Recharge progress is not persisted, so a restart requires fresh qualifying recharge.
+
+The optional `discharge_floor_held` field lives in `inventory-ledger.json`; preserve it when backing up or repairing state. Persistence failure keeps discharge blocked. Older binaries reject this field when a hold is present. Do not downgrade by deleting an active protection marker; recharge to clear the hold first, or explicitly accept losing this protection after stopping the service and confirming physical idle.
+
 ### Automatic Control Deadlines
 
 Automatic control does not start or refresh in the final minute of its window. A separate control-loop timer requests idle at the selected discharge endpoint, including a partial tariff slot, without needing a successful battery or tariff read. Failed stops retain ownership and use the throttled retry path. This is software scheduling, not a hardware command expiry or a guarantee that network I/O cannot delay physical stopping.

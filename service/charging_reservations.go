@@ -302,7 +302,7 @@ func (s *Service) solarBlockedLocked(now time.Time, soc int) bool {
 	}
 	reservation := s.chargeReservationLocked(now, soc)
 	return reservation.contains(now) ||
-		(s.currentPlan != nil && s.currentPlan.IsInDischargeWindow(now))
+		(!s.inventory.floorHeld && s.currentPlan != nil && s.currentPlan.IsInDischargeWindow(now))
 }
 
 func (s *Service) chargePriceMeetsProfitFloorLocked(price, maxChargePrice decimal.Decimal) bool {

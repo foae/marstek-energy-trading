@@ -76,6 +76,11 @@ type dischargeInventory struct {
 	persistPending      bool
 	firstSampleAt       time.Time
 	lastRecoveryAttempt time.Time
+	floorHeld           bool
+	floorLowSince       time.Time
+	floorSampleAt       time.Time
+	floorRechargeDCKWh  float64
+	linkLiveAt          time.Time
 }
 
 // dischargeEfficiency is the configured DC-to-AC share: round-trip divided by
@@ -105,9 +110,10 @@ func (s *Service) inventorySnapshotLocked() InventorySnapshot {
 		// allowance, so the pending repair has to outlive the process. Its SOC
 		// floor travels with it: without the floor a restart would re-open the
 		// drain-and-refill window the floor exists to close.
-		LostDCKWh:         s.inventory.lostDCKWh,
-		LostSOCFloor:      s.inventory.lostSOCFloor,
-		LostSOCFloorKnown: s.inventory.lostSOCFloorKnown,
+		LostDCKWh:          s.inventory.lostDCKWh,
+		LostSOCFloor:       s.inventory.lostSOCFloor,
+		LostSOCFloorKnown:  s.inventory.lostSOCFloorKnown,
+		DischargeFloorHeld: s.inventory.floorHeld,
 	}
 }
 
@@ -120,6 +126,10 @@ func (s *Service) restoreDischargeInventory() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.inventory = dischargeInventory{}
+	if snapshot != nil {
+		// A cutoff is independent of balance validity, including interrupted sales.
+		s.inventory.floorHeld = snapshot.DischargeFloorHeld
+	}
 	if snapshot != nil && !snapshot.InFlight && snapshot.CapacityKWh == s.cfg.BatteryCapacityKWh && snapshot.MinSOCPercent == s.cfg.MinSOCPercent() {
 		s.inventory.remainingDCKWh = snapshot.RemainingDCKWh
 		s.inventory.lostDCKWh = snapshot.LostDCKWh
@@ -192,6 +202,7 @@ func (s *Service) observeDischargeInventoryLocked(soc int, powerW float64) {
 	if !inv.blocked && charging && inv.sampleCharging && elapsed > 0 && elapsed <= inventoryCreditGapTolerance {
 		inv.remainingDCKWh += min(inv.chargePowerW, max(0, powerW)) * elapsed.Hours() / 1000
 	}
+	s.observeDischargeFloorLocked(soc, powerW, charging, elapsed)
 	socCap := s.inventorySOCCap(soc)
 	socLive := !inv.socLiveAt.IsZero() && now.Sub(inv.socLiveAt) <= inventorySOCLiveWindow
 	if inv.inFlight && !inv.blocked && socLive && s.linkDownSince.IsZero() && socCap > inv.remainingDCKWh {
@@ -218,6 +229,8 @@ func (s *Service) observeDischargeInventoryLocked(soc int, powerW float64) {
 // invalidates, and a confirmed dead link bypasses the grace entirely.
 func (s *Service) noteInventoryTelemetryFailureLocked() {
 	inv := &s.inventory
+	inv.floorLowSince = time.Time{}
+	inv.floorSampleAt = time.Time{}
 	now := s.now()
 	if inv.telemetryFailureSince.IsZero() {
 		inv.telemetryFailureSince = now
@@ -318,6 +331,9 @@ func (s *Service) invalidateDischargeInventoryLocked(repairable bool) {
 
 func (s *Service) prepareDischargeInventoryLocked(soc, powerW int, automatic bool, windowEnd time.Time) (time.Time, error) {
 	inv := &s.inventory
+	if inv.floorHeld {
+		return time.Time{}, fmt.Errorf("discharge held after low-SOC cutoff; measured recharge required")
+	}
 	if inv.blocked || inv.inFlight {
 		return time.Time{}, fmt.Errorf("discharge inventory persistence or settlement pending")
 	}
@@ -465,6 +481,8 @@ func (s *Service) stopDischargeForSafetyLocked(ctx context.Context, soc int) {
 	switch {
 	case !s.linkDownSince.IsZero():
 		reason = "RS485 link down"
+	case s.inventory.floorHeld:
+		reason = "low-SOC discharge hold"
 	case soc <= s.cfg.MinSOCPercent():
 		reason = "minimum SOC"
 	case !deadline.IsZero() && !now.Before(deadline):
